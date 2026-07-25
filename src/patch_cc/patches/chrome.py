@@ -12,6 +12,7 @@ from .base import (
     Outcome,
     Patch,
     compile_js,
+    js_string,
 )
 
 # ---------------------------------------------------------- spinner tips
@@ -95,8 +96,11 @@ def _branding(content: str, options: Options, outcome: Outcome) -> str:
         outcome.note("brand unchanged; nothing to do")
         return content
 
+    # Every site below quotes through `js_string`, never by interpolating into a
+    # literal written here: the brand is arbitrary text, and hand-escaping only
+    # the quote and the backslash let a newline through into a double-quoted
+    # literal, producing a bundle that parsed nowhere but verified fine.
     brand = options.brand
-    esc = brand.replace("\\", "\\\\").replace('"', '\\"')
     output = content
 
     def swap(step_name: str, pattern: re.Pattern[str], replace) -> None:
@@ -117,7 +121,9 @@ def _branding(content: str, options: Options, outcome: Outcome) -> str:
         compile_js(
             rf'({IDENT})\.createElement\(({IDENT}),\{{bold:!0\}},"Claude Code"\)'
         ),
-        lambda m: f'{m.group(1)}.createElement({m.group(2)},{{bold:!0}},"{esc}")',
+        lambda m: (
+            f"{m.group(1)}.createElement({m.group(2)},{{bold:!0}},{js_string(brand)})"
+        ),
     )
     swap(
         "bold-jsx",
@@ -125,7 +131,8 @@ def _branding(content: str, options: Options, outcome: Outcome) -> str:
             rf'({IDENT})\.(jsx|jsxs)\(({IDENT}),\{{bold:!0,children:"Claude Code"\}}\)'
         ),
         lambda m: (
-            f'{m.group(1)}.{m.group(2)}({m.group(3)},{{bold:!0,children:"{esc}"}})'
+            f"{m.group(1)}.{m.group(2)}({m.group(3)},"
+            f"{{bold:!0,children:{js_string(brand)}}})"
         ),
     )
     swap(
@@ -135,34 +142,34 @@ def _branding(content: str, options: Options, outcome: Outcome) -> str:
             r'color:"professionalBlue",defaultTab:"general"'
         ),
         lambda m: (
-            f'title:{m.group(1)}.replace("Claude Code","{esc}"),'
+            f'title:{m.group(1)}.replace("Claude Code",{js_string(brand)}),'
             f'color:"professionalBlue",defaultTab:"general"'
         ),
     )
     swap(
         "welcome-for",
         compile_js(r'"Welcome to Claude Code for "'),
-        lambda _m: f'"Welcome to {esc} for "',
+        lambda _m: js_string(f"Welcome to {brand} for "),
     )
     swap(
         "welcome",
         compile_js(r'"Welcome to Claude Code"'),
-        lambda _m: f'"Welcome to {esc}"',
+        lambda _m: js_string(f"Welcome to {brand}"),
     )
     swap(
         "children-array",
         compile_js(r'(color:"claude",bold:!0,children:\[)"Claude Code"(," "\])'),
-        lambda m: f'{m.group(1)}"{esc}"{m.group(2)}',
+        lambda m: f"{m.group(1)}{js_string(brand)}{m.group(2)}",
     )
     swap(
         "styled-title",
         compile_js(rf'({IDENT})\("claude",({IDENT})\)\("Claude Code"\)'),
-        lambda m: f'{m.group(1)}("claude",{m.group(2)})("{esc}")',
+        lambda m: f'{m.group(1)}("claude",{m.group(2)})({js_string(brand)})',
     )
     swap(
         "styled-title-padded",
         compile_js(rf'({IDENT})\("claude",({IDENT})\)\(" Claude Code "\)'),
-        lambda m: f'{m.group(1)}("claude",{m.group(2)})(" {esc} ")',
+        lambda m: f'{m.group(1)}("claude",{m.group(2)})({js_string(f" {brand} ")})',
     )
 
     return output

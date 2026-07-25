@@ -110,15 +110,3 @@ def codesign(path: str) -> None:
     )
     if result.returncode != 0:  # pragma: no cover - macOS only
         raise MachOError(f"codesign failed: {result.stderr.strip()}")
-
-
-def verify_signature(path: str) -> bool:  # pragma: no cover - macOS only
-    if not shutil.which("codesign"):
-        return False
-    return (
-        subprocess.run(
-            ["codesign", "--verify", "--verbose=2", path],
-            capture_output=True,
-        ).returncode
-        == 0
-    )

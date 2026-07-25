@@ -3,16 +3,25 @@
 Patches run in registration order and each sees the previous one's output.
 The order below is the upstream order; do not reorder casually -- some patches
 depend on regions an earlier one leaves untouched.
+
+``codex`` runs before ``agents`` on purpose, and it is the one ordering that is
+load-bearing rather than inherited. ``codex-models`` writes the chosen Codex ids
+into the Task tool's model enum; ``subagent-models`` reads that same enum to
+decide what a subagent may be pinned to. Registering first means a pin to a
+Codex model is offered exactly when that model is really in the bundle -- so a
+``codex-models`` the fixpoint had to drop takes its pins down with it instead of
+leaving a definition pointing at a model nothing registered.
 """
 
 from __future__ import annotations
 
-from . import agents, chrome, output, streaming, thinking
+from . import agents, chrome, codex, output, streaming, thinking
 from .base import (
     DEFAULT_BRAND,
     DEFAULT_SUFFIX,
     GROUP_AGENTS,
     GROUP_CHROME,
+    GROUP_CODEX,
     GROUP_OUTPUT,
     GROUP_THINKING,
     SENTINEL,
@@ -26,20 +35,12 @@ ALL_PATCHES: list[Patch] = [
     *output.PATCHES,
     *thinking.PATCHES,
     *streaming.PATCHES,
+    *codex.PATCHES,
     *agents.PATCHES,
     *chrome.PATCHES,
 ]
 
-GROUP_ORDER = [GROUP_OUTPUT, GROUP_THINKING, GROUP_AGENTS, GROUP_CHROME]
-
-_BY_ID = {patch.id: patch for patch in ALL_PATCHES}
-
-
-def get(patch_id: str) -> Patch:
-    try:
-        return _BY_ID[patch_id]
-    except KeyError:
-        raise KeyError(f"unknown patch id: {patch_id}") from None
+GROUP_ORDER = [GROUP_OUTPUT, GROUP_THINKING, GROUP_AGENTS, GROUP_CODEX, GROUP_CHROME]
 
 
 def ids() -> list[str]:
@@ -67,7 +68,6 @@ __all__ = [
     "Patch",
     "SENTINEL",
     "derived_brand",
-    "get",
     "ids",
     "default_ids",
     "by_group",

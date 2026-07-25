@@ -119,14 +119,35 @@ def _subagent_prompt(content: str, _options: Options, outcome: Outcome) -> str:
 #: the main loop runs.
 INHERIT = "inherit"
 
-_AGENT_DEF = compile_js(r'agentType:"([\w-]+)",whenToUse:')
-_MODEL_FIELD = compile_js(r'model:"([\w\[\].-]+)"')
+# The optional `model:"..."` is the property *this patch inserts* into a
+# definition that had none. Without it in the anchor our own rewrite breaks the
+# adjacency the anchor is made of, and every agent we overrode vanishes from a
+# re-read of the patched bundle -- the menu offering five agents where the
+# binary has six, and `--model` rejecting the very agent it just pinned. The
+# only bundle that carries this shape is one we wrote, so it stays narrow.
+_AGENT_DEF = compile_js(r'agentType:"([\w-]+)",(?:model:"[^"]*",)?whenToUse:')
+#: What a model literal may contain: word characters, the ``[1m]`` brackets the
+#: binary's own long-context aliases carry, and the dots and dashes of a codex
+#: alias (``gpt-5.6-sol``). One home, because three matchers have to agree on it
+#: -- the definition's ``model:"..."``, the Task schema's enum, and the values
+#: read back out of that enum. They did not: the enum pair stopped at ``\w``, so
+#: the moment ``codex-models`` registered an alias the enum stopped matching and
+#: discovery fell back to three hardcoded names, silently dropping ``fable``
+#: along with every imported model.
+_MODEL_CHARS = r"[\w\[\].-]"
+_MODEL_FIELD = compile_js(rf'model:"({_MODEL_CHARS}+)"')
 #: A definition object is scanned at most this far; every known definition fits
 #: well within it, and the cap keeps a moved anchor from swallowing a neighbour.
 _DEF_WINDOW = 3000
 
-_MODEL_ENUM = compile_js(
-    rf'model:{IDENT}\.enum\(\[((?:"[\w\[\]]+",?)+)\]\)\.optional\(\)'
+#: The Task tool's own ``model`` enum -- the list of aliases a subagent may be
+#: pinned to. Group 1 is the comma-joined body. One home because two patches need
+#: this exact anchor: ``codex-models`` splices imported aliases into that group
+#: and :func:`discover_models` reads them back out (patches/__init__.py explains
+#: why that ordering is load-bearing). Matched separately, the two would drift
+#: apart on the next upstream reshape, and only one of them would be repaired.
+MODEL_ENUM = compile_js(
+    rf'model:{IDENT}\.enum\(\[((?:"{_MODEL_CHARS}+",?)+)\]\)\.optional\(\)'
     rf'\.describe\([`"]Optional model override'
 )
 #: Used only if the Task-tool schema anchor ever disappears.
@@ -186,10 +207,10 @@ def discover_agents(source: str) -> list[BuiltinAgent]:
 
 def discover_models(source: str) -> list[str]:
     """Model aliases the binary's own Task tool accepts for subagents."""
-    match = _MODEL_ENUM.search(source)
+    match = MODEL_ENUM.search(source)
     if not match:
         return list(_FALLBACK_MODELS)
-    return re.findall(r'"([\w\[\]]+)"', match.group(1))
+    return re.findall(rf'"({_MODEL_CHARS}+)"', match.group(1))
 
 
 # --------------------------------------------------------- model overrides
@@ -278,10 +299,21 @@ def _subagent_models(content: str, options: Options, outcome: Outcome) -> str:
         return content
 
     output = content
+    # The bundle in hand is the only authority on what a subagent may be pinned
+    # to -- including imported Codex aliases, which codex-models has already
+    # written into this very enum by the time we run (see patches/__init__.py).
+    # Asking the bundle rather than the options is what ties a pin to its
+    # registration: a codex-models the fixpoint dropped leaves no alias here, so
+    # the pin fails with it instead of landing on a model nothing registered.
     offered = {INHERIT, *discover_models(output)}
 
     for agent, target in sorted(options.subagent_models.items()):
-        step = outcome.step(agent)
+        # Required: every override reaching a patch has already been validated
+        # against this bundle by its surface (CLI, --from-cache, or the menu), so
+        # one that cannot be written is not a shape this build lacks -- it is the
+        # asked-for change failing. Left optional, the patch stayed green, the
+        # binary shipped without the override, and the manifest claimed it anyway.
+        step = outcome.step(agent, expect=True)
         if target not in offered:
             step.note(f"model {target!r} not offered by this bundle; skipped")
             continue
@@ -292,7 +324,11 @@ def _subagent_models(content: str, options: Options, outcome: Outcome) -> str:
 
         step.candidates += 1
         if info.effective_model == target:
-            continue  # already the desired model
+            # Already the desired model. Credited as landed because the step is
+            # judged on what it achieved, not on whether bytes moved -- the
+            # definition carries the chosen model either way (docs/PLAYBOOK.md).
+            step.applied += 1
+            continue
         if info.model is None:
             output = splice(
                 output, info.insert_at, info.insert_at, f'model:"{target}",'

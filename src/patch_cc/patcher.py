@@ -69,13 +69,20 @@ class PatchReport:
         return self.output is not None and not self.regressions
 
 
-def build_manifest(landed: list[str], options: Options) -> str:
+def manifest_payload(landed: list[str], options: Options) -> dict:
     """Describe what is *in the binary* -- never what was merely asked for.
 
     Each configurable value belongs to a patch, so it is recorded only when
     that patch landed. Writing the brand while `branding` was dropped for
     drifting would have `status` assert a name the bundle does not contain,
     and re-applying from that manifest would keep asserting it.
+
+    Kept apart from its serialisation because this *is* the description of a
+    patched bundle's shape, and one other question is asked of it: the menu's
+    "does my selection differ from the binary?" compares the payload this would
+    write against the one the binary carries, rather than re-listing the fields
+    by hand. A second, hand-written list of what counts is how the gateway port
+    and the imported model set came to change with the menu reporting no change.
     """
     applied = set(landed)
     payload: dict = {"v": 1, "tool": __version__, "patches": landed}
@@ -85,7 +92,23 @@ def build_manifest(landed: list[str], options: Options) -> str:
         payload["suffix"] = options.version_suffix
     if options.subagent_models and "subagent-models" in applied:
         payload["models"] = options.subagent_models
-    return "\n" + MANIFEST_PREFIX + json.dumps(payload, separators=(",", ":")) + "\n"
+    if options.codex_models and "codex-models" in applied:
+        # Ids and a port -- the whole of what was asked for. A model's name and
+        # context window are baked into the bundle itself (the picker rows, the
+        # window table), and re-stating them here would be a second copy free to
+        # disagree with it; they are also derived from the plan, so a backend that
+        # relabelled a model would read as an edit nobody made.
+        payload["codex"] = {
+            "port": options.codex_port,
+            "models": [m.id for m in options.codex_models],
+        }
+    return payload
+
+
+def build_manifest(landed: list[str], options: Options) -> str:
+    """The manifest comment line a patched bundle ends with."""
+    payload = json.dumps(manifest_payload(landed, options), separators=(",", ":"))
+    return "\n" + MANIFEST_PREFIX + payload + "\n"
 
 
 def read_manifest(source: str) -> dict | None:
@@ -135,46 +158,87 @@ def _backup_dir() -> Path:
 
 
 def backup_path_for(install: locate.Installation) -> Path:
-    """The single source of truth for where a binary's backup lives.
+    """Where a *new* backup for this binary is written.
 
-    Canonical native installs are version-named, giving a clean
-    ``<name>.<version>.orig``. When the name is not a version we cannot tell two
-    unrelated ``claude`` binaries apart by name alone, so a short hash of the
-    absolute path is mixed in to keep their backups distinct.
+    A canonical native install is version-named, so the binary's own name is
+    already the version and names the backup: ``2.1.219.orig``. When the name is
+    not a version we cannot tell two unrelated ``claude`` binaries apart by name
+    alone, so a short hash of the absolute path is mixed in to keep their
+    backups distinct.
     """
     root = _backup_dir()
     if install.version:
-        stem = f"{install.binary.name}.{install.version}"
-    else:
-        digest = hashlib.sha256(str(install.binary.resolve()).encode()).hexdigest()[:8]
-        stem = f"{install.binary.name}.unknown-{digest}"
-    return root / f"{stem}.orig"
+        return root / f"{install.binary.name}.orig"
+    digest = hashlib.sha256(str(install.binary.resolve()).encode()).hexdigest()[:8]
+    return root / f"{install.binary.name}.unknown-{digest}.orig"
 
 
-def read_pristine(install: locate.Installation) -> Bundle:
-    """The bundle patching starts from: the backup when one exists.
+def existing_backup(install: locate.Installation) -> Path | None:
+    """The pristine copy on disk, or ``None``.
 
-    Patching never stacks edits on edits -- each apply begins at this pristine
-    source, so the selected set is always exactly what ends up in the binary.
-    """
-    backup = backup_path_for(install)
-    return container.read(str(backup if backup.exists() else install.binary))
+    One home for "is there a backup, and which file is it" -- read, restore,
+    dry-run and status all ask that one question, and asking it five ways is how
+    a safety net grows a hole.
 
-
-def _backup(install: locate.Installation, *, pristine: bool) -> Path | None:
-    """Record the pristine original once, so ``restore`` is a plain copy back.
-
-    Only ever captures a binary that is actually unpatched: backing up an
-    already-marked binary would enshrine a poisoned "original" that ``restore``
-    would later hand back as clean.
+    Backups written before 0.2.0 doubled the name (``2.1.219.2.1.219.orig``:
+    for a version-named install the name *is* the version, so composing the two
+    only ever said it twice). Those are still adopted, because the alternative
+    is an install whose pristine copy silently stops counting as one.
     """
     dest = backup_path_for(install)
     if dest.exists():
         return dest
-    if not pristine:
-        return None
+    legacy = dest.with_name(f"{install.binary.name}.{install.version}.orig")
+    return legacy if install.version and legacy.exists() else None
+
+
+def read_pristine(
+    install: locate.Installation, *, installed: Bundle | None = None
+) -> Bundle:
+    """The bundle patching starts from: the backup when one exists.
+
+    Patching never stacks edits on edits -- each apply begins at this pristine
+    source, so the selected set is always exactly what ends up in the binary.
+
+    ``installed`` may carry an already-read bundle of the installed binary. With
+    no backup yet -- where every first run is -- that bundle *is* the pristine
+    source, so a caller that needed it anyway (the menu reads it for status)
+    stops paying for a second full read of the same 275 MB file.
+    """
+    backup = existing_backup(install)
+    if backup is not None:
+        return container.read(str(backup))
+    return installed if installed is not None else container.read(str(install.binary))
+
+
+def _backup(install: locate.Installation) -> Path:
+    """Record the pristine original once, so ``restore`` is a plain copy back.
+
+    Only ever reached with an unpatched original: :func:`patch_installation`
+    refuses a patched binary that has no backup to start from, so there is no
+    path here that could enshrine a poisoned "original" for ``restore`` to hand
+    back as clean.
+    """
+    existing = existing_backup(install)
+    if existing is not None:
+        return existing
+    dest = backup_path_for(install)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(install.binary, dest)
+    # Staged, then renamed -- the same discipline `container.write` uses on the
+    # binary itself, and for the same reason. Copying 275 MB straight onto the
+    # canonical name means a full disk, a SIGKILL, or a closed lid leaves a
+    # truncated file wearing it; `existing_backup` asks only whether that name
+    # exists, and `restore` copies whatever it finds over the live executable
+    # without reading it. The half-written "original" would be installed as the
+    # clean one -- the brick this whole file exists to prevent. A rename is
+    # atomic, so the name appears only once the bytes are all there.
+    staged = dest.with_name(dest.name + ".partial")
+    try:
+        shutil.copy2(install.binary, staged)
+        os.replace(staged, dest)
+    except BaseException:
+        staged.unlink(missing_ok=True)
+        raise
     return dest
 
 
@@ -185,7 +249,6 @@ def patch_installation(
     *,
     bundle: Bundle | None = None,
     out_path: Path | None = None,
-    make_backup: bool = True,
 ) -> PatchReport:
     """Patch ``install`` (or write to ``out_path``) with the ``selected`` patches.
 
@@ -235,8 +298,12 @@ def patch_installation(
     patched_source += build_manifest(landed, options)
 
     target = out_path or install.binary
-    if make_backup and out_path is None:
-        report.backup = _backup(install, pristine=not is_patched(source.source))
+    # Writing the install is the only case that needs a pristine copy kept; an
+    # `out_path` leaves it alone. There is deliberately no way to patch the
+    # install *without* the backup -- that switch existed, had no caller, and its
+    # only effect was to skip the one thing `restore` depends on.
+    if out_path is None:
+        report.backup = _backup(install)
 
     container.write(source, patched_source, str(target))
     report.output = Path(target)
@@ -244,27 +311,14 @@ def patch_installation(
     return report
 
 
-def clean_source_path(install: locate.Installation) -> Path | None:
-    """A binary whose bundle is guaranteed unpatched, for matcher-health tests.
-
-    If the installed binary is already patched, our own edits have removed the
-    anchors the matchers look for, so a dry-run against it conflates
-    "already applied" with "anchor gone". The pristine backup is the honest
-    thing to test against.
-    """
-    backup = backup_path_for(install)
-    return backup if backup.exists() else None
-
-
 def restore(install: locate.Installation) -> Path:
     """Copy the pristine backup back over the installed binary."""
-    backup = backup_path_for(install)
-    if not backup.exists():
+    backup = existing_backup(install)
+    if backup is None:
         raise FileNotFoundError(
-            f"No backup found for {install.binary.name} "
-            f"{install.version or '(unknown version)'} at {backup}. "
-            "If Claude auto-updated, the original for this version was never saved -- "
-            "reinstall to get a clean binary."
+            f"No backup found for {install.binary.name} at "
+            f"{backup_path_for(install)}. If Claude auto-updated, the original "
+            "for this version was never saved -- reinstall to get a clean binary."
         )
     # A full-file copy-back, so it works for both ELF and Mach-O.
     from .bun.elf import atomic_write  # noqa: PLC0415

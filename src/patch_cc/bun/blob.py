@@ -90,9 +90,14 @@ class Blob:
         return self.payload(self.entry_module().ranges["contents"])
 
     def bytecode_size(self) -> int:
-        return (
-            self.entry_module().ranges["bytecode"][1] if self.struct_size == 52 else 0
-        )
+        """Bytes of precompiled bytecode on the entrypoint, for either layout.
+
+        ``bytecode`` is the fourth pair, so *both* record formats carry it --
+        ``FIELDS_OLD`` is the first four of ``FIELDS_NEW``. Reporting zero for the
+        36-byte layout said "already stripped" about a module that had 154 MB of
+        it, which is the one thing ``status`` reads this for.
+        """
+        return self.entry_module().ranges["bytecode"][1]
 
 
 def _detect_struct_size(modules_len: int) -> int:

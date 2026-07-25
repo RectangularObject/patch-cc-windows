@@ -24,6 +24,7 @@ changes asks first.
 from __future__ import annotations
 
 import sys
+import textwrap
 import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -39,6 +40,8 @@ from rich.text import Text
 
 from . import cache, locate, patcher
 from .bun import Bundle, BunError, container
+from .codex import DEFAULT_PORT, is_valid_port
+from .codex.models import CodexModel, discover, reconcile
 from .patches import (
     DEFAULT_BRAND,
     DEFAULT_SUFFIX,
@@ -49,7 +52,7 @@ from .patches import (
     derived_brand,
 )
 from .patches.agents import INHERIT, BuiltinAgent, discover_agents, discover_models
-from .ui import MARKS, applied_value, console, err, findings
+from .ui import MARKS, applied_value, console, err, findings, gateway_note
 
 if TYPE_CHECKING:
     from .doctor import DryRun, Status
@@ -81,7 +84,7 @@ def _hints(*pairs: tuple[str, str]) -> Text:
 
 
 #: Patches whose row opens a modal on enter instead of plain toggling.
-_CONFIGURABLE = {"subagent-models", "branding", "version-marker"}
+_CONFIGURABLE = {"subagent-models", "branding", "version-marker", "codex-models"}
 
 
 # ----------------------------------------------------------------- rows
@@ -116,6 +119,14 @@ class TextRow:
     value: str
 
 
+@dataclass(slots=True)
+class _CodexPick:
+    """One model your plan offers, as the checklist edits it."""
+
+    model: CodexModel
+    on: bool = False
+
+
 Row = HeaderRow | PatchRow
 
 
@@ -131,6 +142,10 @@ class MenuModel:
     patch_rows: dict[str, PatchRow] = field(default_factory=dict)
     agent_rows: list[AgentRow] = field(default_factory=list)
     text_rows: dict[str, TextRow] = field(default_factory=dict)
+    #: Codex models to register and the port to route them to -- edited in the
+    #: Codex submenu, seeded and saved exactly like every other choice here.
+    codex_models: list[CodexModel] = field(default_factory=list)
+    codex_port: int = DEFAULT_PORT
 
     @classmethod
     def build(
@@ -147,14 +162,19 @@ class MenuModel:
         )
 
         seed = model._seed()
+        model.codex_models = list(seed.options.codex_models)
+        model.codex_port = seed.options.codex_port
         for group in GROUP_ORDER:
             for patch in by_group().get(group, []):
                 model.patch_rows[patch.id] = PatchRow(patch, patch.id in seed.patches)
 
+        # A Codex id this run would register is a valid pin too, so a remembered
+        # codex override survives instead of snapping back to keep.
+        offered = {*models, *(m.id for m in model.codex_models)}
         for agent in agents:
             picked = seed.options.subagent_models.get(agent.name)
             model.agent_rows.append(
-                AgentRow(agent, picked if picked in models else _KEEP)
+                AgentRow(agent, picked if picked in offered else _KEEP)
             )
 
         brand = seed.options.brand if seed.options.rebrands else derived_brand()
@@ -166,8 +186,11 @@ class MenuModel:
 
     def _seed(self) -> cache.Selection:
         """Manifest > cached last selection > defaults."""
-        manifest = getattr(self.status, "manifest", None)
+        manifest = self.status.manifest
         if manifest:
+            codex = manifest.get("codex")
+            codex = codex if isinstance(codex, dict) else {}
+            port = codex.get("port")
             seed = cache.Selection()
             seed.patches = [
                 p for p in manifest.get("patches", []) if isinstance(p, str)
@@ -180,6 +203,15 @@ class MenuModel:
                     for a, m in (manifest.get("models") or {}).items()
                     if isinstance(a, str) and isinstance(m, str)
                 },
+                # Ids, which is all the manifest records: what a model is called
+                # and how wide its context is belong to your plan, and are asked
+                # for again at the moment of baking (`_apply`).
+                codex_models=[
+                    CodexModel(i)
+                    for i in codex.get("models") or []
+                    if isinstance(i, str) and i
+                ],
+                codex_port=port if is_valid_port(port) else DEFAULT_PORT,
             )
             return seed
         return cache.load()
@@ -197,13 +229,30 @@ class MenuModel:
     def overridden(self) -> int:
         return sum(1 for row in self.agent_rows if row.choice != _KEEP)
 
+    def applied_ids(self) -> set[str]:
+        """What the binary claims, limited to what this build still offers.
+
+        A manifest written by an older patch-cc can name a patch that has since
+        been retired (docs/PLAYBOOK.md keeps the list). There is no row for one,
+        so counting it would leave the selection differing from the binary
+        forever -- a permanent "unsaved", and a quit-confirm, on a binary nobody
+        has touched.
+        """
+        return {pid for pid in self.status.patch_ids if pid in self.patch_rows}
+
     # -- what apply would do
 
     def selection(self) -> cache.Selection:
         selected = [pid for pid, row in self.patch_rows.items() if row.on]
         options = Options()
+        # Only pin a target that still exists: a Codex model can vanish mid-session
+        # when the Codex submenu unpicks it, and a stale pin would be written --
+        # and cached -- only for the patch layer to skip it.
+        offered = {*self.models, *(m.id for m in self.codex_models)}
         overrides = {
-            row.agent.name: row.choice for row in self.agent_rows if row.choice != _KEEP
+            row.agent.name: row.choice
+            for row in self.agent_rows
+            if row.choice != _KEEP and row.choice in offered
         }
         if "subagent-models" in selected:
             if overrides:
@@ -220,6 +269,28 @@ class MenuModel:
             options.version_suffix = (
                 self.text_rows["suffix"].value.strip() or DEFAULT_SUFFIX
             )
+        # A subagent pinned to a Codex model needs codex-models applied too -- it
+        # registers the id and installs the redirect, without which the pin
+        # resolves to nothing. That coupling is enforced where the user can see
+        # it (`_open_model_modal` turns the row on with the pin), never here:
+        # silently adding the patch during serialisation applied a row the screen
+        # was drawing as off. So a pin whose patch is switched off is dropped, and
+        # the visible selection is what runs.
+        codex_ids = {m.id for m in self.codex_models}
+        if "codex-models" not in selected:
+            options.subagent_models = {
+                agent: model
+                for agent, model in options.subagent_models.items()
+                if model not in codex_ids
+            }
+            if not options.subagent_models and "subagent-models" in selected:
+                selected.remove("subagent-models")
+        if "codex-models" in selected:
+            if self.codex_models:
+                options.codex_models = list(self.codex_models)
+                options.codex_port = self.codex_port
+            else:
+                selected.remove("codex-models")  # nothing chosen to register
         return cache.Selection(patches=selected, options=options)
 
 
@@ -298,7 +369,13 @@ class InputModal:
     """A centered free-text field; enter saves, esc keeps the old value."""
 
     def __init__(
-        self, title: str, value: str, *, width: int = 52, max_len: int = 48
+        self,
+        title: str,
+        value: str,
+        *,
+        width: int = 52,
+        max_len: int = 48,
+        digits_only: bool = False,
     ) -> None:
         self.title = title
         self.value = value
@@ -306,6 +383,8 @@ class InputModal:
         self.hint = _hints(("enter", "save"), ("esc", "cancel"))
         self.width = width
         self.max_len = max_len
+        #: Reject non-digit keys at input time (a numeric field, e.g. the port).
+        self.digits_only = digits_only
         self.finish: Callable[[object], None] = lambda result: None
 
     def handle(self, key: str) -> None:
@@ -329,6 +408,10 @@ class InputModal:
             self.value = self.value[: self.cur] + self.value[self.cur + 1 :]
         else:
             ch = " " if key == "space" else key
+            # Match ASCII 0-9 only: str.isdigit() also passes superscripts like
+            # "²" (a single AZERTY/AltGr keypress) that int() then rejects.
+            if self.digits_only and ch not in "0123456789":
+                return
             if len(ch) == 1 and ch.isprintable() and len(self.value) < self.max_len:
                 self.value = self.value[: self.cur] + ch + self.value[self.cur :]
                 self.cur += 1
@@ -383,7 +466,79 @@ class ConfirmModal:
         )
 
 
-Modal = PickModal | InputModal | ConfirmModal
+class CheckModal:
+    """A centered checklist: space toggles, enter confirms.
+
+    Used for "which Codex models to enable". Each row is a discovered model;
+    reasoning effort is not chosen here -- it rides in each request (Claude
+    Code's live ``/effort``), so one enabled model serves every level.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        items: list[_CodexPick],
+        *,
+        hint: Text | None = None,
+        width: int = 64,
+    ) -> None:
+        self.title = title
+        self.items = items
+        self.cursor = 0
+        self.width = width
+        self.hint = hint or _hints(
+            ("space", "toggle"), ("enter", "done"), ("esc", "cancel")
+        )
+        self.finish: Callable[[object], None] = lambda result: None
+
+    def handle(self, key: str) -> None:
+        if key in ("escape", "q"):
+            self.finish(None)
+            return
+        if key == "enter":
+            self.finish([item for item in self.items if item.on])
+            return
+        if not self.items:
+            return
+        if key in ("down", "j"):
+            self.cursor = (self.cursor + 1) % len(self.items)
+        elif key in ("up", "k"):
+            self.cursor = (self.cursor - 1) % len(self.items)
+        elif key == "space":
+            item = self.items[self.cursor]
+            item.on = not item.on
+
+    def render(self) -> Panel:
+        inner = self.width - 8
+        body = Text()
+        if not self.items:
+            body.append("  no models offered by your plan\n", style="dim")
+        for i, item in enumerate(self.items):
+            current = i == self.cursor
+            line = Text()
+            line.append("❯ " if current else "  ", style=_ACCENT)
+            line.append(
+                "◉ " if item.on else "○ ",
+                style=_ACCENT if item.on else f"dim {_ACCENT}",
+            )
+            line.append(
+                item.model.label,
+                style="bold" if current else ("" if item.on else "dim"),
+            )
+            line.truncate(inner, overflow="ellipsis")
+            body.append_text(line)
+            body.append("\n")
+        return Panel(
+            Group(body, Align.center(self.hint)),
+            box=box.ROUNDED,
+            border_style=_ACCENT,
+            padding=(1, 3),
+            title=Text(self.title, style=f"bold {_ACCENT}"),
+            title_align="center",
+        )
+
+
+Modal = PickModal | InputModal | ConfirmModal | CheckModal
 
 
 # ----------------------------------------------------------------- app
@@ -416,6 +571,10 @@ class MenuApp:
         self._exit: int | None = None
         #: A worker's tagged result, read by the loop: (kind, payload, error).
         self._worker_result: tuple[str, Any, str | None] | None = None
+        #: Set (from a busy-view key) to abandon an in-flight sign-in poll.
+        self._cancel = threading.Event()
+        #: The codex-models row awaiting the submenu's result.
+        self._codex_row: PatchRow | None = None
         self._frame = 0
         self._scroll = 0
         self._needs_paint = True
@@ -448,6 +607,10 @@ class MenuApp:
                         self._on_key("ctrl+c")
                     continue
                 if self.view == "busy":
+                    # A slow sign-in poll is the one busy state a key can touch:
+                    # esc asks it to give up.
+                    if self._key_name(keystroke) == "escape":
+                        self._cancel.set()
                     self._poll_worker()
                     continue
                 key = self._key_name(keystroke)
@@ -555,6 +718,8 @@ class MenuApp:
         elif patch_id in ("branding", "version-marker"):
             row.on = True
             self._open_text_modal("brand" if patch_id == "branding" else "suffix")
+        elif patch_id == "codex-models":
+            self._open_codex_menu(row)  # submenu: pick models / set gateway port
         else:
             row.on = not row.on
 
@@ -600,18 +765,40 @@ class MenuApp:
         )
 
     def _open_model_modal(self, agent_row: AgentRow) -> None:
-        items = [_KEEP, *self.model.models]
+        codex_ids = [m.id for m in self.model.codex_models]
+        items = [_KEEP, *self.model.models, *codex_ids]
+        codex_set = set(codex_ids)
 
         def label(value: str, _selected: bool) -> Text:
+            """The handle you pick, then a dim parenthetical explaining it.
+
+            Every row is that one shape -- what `keep` would leave in place, what
+            `inherit` resolves to, where a Codex model came from -- so the branches
+            below only choose the words, never how they are drawn. Written three
+            ways, only the codex row's aside was dim and the other two read as
+            part of the name.
+            """
+            head, note = value, ""
             if value == _KEEP:
-                return Text(f"keep default ({agent_row.agent.effective_model})")
-            if value == INHERIT:
-                return Text("inherit (main model)")
-            return Text(value)
+                head, note = "keep default", agent_row.agent.effective_model
+            elif value == INHERIT:
+                note = "main model"
+            elif value in codex_set:
+                note = "codex"
+            text = Text(head)
+            if note:
+                text.append(f" ({note})", style="dim")
+            return text
 
         def picked(choice: object) -> None:
-            if isinstance(choice, str):
-                agent_row.choice = choice
+            if not isinstance(choice, str):
+                return
+            agent_row.choice = choice
+            # A Codex model only resolves once codex-models registers it, so the
+            # pin selects that row too -- here, where the tick visibly moves,
+            # rather than at save time behind a row still drawn as off.
+            if choice in codex_set:
+                self.model.patch_rows["codex-models"].on = True
 
         self._push(
             PickModal(
@@ -633,6 +820,159 @@ class MenuApp:
                 row.value = value.strip()
 
         self._push(InputModal(titles[key], row.value), entered)
+
+    # -- codex submenu: pick models / set the gateway port ------------------
+    #
+    # Enter on the codex-models row opens this chooser instead of jumping
+    # straight into sign-in: `enter` is the row's only free affordance (space
+    # toggles the row), so both settings hang off it. Each choice closes the
+    # chooser before it runs, so the network flow below never fires with a modal
+    # still on the stack. Nothing here writes to disk -- both settings are part of
+    # the selection, saved with it by `s` and by nothing else.
+
+    def _open_codex_menu(self, row: PatchRow) -> None:
+        model = self.model
+
+        def label(item: str, selected: bool) -> Text:
+            head = "bold" if selected else ""
+            if item == "models":
+                n = len(model.codex_models)
+                text = Text("Pick models", style=head)
+                text.append(f"  {n} chosen" if n else "  none chosen", style="dim")
+                return text
+            text = Text("Gateway port", style=head)
+            text.append(f"  {model.codex_port}", style=_VALUE)
+            return text
+
+        def chosen(item: object) -> None:
+            if item == "models":
+                self._open_codex(row)
+            elif item == "port":
+                self._open_codex_port()
+
+        self._push(
+            PickModal(
+                "Codex",
+                ["models", "port"],
+                label,
+                width=46,
+                hint=_hints(("enter", "open"), ("esc", "close")),
+            ),
+            chosen,
+        )
+
+    def _open_codex_port(self) -> None:
+        model = self.model
+
+        def entered(value: object) -> None:
+            if not isinstance(value, str):
+                return  # cancelled
+            text = value.strip()
+            if not text:
+                return  # left blank -> keep the current port
+            try:
+                port = int(text)  # the digit filter should already ensure this
+            except ValueError:
+                self.flash = "port must be a number"
+                return
+            if not is_valid_port(port):
+                self.flash = "port must be between 1 and 65535"
+                return
+            model.codex_port = port
+
+        self._push(
+            InputModal(
+                "Gateway port",
+                str(model.codex_port),
+                width=46,
+                max_len=5,
+                digits_only=True,
+            ),
+            entered,
+        )
+
+    # -- pick models: sign in (if needed) -> discover -> choose -------------
+    #
+    # Each network step is a worker thread that reports through _worker_result,
+    # exactly like apply/doctor; the busy view shows progress and esc cancels a
+    # slow sign-in. Sign-in and discovery share oauth/models with the CLI, so the
+    # two surfaces behave identically.
+    #
+    # The list is fetched live every time, which is what keeps a remembered pick
+    # honest: a model the current plan no longer offers simply has no row to be
+    # ticked in, so switching accounts reconciles itself instead of leaving a
+    # choice nothing can serve.
+
+    def _open_codex(self, row: PatchRow) -> None:
+        from .codex import oauth
+
+        self._codex_row = row
+        if oauth.load() is None:
+            self._start_codex_auth()
+        else:
+            self._start_codex_discovery()
+
+    def _start_codex_auth(self) -> None:
+        from .codex import oauth
+
+        def show(url: str, code: str) -> None:
+            self.busy_message = f"code {code}   ·   {url}   ·   esc cancels"
+            self._needs_paint = True
+
+        self._cancel.clear()
+        self._start_worker(
+            "codex-auth",
+            "Starting OpenAI sign-in …",
+            lambda: oauth.login(show, cancel=self._cancel.is_set),
+        )
+
+    def _start_codex_discovery(self) -> None:
+        self._start_worker(
+            "codex-discover", "Fetching your Codex models …", self._discover_codex
+        )
+
+    def _discover_codex(self) -> list[CodexModel]:
+        from .codex import oauth
+
+        creds = oauth.load()
+        if creds is None:
+            raise oauth.OAuthError("not signed in")
+        token, creds = oauth.valid_access(creds)
+        return discover(token, creds.account_id, self.model.install.version or "")
+
+    def _open_codex_picker(self, offered: list[CodexModel]) -> None:
+        if not offered:
+            # Nothing to choose from. Opening an empty checklist would let `enter`
+            # confirm `[]` and clear every pick.
+            self.flash = "couldn't fetch models: your plan was unreachable"
+            return
+        chosen = {m.id for m in self.model.codex_models}
+        items = [_CodexPick(model=m, on=m.id in chosen) for m in offered]
+        self._push(CheckModal("Codex models", items), self._codex_picked)
+
+    def _codex_picked(self, result: object) -> None:
+        if not isinstance(result, list):
+            return  # cancelled -- selection and row untouched
+        # Straight from the picker, so every model carries the name and window the
+        # plan just reported. Nothing is merged in from the previous set: an id is
+        # a model's whole identity, so the ticked rows *are* the answer.
+        models = [pick.model for pick in result]
+        self.model.codex_models = models
+        # A pin to a model just unpicked no longer resolves; revert those agent rows
+        # to keep so the display and the saved selection stay honest (selection()
+        # drops them anyway, but silently -- the row would still lie).
+        offered = {*self.model.models, *(m.id for m in models)}
+        reverted = []
+        for arow in self.model.agent_rows:
+            if arow.choice != _KEEP and arow.choice not in offered:
+                reverted.append(arow.agent.name)
+                arow.choice = _KEEP
+        if self._codex_row is not None:
+            self._codex_row.on = bool(models)
+        if not models:
+            self.flash = "no Codex models chosen"
+        elif reverted:
+            self.flash = f"reset {', '.join(reverted)} to keep (model unpicked)"
 
     def _confirm_restore(self) -> None:
         def answered(restore: object) -> None:
@@ -661,20 +1001,30 @@ class MenuApp:
         self._exit = self.exit_code if self.view in ("report", "doctor") else 0
 
     def _unsaved(self) -> bool:
-        """Does the current selection differ from what the binary carries?"""
+        """Does the current selection differ from what the binary carries?
+
+        Answered by building the manifest this selection *would* write and
+        comparing it to the one the binary has. The manifest is already the single
+        description of a patched bundle's shape, so listing the fields again here
+        would be a second copy of it, free to fall behind -- which is exactly what
+        happened: the gateway port and the imported model set could both change
+        with the menu still reporting no change, and quitting asked nothing.
+
+        Two keys are excluded because they are not edits the user made: ``tool``
+        (a patch-cc upgrade) and ``v``. The patch list is compared through
+        :meth:`MenuModel.applied_ids`, so a retired id in an older manifest cannot
+        read as a change nobody can save away.
+        """
         manifest = self.model.status.manifest
         sel = self.model.selection()
         if not manifest:
             return bool(sel.patches)
-        if set(sel.patches) != set(self.model.status.patch_ids):
-            return True
-        brand = manifest.get("brand") or DEFAULT_BRAND
-        chosen = sel.options.brand if "branding" in sel.patches else DEFAULT_BRAND
-        if brand != chosen:
-            return True
-        if (manifest.get("suffix") or DEFAULT_SUFFIX) != sel.options.version_suffix:
-            return True
-        return (manifest.get("models") or {}) != sel.options.subagent_models
+        would = patcher.manifest_payload(sorted(sel.patches), sel.options)
+        carried = {**manifest, "patches": sorted(self.model.applied_ids())}
+        return any(
+            would.get(key) != carried.get(key)
+            for key in (would.keys() | carried.keys()) - {"v", "tool"}
+        )
 
     # ---------------------------------------------------- actions
 
@@ -687,11 +1037,11 @@ class MenuApp:
         def confirmed(save: object) -> None:
             if not save:
                 return
-            cache.save(selection)
-            self._busy(f"Patching Claude {self.model.install.version or '?'} …")
-            threading.Thread(
-                target=self._apply_worker, args=(selection,), daemon=True
-            ).start()
+            self._start_worker(
+                "apply",
+                f"Patching Claude {self.model.install.version or '?'} …",
+                lambda: self._apply(selection),
+            )
 
         count = len(selection.patches)
         self._push(
@@ -703,53 +1053,86 @@ class MenuApp:
             confirmed,
         )
 
-    def _apply_worker(self, selection: cache.Selection) -> None:
-        try:
-            report = patcher.patch_installation(
-                self.model.install,
-                selection.patches,
-                selection.options,
-                bundle=self.model.pristine,
+    def _apply(
+        self, selection: cache.Selection
+    ) -> tuple[patcher.PatchReport, "Status | None"]:
+        options = selection.options
+        if options.codex_models:
+            # Fill in each model's name and window right before baking. A pick
+            # seeded from the manifest or the cache carries an id and nothing else,
+            # and a model baked without its real window makes Claude Code
+            # auto-compact early -- so the plan is asked here, off-loop, where the
+            # busy view is already up and a slow answer costs no frame.
+            #
+            # Refreshing only ever *adds* what the plan knows: a model it no longer
+            # offers keeps its fallbacks instead of being dropped behind your back.
+            # Dropping belongs to the picker, which lists the plan live, so a model
+            # that has gone simply has no row left to tick -- visible, and undoable.
+            options.codex_models, _ = reconcile(
+                options.codex_models, self.model.install.version or ""
             )
-            status = None
-            if report.output is not None:
-                # The binary just changed; recompute the header state off-loop.
-                try:
-                    from . import doctor
+        report = patcher.patch_installation(
+            self.model.install,
+            selection.patches,
+            selection.options,
+            bundle=self.model.pristine,
+        )
+        status = None
+        if report.output is not None:
+            # Remembered once it is really in the binary, never before -- the
+            # same rule `apply` follows. Saving on the way in would have a run
+            # that then failed still rewrite what `--from-cache` replays.
+            cache.save(selection)
+            # The binary just changed; recompute the header state off-loop. A
+            # failure here costs only the refreshed header, not the apply that
+            # already succeeded, so it stays a local miss rather than a result.
+            try:
+                from . import doctor
 
-                    status = doctor.status(
-                        container.read(str(self.model.install.binary))
-                    )
-                except (BunError, OSError):
-                    status = None
-            self._worker_result = ("apply", (report, status), None)
-        except (patcher.AlreadyPatchedError, BunError, OSError) as exc:
-            self._worker_result = ("apply", None, str(exc))
+                status = doctor.status(container.read(str(self.model.install.binary)))
+            except (BunError, OSError):
+                status = None
+        return report, status
 
     def _start_doctor(self) -> None:
-        self._busy("Checking every patch against a clean bundle …")
-        threading.Thread(target=self._doctor_worker, daemon=True).start()
-
-    def _doctor_worker(self) -> None:
         from . import doctor
 
-        self._worker_result = ("doctor", doctor.dryrun(self.model.pristine), None)
+        self._start_worker(
+            "doctor",
+            "Checking every patch against a clean bundle …",
+            lambda: doctor.dryrun(self.model.pristine),
+        )
 
     def _start_restore(self) -> None:
-        self._busy("Restoring the original binary …")
-        threading.Thread(target=self._restore_worker, daemon=True).start()
-
-    def _restore_worker(self) -> None:
-        try:
-            patcher.restore(self.model.install)
-            self._worker_result = ("restore", None, None)
-        except (FileNotFoundError, OSError) as exc:
-            self._worker_result = ("restore", None, str(exc))
+        self._start_worker(
+            "restore",
+            "Restoring the original binary …",
+            lambda: patcher.restore(self.model.install),
+        )
 
     def _busy(self, message: str) -> None:
         self.view = "busy"
         self.busy_message = message
         self._needs_paint = True
+
+    def _start_worker(self, kind: str, message: str, work: Callable[[], Any]) -> None:
+        """Show ``message``, run ``work`` off-loop, and post its result exactly once.
+
+        Failing is a result too. A worker that dies without posting leaves the
+        busy view spinning forever -- nothing else polls it, and ``esc`` there
+        only sets ``_cancel`` -- so the one thing every worker must not do is
+        raise. Owning that here is what lets each of them below be the plain
+        call it is, and makes the guarantee true for the next one by default.
+        """
+        self._busy(message)
+
+        def run() -> None:
+            try:
+                self._worker_result = (kind, work(), None)
+            except Exception as exc:
+                self._worker_result = (kind, None, str(exc) or exc.__class__.__name__)
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _poll_worker(self) -> None:
         result = self._worker_result
@@ -782,6 +1165,22 @@ class MenuApp:
                 return
             self.exit_message = "Restored the original binary. Restart Claude Code."
             self._exit = 0
+        elif kind == "codex-auth":
+            self.view = "select"
+            if error is not None:
+                self.flash = (
+                    "sign-in cancelled"
+                    if "cancel" in error.lower()
+                    else f"sign-in failed: {error}"
+                )
+                return
+            self._start_codex_discovery()  # signed in -> straight to discovery
+        elif kind == "codex-discover":
+            self.view = "select"
+            if error is not None:
+                self.flash = f"couldn't fetch models: {error}"
+                return
+            self._open_codex_picker(payload)
 
     # ---------------------------------------------------- movement
 
@@ -920,7 +1319,7 @@ class MenuApp:
         line.append(f"Claude {model.install.version or '?'}", style="bold")
         line.append("  ·  ", style="dim")
         if model.status.patched:
-            applied = len(model.status.patch_ids)
+            applied = len(model.applied_ids())
             line.append("patched", style="green")
             if applied:
                 line.append(f" ({applied})", style="dim")
@@ -934,8 +1333,11 @@ class MenuApp:
     def _foot(self, panel_width: int) -> list[Text]:
         lines = [Text("─" * panel_width, style=_RULE)]
         if self.view == "select":
-            if self.flash:
-                lines.append(_center(Text(self.flash, style=_WARN), panel_width))
+            # Wrapped, not truncated. The longest thing that lands here is the
+            # "already patched and no pristine backup exists" refusal, whose
+            # whole value is the sentence naming the way out -- and one centred
+            # line cut at the panel edge threw exactly that half away.
+            lines += _center_block(textwrap.wrap(self.flash, panel_width), panel_width)
             rows = self.model.rows()
             row = rows[self.cursor] if self.cursor < len(rows) else None
             if isinstance(row, PatchRow) and row.patch.id in _CONFIGURABLE:
@@ -1010,6 +1412,13 @@ class MenuApp:
             return Text(model.text_rows["brand"].value, style=_VALUE)
         if row.patch.id == "version-marker":
             return Text(model.text_rows["suffix"].value, style=_VALUE)
+        if row.patch.id == "codex-models":
+            count = len(model.codex_models)
+            if not count:
+                return Text("none chosen", style="dim")
+            note = Text(f"{count} model{'s' if count != 1 else ''}", style=_VALUE)
+            note.append(f"  ·  :{model.codex_port}", style="dim")
+            return note
         return None
 
     def _body_busy(self, panel_width: int) -> tuple[list[Text], int | None]:
@@ -1035,7 +1444,7 @@ class MenuApp:
             line.append(f"  {mark} ", style=style)
             line.append(f"{patch.title:<32}")
             line.append(f"{outcome.applied or '':>3}", style="dim")
-            if outcome.applied and (value := applied_value(patch, options)):
+            if value := applied_value(patch, outcome, options):
                 line.append(f"  → {value}", style="dim")
             lines.append(line)
             lines += _findings(outcome)
@@ -1066,6 +1475,11 @@ class MenuApp:
             )
             lines.append(line)
             lines.append(Text("    Restart Claude Code to see it.", style="dim"))
+            if "codex-models" in report.landed_ids:
+                # The binary now routes Codex models to this port; the run that
+                # made that true is the only one that knows to say so.
+                style, note = gateway_note(options.codex_port)
+                lines.append(Text(f"    gateway  {note}", style=style))
             lines.append(
                 Text(
                     "    Reapply this selection anytime:  patch-cc apply --from-cache",
@@ -1109,6 +1523,16 @@ def _center(text: Text, width: int) -> Text:
     return line
 
 
+def _center_block(lines: list[str], width: int, style: str = _WARN) -> list[Text]:
+    """Centre wrapped text as one block, sharing a left edge.
+
+    Centring each line on its own makes a broken path zig-zag down the panel;
+    one edge is what lets several lines still read as a single sentence.
+    """
+    pad = " " * max(0, (width - max((len(line) for line in lines), default=0)) // 2)
+    return [Text(pad + line, style=style) for line in lines]
+
+
 # ----------------------------------------------------------------- entry
 
 
@@ -1128,7 +1552,10 @@ def run_menu() -> int:
 
     try:
         installed = container.read(str(install.binary))
-        pristine = patcher.read_pristine(install)
+        # Before the first apply there is no backup, and the installed binary
+        # *is* the pristine source -- handing it over keeps a first run from
+        # reading the same 275 MB file twice.
+        pristine = patcher.read_pristine(install, installed=installed)
     except BunError as exc:
         err(str(exc))
         return 1

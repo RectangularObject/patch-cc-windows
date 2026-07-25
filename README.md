@@ -24,12 +24,12 @@ uvx patch-cc                   # fullscreen menu, no install needed
 ```
 
 The menu is a single centered panel: move with `↑ ↓`, toggle with `space`,
-press `s` to save. Patches that carry a setting — subagent models, the startup
-name, the `--version` marker — open a centered modal on `enter`, and the row
-then shows what you chose. Everything choosable is a picker: the agent names
-and model aliases are **discovered from your binary itself**, so the menu can
-never offer something your build would reject. Typing exists only for the two
-genuinely free-text values.
+press `s` to save. Patches that carry a setting — subagent models, Codex models,
+the startup name, the `--version` marker — open a centered modal on `enter`, and
+the row then shows what you chose. Everything choosable is a picker: the agent
+names and model aliases are **discovered from your binary itself** (and the
+Codex ones from your plan), so the menu can never offer something your build
+would reject. Typing exists only for the genuinely free-text values.
 
 A patched binary records what was applied inside itself, so the menu always
 comes up showing the real current state, and `patch-cc status` answers
@@ -56,6 +56,7 @@ patch-cc                       # then just run it
 | Chrome | Disable spinner tips | No rotating tips on the spinner |
 | | Custom startup name | Defaults to `<your username>'s Code` |
 | | Mark `--version` | Appends `(patched)` — or any marker you choose |
+| Codex | Codex models | Use OpenAI/Codex-plan models in Claude Code — see [Codex models](#codex-models) |
 
 ## Usage
 
@@ -69,6 +70,7 @@ uvx patch-cc apply --brand                    # + branding as <username>'s Code
 uvx patch-cc apply --brand "Ada's Code"       # + branding, explicit name
 uvx patch-cc apply --model Explore=haiku --model general-purpose=opus
 uvx patch-cc apply --suffix "(mine)"          # custom --version marker
+uvx patch-cc apply --codex gpt-5.6-sol        # + a Codex model (see below)
 uvx patch-cc apply --from-cache               # replay your last remembered selection
 uvx patch-cc status                           # exactly what is applied
 uvx patch-cc doctor                           # do all patches match this build?
@@ -77,8 +79,67 @@ uvx patch-cc list                             # every patch, described
 uvx patch-cc restore                          # put the original back
 ```
 
-`--model` and `--brand` imply their patches; agents and models are validated
-against what your installed binary actually ships.
+`--brand`, `--model` and `--codex` imply their patches; agents and models are
+validated against what your installed binary actually ships, and Codex model ids
+against what your plan offers. `apply --help` lists all three.
+
+## Codex models
+
+Bring your **ChatGPT/Codex-plan** models (GPT-5.x) into Claude Code and use them
+alongside your Claude ones — in the `/model` picker, as a subagent override,
+with `/effort` driving how hard they think. It is two halves: a patch that
+teaches your binary to accept and route the models you pick, and a small
+localhost **gateway** that translates between Claude Code and OpenAI. Only the
+models you pick are diverted — every Anthropic request stays byte-identical,
+so your Claude plan is untouched. Nothing extra to install: the gateway is pure
+Python and ships with patch-cc; you just sign in to a ChatGPT or Codex plan.
+
+```bash
+uvx patch-cc codex login                 # sign in to your ChatGPT/Codex plan
+uvx patch-cc                             # Codex models → pick models → save with `s`
+uvx patch-cc codex serve                 # start the gateway; keep it running
+```
+
+Which models you want is a patch setting like the startup name, so the menu's
+**Codex models** row is where you pick them — it lists what your plan offers,
+live. Everything the menu does the command line does too:
+
+```bash
+uvx patch-cc apply --codex gpt-5.6-sol --codex gpt-5.5
+uvx patch-cc apply --help                # lists the model ids your plan offers
+uvx patch-cc apply --from-cache           # replay your last selection
+```
+
+Then pick a model like any other:
+
+```bash
+claude --model sol                       # shortcut → newest gpt-5.6-sol
+claude --model gpt-5.6-sol               # the full id also works, as does /model
+```
+
+- **Shortcuts** (`sol`, `terra`, `luna`, …) are the last word of the model id;
+  the newest in a family wins, the way `opus` means the latest Claude Opus. They
+  are derived from the ids you picked — there is nothing to configure.
+- **Your binary is the record.** The models and the port live in the patched
+  binary, so `patch-cc status` names exactly what is registered, and
+  `codex serve` finds the right port with nothing to tell it.
+- **They read as native everywhere.** A registered model is added to the
+  binary's own model table, so its real name shows in the status line and the
+  welcome banner, its plan-reported effort levels are declared, and
+  `/advisor sol` works like any other model. Ask for an effort the model
+  doesn't run and the gateway quietly runs the closest lower one — the same
+  clamping Claude Code documents for its own models.
+- **The gateway has to be running.** Every surface that names it says whether it
+  is — the apply report as soon as you bake, `patch-cc status`, and `codex
+  status` — so you never learn it from a request that hangs instead.
+- The gateway holds *your* OpenAI token and listens only on localhost. No
+  Anthropic-model request is ever diverted to it. The Codex ones that *are*
+  still carry Claude Code's own auth header — the gateway ignores it and never
+  forwards it, but treat the port as trusted: whatever binds it first sees it.
+- After a Claude update, **re-bake** — the patch reverts with the binary — but
+  the gateway is separate and keeps running. Until you do, a Codex model you had
+  saved as your default reads as unavailable; the models live in the patch.
+  Change the port and the gateway needs a restart to follow it.
 
 ## After a Claude update
 
@@ -104,6 +165,8 @@ binary is *smaller* than the original (≈113 MB vs 267 MB), not larger.
 
 See [docs/INTERNALS.md](docs/INTERNALS.md) for the container format and
 [docs/PLAYBOOK.md](docs/PLAYBOOK.md) for repairing a patch after an update.
+Changing anything here starts at [docs/CONDUCT.md](docs/CONDUCT.md) — how this
+is built, and what a patch has to prove before it ships.
 
 ## Credits
 
@@ -111,6 +174,9 @@ The patch set is a Python port of
 [a-connoisseur/patch-claude-code](https://github.com/a-connoisseur/patch-claude-code),
 with the subagent-model override idea from
 [aleks-apostle/claude-code-patches](https://github.com/aleks-apostle/claude-code-patches).
+Registering Codex models inside the bundle follows
+[clodex](https://github.com/gxjansen/clodex); the routing here is done in the
+bundle rather than with clodex's TLS interception.
 
 ## License
 

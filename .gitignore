@@ -20,3 +20,7 @@ build/
 *.patched
 content*.js
 claude-*.bin
+.opencode/
+
+# Build journal, not documentation (see docs/PLAYBOOK.md for the shipped "why")
+CODEX-PLAN.md

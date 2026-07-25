@@ -76,8 +76,31 @@ def _resolve(path: Path) -> Installation | None:
     return Installation(launcher=path, binary=real, version=_version_of(real))
 
 
+def _is_native(binary: Path) -> bool:
+    """Is this file one of the containers we can actually open?"""
+    from .bun import BunError, container  # noqa: PLC0415 - keeps import order flat
+
+    try:
+        container.detect(str(binary))
+    except (BunError, OSError):
+        return False
+    return True
+
+
 def find() -> Installation | None:
-    """Return the first resolvable installation, or ``None``."""
+    """The installed Claude -- preferring one we can actually read.
+
+    Candidate order still decides; being a native container is only the
+    tie-break. A ``claude`` on PATH that is *not* the native build -- the npm
+    wrapper, a shim, a stale script -- would otherwise shadow the real binaries
+    sitting one candidate later and turn every command into "reinstall the
+    native build" while it is already installed.
+
+    When nothing is native the first resolvable candidate is returned anyway, so
+    the container layer gets to say precisely what the file is instead of this
+    reporting nothing found at all.
+    """
+    fallback: Installation | None = None
     seen: set[Path] = set()
     for candidate in _candidates():
         try:
@@ -88,9 +111,12 @@ def find() -> Installation | None:
             continue
         seen.add(real)
         install = _resolve(candidate)
-        if install:
+        if install is None:
+            continue
+        if _is_native(install.binary):
             return install
-    return None
+        fallback = fallback or install
+    return fallback
 
 
 def find_or_raise() -> Installation:
@@ -101,17 +127,3 @@ def find_or_raise() -> Installation:
             "  curl -fsSL https://claude.ai/install.sh | bash"
         )
     return install
-
-
-def all_versions() -> list[Installation]:
-    """Every version binary found under the native versions directory."""
-    versions = Path.home() / ".local" / "share" / "claude" / "versions"
-    if not versions.is_dir():
-        return []
-    out: list[Installation] = []
-    for entry in sorted(versions.iterdir(), key=_version_sort_key, reverse=True):
-        if entry.is_file():
-            out.append(
-                Installation(launcher=entry, binary=entry, version=_version_of(entry))
-            )
-    return out

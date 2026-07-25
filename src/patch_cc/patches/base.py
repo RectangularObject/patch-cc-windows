@@ -21,9 +21,16 @@ Porting rules, for anyone translating more of upstream's JS:
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+from ..codex import DEFAULT_PORT
+
+if TYPE_CHECKING:
+    from ..codex.models import CodexModel
 
 #: Prefix for every identifier we inject. These are the only reliable
 #: fingerprints of our work -- value flips like ``verbose:!0`` are
@@ -34,6 +41,7 @@ SENTINEL = "__cc_"
 GROUP_OUTPUT = "Output & diffs"
 GROUP_THINKING = "Thinking"
 GROUP_AGENTS = "Subagents"
+GROUP_CODEX = "Codex models"
 GROUP_CHROME = "Chrome & branding"
 
 #: Default brand: the name shown unless the user overrides it. One home so the
@@ -48,13 +56,19 @@ def derived_brand() -> str:
     """The branding default: the system username, possessive.
 
     ``anfreire`` becomes ``anfreire's Code``. Falls back to the unbranded
-    default when no username can be determined.
+    default when no username can be determined -- however it fails. What
+    :func:`getpass.getuser` raises is a Python-version detail (``OSError`` from
+    3.13, ``KeyError``/``ImportError`` before it, when a container has no passwd
+    entry and no ``LOGNAME``), and none of them change the answer: nobody to
+    name, so no name. Catching the 3.13 spelling alone let a traceback out of
+    `apply` -- which carries branding by default -- on the two versions this
+    package also supports.
     """
     import getpass
 
     try:
         user = getpass.getuser().strip()
-    except OSError:
+    except Exception:
         user = ""
     return f"{user}'s Code" if user else DEFAULT_BRAND
 
@@ -66,6 +80,14 @@ class Options:
     brand: str = DEFAULT_BRAND
     version_suffix: str = DEFAULT_SUFFIX
     subagent_models: dict[str, str] = field(default_factory=dict)
+    #: Codex models to register and route -- ordinary patch configuration, like
+    #: every field here: chosen in the menu or with ``--codex``, and recorded in
+    #: the manifest by the patch that bakes it.
+    codex_models: list["CodexModel"] = field(default_factory=list)
+    #: Localhost port shared by the redirect patch and the gateway. Defaulted
+    #: from the one home (:data:`patch_cc.codex.DEFAULT_PORT`) so the number
+    #: never lives in two places.
+    codex_port: int = DEFAULT_PORT
 
     @property
     def rebrands(self) -> bool:
@@ -262,21 +284,25 @@ def switch_case_end(content: str, start: int) -> int:
     return min(ends) if ends else len(content)
 
 
-def iter_segments(content: str, needle: str):
-    """Yield ``(start, end)`` for each switch arm introduced by ``needle``.
-
-    The caller rewrites and the generator is restarted, so this is deliberately
-    a simple finder rather than a stateful cursor.
-    """
-    index = 0
-    while True:
-        start = content.find(needle, index)
-        if start == -1:
-            return
-        end = switch_case_end(content, start + len(needle))
-        yield start, end
-        index = start + len(needle)
-
-
 def splice(content: str, start: int, end: int, replacement: str) -> str:
     return content[:start] + replacement + content[end:]
+
+
+def js_string(value: str) -> str:
+    """``value`` as a complete, quoted JS string literal -- never hand-escaped.
+
+    JSON's string grammar is a subset of JavaScript's, so :func:`json.dumps` is
+    already the correct encoder: it closes over quotes, backslashes, *control
+    characters*, and non-ASCII (as ``\\uXXXX``). Escaping by hand covers the
+    characters you thought of, and a brand carrying a newline
+    (``--brand $'Ada\\nOwned'``) then put a raw line terminator inside a
+    double-quoted literal -- a bundle that no longer parses. Nothing caught it:
+    the patch reported every step applied, and the write verifier re-extracts
+    what we wrote and compares it to what we meant to write, so it agreed the
+    invalid source was correct. The binary died at launch with
+    ``SyntaxError: Unexpected EOF``.
+
+    Build the whole Python string first and quote it once here; do not
+    interpolate into a literal you wrote yourself.
+    """
+    return json.dumps(value)

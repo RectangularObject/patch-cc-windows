@@ -43,27 +43,37 @@ Anything the binary can enumerate for us, it does:
   `"Internal` are plumbing and are not offered.
 - **Model aliases** come from the Task tool's own input schema: the
   `model:<zod>.enum([...])` whose describe-string starts
-  `Optional model override` (`agents.discover_models`).
+  `Optional model override` — `agents.MODEL_ENUM`, one compiled anchor because
+  `codex-models` splices the chosen Codex ids into the very group
+  `discover_models` reads back out.
 
 A new upstream agent or model appears in `patch-cc list`, the menu, and
 `--model` validation without a code change. If the enum anchor ever vanishes,
 discovery falls back to `haiku/sonnet/opus` — `doctor` prints both lists, so a
 missing agent or alias is visible at a glance.
 
+**The one hardcoded list, and why it may stay one.**
+`models._RESERVED` names Claude's short built-ins so `apply --codex opus` is
+refused, and so a *derived* family shortcut can never take one of those names
+either (a pathological `gpt-5.6-opus` is the only way it could try). It is a
+snapshot, so upstream can outgrow it — and it does not matter, because it is a
+courtesy, not the guard. A name the bundle already knows makes `enum` and
+`validator` find it *present*, so both rewrite nothing; they are `expect=True`,
+so the patch reports broken, the fixpoint drops it, and nothing is written. The
+bundle refuses the collision at bake time, derived rather than remembered.
+Reserving the discovered set instead would buy a friendlier message for a hazard
+that cannot land, at the price of reading a 275 MB binary before argument parsing
+can finish.
+
 ## The manifest
 
-Every patched bundle ends with one comment line:
-
-```
-//patch-cc {"v":1,"tool":"0.1.0","patches":[...],"brand":...,"models":{...}}
-```
-
-A comment cannot collide with code, survives re-extraction, and makes `status`
-a parse instead of a guess — several patches are value flips
-(`verbose:!0`) that leave no other fingerprint. `is_patched` also still
-recognises the legacy fingerprints (`__cc_` identifiers, the old `--version`
-marker) so binaries patched by pre-manifest versions are not mistaken for
-clean.
+Every patched bundle ends with one comment line recording what was applied; its
+shape lives in [INTERNALS.md](INTERNALS.md#the-manifest). What matters here is
+that it makes `status` a parse instead of a guess — several patches are value
+flips (`verbose:!0`) that leave no other fingerprint — and that `is_patched`
+also still recognises the legacy fingerprints (`__cc_` identifiers, the old
+`--version` marker), so binaries patched by pre-manifest versions are not
+mistaken for clean.
 
 ## How resilience is detected
 
@@ -308,6 +318,13 @@ anchor, and where it lives.
   definition (discovered as above): rewrite the `model:"..."` literal when the
   definition has one, insert `model:"...",` right after `agentType:"...",`
   when it doesn't. Both splice at offsets from a fresh discovery pass.
+  Every requested override is a **required step**: each one reaching this patch
+  has already been validated against the bundle by whichever surface asked for
+  it, so a pin that cannot be written is not a shape this build lacks — it is
+  the asked-for change failing, and the patch is dropped rather than shipping a
+  manifest that claims it. An override whose target the definition already
+  carries counts as landed: the step is judged on what it achieved, not on
+  whether bytes moved.
   **The bypass:** one helper ignores the definition's model for a single
   pinned agent (Explore today) — shape
   `function f(def,main){if(def.agentType!==X.agentType||def.source!=="built-in")return def.model;…;return g(main)?PIN:"inherit"}`.
@@ -337,6 +354,152 @@ anchor, and where it lives.
   you neutralise an unrelated helper and report success; anchoring also means a
   build that pins two agents gets both handled, rewritten last-first so earlier
   offsets stay valid.
+
+### Codex — `codex.py`
+
+- **`codex-models`** — make Claude Code accept and show the chosen Codex models,
+  and divert *only* those models' requests to the localhost gateway.
+  Eight sub-steps; with nothing chosen the patch is a no-op, like
+  `subagent-models`. The ids and the port are ordinary patch configuration
+  (`Options.codex_models` / `codex_port`) — chosen in the menu or with
+  `--codex`/`--codex-port`, never read from a store of the patch's own.
+
+  | step | what it changes | anchor |
+  |---|---|---|
+  | `enum`\* | the Task tool's `model` enum, so a subagent can be pinned to a Codex id | `agents.MODEL_ENUM` — the same anchor `discover_models` reads |
+  | `validator`\* | the known-model array — it gates *resolution*, not just acceptance | `["sonnet","opus","haiku","fable",…,"opusplan",…]` |
+  | `resolver`\* | the override resolver `J9n` | its `case"best":{…}` block |
+  | `general-resolver`\* | the resolver every ordinary request uses, `Ei` | `case"best":return X();default:}` |
+  | `redirect`\* | swaps the request origin to `127.0.0.1:<port>` | the SDK's `buildRequest`, up to `let u=this.buildURL(…)` |
+  | `picker` | the `/model` list | `?[n,r]:[r];for(let i of o)push(e,i,t);` |
+  | `context` | the real context window | the brace-free `(e,t)` body reading `CLAUDE_CODE_MAX_CONTEXT_TOKENS` |
+  | `registry` | the binary's own model table — the status-line name, effort capabilities, `/advisor` eligibility | `],aliases:{` closing the `models:[...]` registry |
+
+  \* required (`expect=True`) — without any one of them the feature is dead.
+  `picker`, `context` and `registry` are refinements: absent, you can still
+  type `/model <id>` and get the 200k default under the model's raw id.
+  `context` has no step at all when no chosen model reports a window — there
+  is no rewrite owed, and reporting that as either a missing shape or a missed
+  rewrite would blame the build for having nothing to do.
+
+  **An id is a model's whole identity.** There is no second name to carry: the id
+  is what `--codex` takes, what the manifest records, what the enum and the
+  picker and the redirect array hold, and what a diverted request already names
+  by the time the gateway sees it. Everything else is derived — the display name
+  and the window from the plan, the shortcut from the id — so nothing downstream
+  keeps a mapping that could disagree with the bundle. That is why the gateway
+  needs only the port, and it is structural rather than a rule to remember:
+  there is no map left to read.
+
+  **The picker's label rule is one rule.** Every row's label is its handle
+  *spelled as a name* — `_display_name` turns `sol` into `Sol` and
+  `gpt-5.6-sol` into `GPT 5.6 Sol` — because the binary's own rows are named,
+  not slugged. Labelling id rows with the raw id instead made them the only
+  entries in the list wearing a different sort of name than their neighbours
+  (`gpt-5.6-sol` sitting under `Opus`). Two label rules is what let that
+  through, so there is one.
+
+  **The registry is the binary's own model table, and the sharpest splice
+  here.** Everything Claude Code knows about a model it did not hardcode a
+  check for lives in one embedded object — `models:[{id, family, display_name,
+  provider_ids, context, capabilities:[...], default_effort, advisor_rank,
+  ...}]` plus the `aliases` map its resolvers read — validated by a zod
+  `safeParse` whose fallback is **empty** (`models:[]`): one malformed entry
+  strips every model, Claude's included, of its metadata. So the step emits
+  only fields the schema declares — the required four (`id`, `family`,
+  `display_name`, `provider_ids.first_party`) plus values with something true
+  to record. `default_effort` is deliberately not among them: the binary
+  resolves a missing default as `high` (`?.default_effort??"high"` — the very
+  default its own flagships declare), so omission makes `/effort auto` and an
+  untouched session mean on these models exactly what they mean on Opus,
+  instead of importing Codex-the-product's own default (`low` on sol). An
+  entry is what turns "accepted" into "first-class": the status line resolves
+  `display_name` through it (raw id without one), `/advisor` eligibility is
+  exactly "has an `advisor_rank`", the effort gates read `capabilities`, and
+  surfaces nobody has enumerated inherit the same answers. `/advisor sol` on a
+  freshly baked binary is the cheap end-to-end check that the entry parsed.
+
+  **What the entry deliberately leaves out.** `pricing` and
+  `max_output_tokens` (readers guard for absence; a subscription has no
+  per-token price; the cap never reaches the wire), `context` (the window
+  resolver ends on a flat 200k without consulting the registry — the `context`
+  step stays the one home for the window), and the `aliases` /
+  `latest_per_family` maps (shortcuts already resolve through the spliced
+  arms; a second mechanism would be a second home — and `latest_per_family`
+  feeds Claude's own system-prompt text). The `/model` picker does not iterate
+  the registry either — its rows are hand-built per family upstream, which is
+  why `picker` exists — and our row push is the same `{value,label,description}`
+  + `.some()` idiom the binary itself uses for `ANTHROPIC_CUSTOM_MODEL_OPTION`.
+
+  **Capabilities can only say yes.** The binary reads an *absent* capability
+  as "ask the provider fallback", which on the first-party API is permissive —
+  upstream's own choice for models it does not know. That is why the `/effort`
+  menu offers the whole ladder on any imported model, and why an entry cannot
+  *hide* a level; hiding would mean splicing the per-level exclusion chains,
+  a new matcher surface bought for a cosmetic win. Which levels a model
+  actually runs is the backend's per-model ruling, refused with a structured
+  400 (`param:"reasoning.effort"`, `code:"invalid_value"`) before any
+  generation — measured: gpt-5.5 runs `xhigh` and refuses `max`. Baking that
+  ruling would be a copy free to go stale between bake and runtime, so the
+  gateway clamps off the refusal itself (`translate.clamp_effort`): one rung
+  down per retry, mirroring Claude Code's documented "highest supported level
+  at or below" rule for its own models. A menu that over-offers costs one
+  extra round-trip, never a dead turn.
+
+  **It runs before `subagent-models`, and that ordering is load-bearing.**
+  `enum` registers the ids in the very schema `discover_models` reads, so a
+  subagent pinned to a Codex model is offered exactly when that model is really
+  in the bundle. Registering *after* meant `subagent-models` had to be told
+  about the ids out of band, so it landed a pin whether or not
+  `codex-models` did: drop `codex-models` for a drifted anchor and the binary
+  kept `model:"gpt-5.6-sol"` on an agent, pointing at a model nothing had
+  registered, with the manifest asserting the override. Now the dropped patch
+  takes its pins down with it.
+
+  **Two resolvers, and why both.** `Ei` is the general one — it turns `opus`
+  into `claude-opus-4-8`, its return value *replaces* the model before the
+  request is built, and it passes an unknown-but-valid name straight through
+  (`return e`). `J9n` runs only when managed `availableModels` are active and
+  defaults to `null`, not passthrough. An id needs neither arm (identity
+  *is* passthrough); a **family shortcut** (`sol` → the newest
+  `gpt-<ver>-sol`) needs one in both, and `Ei`'s is what makes it work on the
+  ordinary path.
+
+  **The shortcut gate.** Shortcuts are registered only when the `Ei` anchor is
+  present. Absent it, none are registered anywhere and the ids — which need none
+  of this — carry on. Accepted-but-unresolved is the failure worth engineering
+  against: it leaves the redirect (which matches ids only), reaches Anthropic as
+  an unknown model, and 404s.
+
+  **Why the "already added?" checks are bounded.** The resolver check matches
+  only the contiguous arms *at the insertion point* (`_RESOLVER_ARMS`), never
+  the whole bundle: a short word like `auto` occurs as `case"auto":return` in
+  stock code, so a global check would skip its arm while the id arms still
+  marked the step applied — a shortcut that resolves nowhere. The picker drops
+  its build-time check for the same reason and leans on the runtime `.some()`
+  guard it injects. `Ei`'s own idempotency is the `default:}` adjacency: it
+  matches the pristine arm only.
+
+  **Routing knows nothing about shortcuts.** The redirect tests `body.model`
+  against the baked id array, and the context table is keyed the same way — by
+  the time either runs, `Ei` has already rewritten the shortcut. Measured on the
+  wire: `claude --model sol` arrives at the gateway as `"gpt-5.6-sol"`. That is
+  why a drift in the shortcuts costs shortcuts and nothing else.
+
+  **A diverted request still carries Claude Code's auth header.** Measured, not
+  assumed: point a listener at the gateway port and a Codex turn arrives with
+  `Authorization: Bearer sk-ant-oat01-…` and the whole prompt. The gateway
+  ignores it and never forwards it, so the exposure is to whatever holds the
+  port. Stripping it from `redirect` does **not** work — don't retry it blind.
+  `options.headers` is the last source `buildHeaders` merges and its merge
+  treats `null` as delete, so setting a null (or an inert value) there ought to
+  win; neither reaches the wire. With the injected block proven to run — a
+  marker spliced into the replacement URL came through in the path — a probe
+  header set on the options object *and* on the local copy was absent from the
+  request both times, so something between `buildRequest` and `fetch` discards
+  `options.headers` on this build. A real fix needs its own anchor further
+  down, in `prepareRequest` (it receives the final `Headers` and the URL): a new
+  required step and new matcher surface, deliberately not taken for 0.2.0.
 
 ### Chrome & branding — `chrome.py`
 

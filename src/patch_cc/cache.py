@@ -16,6 +16,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .codex import DEFAULT_PORT, is_valid_port
+from .codex.models import CodexModel
 from .patches import DEFAULT_BRAND, DEFAULT_SUFFIX, Options, default_ids, ids
 
 
@@ -39,12 +41,30 @@ def load() -> Selection:
     agent or model still exists is the menu's question, answered against the
     binary it is about to patch.
     """
+    return load_strict() or Selection()
+
+
+def load_strict() -> Selection | None:
+    """The cached selection, or ``None`` when there is not one to read.
+
+    The same parse, with the fallback withheld. A pre-fill is happy to treat an
+    unreadable cache as "no preference" and offer the defaults, but ``apply
+    --from-cache`` *acts* on the answer: handed the defaults it would apply a set
+    the user never chose while reporting that it replayed their selection. The
+    two callers want different things from the same failure, so the substitution
+    belongs to the caller that wants it, not to the parse.
+    """
     try:
         data = json.loads(cache_path().read_text("utf8"))
         known = set(ids())
         brand = data.get("brand", DEFAULT_BRAND)
         suffix = data.get("suffix", DEFAULT_SUFFIX)
         models = data.get("subagent_models", {})
+        # Codex ids only, the same as the manifest keeps: a name and a context
+        # window are the plan's to report, and remembering either would let a
+        # window that has since changed outlive it.
+        codex = data.get("codex_models", [])
+        port = data.get("codex_port")
         return Selection(
             patches=[p for p in data.get("patches", default_ids()) if p in known],
             options=Options(
@@ -57,10 +77,12 @@ def load() -> Selection:
                     for a, m in models.items()
                     if isinstance(a, str) and isinstance(m, str)
                 },
+                codex_models=[CodexModel(i) for i in codex if isinstance(i, str) and i],
+                codex_port=port if is_valid_port(port) else DEFAULT_PORT,
             ),
         )
     except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
-        return Selection()
+        return None
 
 
 def save(selection: Selection) -> None:
@@ -77,6 +99,8 @@ def save(selection: Selection) -> None:
                     "brand": selection.options.brand,
                     "suffix": selection.options.version_suffix,
                     "subagent_models": selection.options.subagent_models,
+                    "codex_models": [m.id for m in selection.options.codex_models],
+                    "codex_port": selection.options.codex_port,
                 },
                 indent=2,
             )

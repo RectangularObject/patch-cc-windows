@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .bun import Bundle
+from .codex.models import CodexModel
 from .patcher import is_patched, read_manifest
 from .patches import ALL_PATCHES, Options, Outcome, Patch
 from .patches.agents import INHERIT, BuiltinAgent, discover_agents, discover_models
@@ -82,15 +83,35 @@ class DryRun:
 def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options:
     """A configuration that forces every configurable patch to do work.
 
-    Each discovered agent is assigned a model different from its current one,
-    so the rewrite (not the already-desired no-op) is what gets tested.
+    Each discovered agent is assigned a model different from its current one, so
+    the rewrite (not the already-desired no-op) is what gets tested. Targets come
+    from the bundle's own aliases, because each patch here runs against pristine
+    in isolation: a Codex id would not be registered in the bundle a lone
+    ``subagent-models`` run reads, and would correctly fail. What the two do
+    together is an apply-time ordering, not something a dry run can show.
     """
-    overrides = {}
-    for agent in agents:
-        target = next((m for m in models if m != agent.effective_model), None)
-        if target is not None:
-            overrides[agent.name] = target
-    return Options(brand="patch-cc doctor", subagent_models=overrides)
+    # Codex models are chosen by the user and described by their plan, neither of
+    # which a dry run has, so it supplies a synthetic one -- with a context window
+    # (so the context step is exercised), a `gpt-<ver>-<family>` id (so a family
+    # shortcut is derived, exercising the general-resolver step too), and the full
+    # effort ladder (so the registry step bakes every capability string) -- to
+    # hold every one of codex-models' anchors in the net like the other patches.
+    codex = [
+        CodexModel(
+            "gpt-9.9-doctor",
+            "Doctor",
+            272_000,
+            efforts=("low", "medium", "high", "xhigh", "max"),
+        )
+    ]
+    overrides = {
+        agent.name: target
+        for agent in agents
+        if (target := next((m for m in models if m != agent.effective_model), None))
+    }
+    return Options(
+        brand="patch-cc doctor", subagent_models=overrides, codex_models=codex
+    )
 
 
 def dryrun(bundle: Bundle) -> DryRun:

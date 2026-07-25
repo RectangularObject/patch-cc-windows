@@ -88,10 +88,12 @@ edit is followed by an ad-hoc `codesign` (mandatory on Apple Silicon).
 
 ## The manifest
 
-Every patched bundle ends with a single comment line:
+Every patched bundle ends with a single comment line — the one description of
+its shape; [PLAYBOOK.md](PLAYBOOK.md) covers what it means for matcher health:
 
 ```
-//patch-cc {"v":1,"tool":"0.1.0","patches":[...],"brand":...,"models":{...}}
+//patch-cc {"v":1,"tool":"<version>","patches":[...],"brand":...,"models":{...},
+            "codex":{"port":8817,"models":["gpt-5.6-sol", ...]}}
 ```
 
 That line is why `patch-cc status` can name exactly what is applied: several
@@ -99,6 +101,18 @@ patches are value flips (`verbose:!0`) that leave no other trace. A comment
 can't collide with code and travels with the bundle through extract/repack.
 The menu also reads it to pre-select the current patch set — the binary is the
 state.
+
+Every key after `patches` belongs to a patch and is written only when *that*
+patch landed, so `status` can never assert a name, marker, or model the bundle
+does not contain.
+
+Each key records what was *asked for*, never what was derived from it. `codex`
+carries model ids and a port and nothing else: a Codex model's display name and
+context window are already baked into the bundle, and repeating them here would
+be a second copy — one that a relabelling upstream could make disagree with the
+binary it claims to describe. That is also what makes the manifest the single
+home for the gateway port: `codex serve` and `codex status` read it from here
+rather than from a store of their own.
 
 ## Safety
 
@@ -112,4 +126,6 @@ state.
 - Every write is verified: patch-cc re-extracts the JS from the binary it just
   wrote and asserts it equals what it meant to write.
 - Patching a binary that is already marked, when no pristine backup exists, is
-  refused unless `--force` — there is nothing clean to start from.
+  refused outright — there is nothing clean to start from, and our edits change
+  lengths, so a second pass would corrupt rather than update. `restore` or a
+  reinstall are the only honest fixes; there is deliberately no override.

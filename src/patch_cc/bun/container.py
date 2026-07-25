@@ -127,3 +127,13 @@ def verify(path: str, expected: str) -> None:
             "patched binary did not round-trip: extracted source differs from "
             f"what we wrote ({len(written.source):,} vs {len(expected):,} bytes)"
         )
+    if written.bytecode_size:
+        # Read back off the written file, not asserted in memory. Bun runs the
+        # bytecode in preference to the source, so any left behind would run the
+        # *unpatched* program while every check above agreed the source was ours
+        # -- every patch a silent no-op. docs/INTERNALS.md calls this the tripwire
+        # for a Bun that makes bytecode authoritative; this is where it trips.
+        raise ContainerError(
+            f"patched binary still carries {written.bytecode_size:,} bytes of "
+            "entrypoint bytecode, which would run instead of our edits"
+        )
