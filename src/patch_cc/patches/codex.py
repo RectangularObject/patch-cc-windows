@@ -50,7 +50,7 @@ import re
 from ..codex.models import family_aliases, family_of
 from .agents import MODEL_ENUM
 from .base import (
-    GROUP_CODEX,
+    GROUP_MODELS,
     IDENT,
     Options,
     Outcome,
@@ -507,7 +507,7 @@ PATCHES = [
         id="codex-models",
         title="Codex models",
         summary="Register your OpenAI/Codex models and route them to the local gateway.",
-        group=GROUP_CODEX,
+        group=GROUP_MODELS,
         fn=_codex_models,
         default=False,
         option="--codex",

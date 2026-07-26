@@ -19,11 +19,9 @@ from . import agents, chrome, codex, output, streaming, thinking
 from .base import (
     DEFAULT_BRAND,
     DEFAULT_SUFFIX,
-    GROUP_AGENTS,
     GROUP_CHROME,
-    GROUP_CODEX,
+    GROUP_MODELS,
     GROUP_OUTPUT,
-    GROUP_THINKING,
     SENTINEL,
     Options,
     Outcome,
@@ -40,7 +38,7 @@ ALL_PATCHES: list[Patch] = [
     *chrome.PATCHES,
 ]
 
-GROUP_ORDER = [GROUP_OUTPUT, GROUP_THINKING, GROUP_AGENTS, GROUP_CODEX, GROUP_CHROME]
+GROUP_ORDER = [GROUP_OUTPUT, GROUP_MODELS, GROUP_CHROME]
 
 
 def ids() -> list[str]:

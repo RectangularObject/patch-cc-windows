@@ -59,6 +59,7 @@ def load_strict() -> Selection | None:
         known = set(ids())
         brand = data.get("brand", DEFAULT_BRAND)
         suffix = data.get("suffix", DEFAULT_SUFFIX)
+        org = data.get("org_label", "")
         models = data.get("subagent_models", {})
         # Codex ids only, the same as the manifest keeps: a name and a context
         # window are the plan's to report, and remembering either would let a
@@ -72,6 +73,7 @@ def load_strict() -> Selection | None:
                 version_suffix=suffix
                 if isinstance(suffix, str) and suffix
                 else DEFAULT_SUFFIX,
+                org_label=org if isinstance(org, str) else "",
                 subagent_models={
                     a: m
                     for a, m in models.items()
@@ -98,6 +100,7 @@ def save(selection: Selection) -> None:
                     "patches": selection.patches,
                     "brand": selection.options.brand,
                     "suffix": selection.options.version_suffix,
+                    "org_label": selection.options.org_label,
                     "subagent_models": selection.options.subagent_models,
                     "codex_models": [m.id for m in selection.options.codex_models],
                     "codex_port": selection.options.codex_port,

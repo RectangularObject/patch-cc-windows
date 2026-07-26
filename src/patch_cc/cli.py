@@ -4,7 +4,8 @@ Bare ``patch-cc`` opens the interactive menu. Every action is also a
 subcommand so nothing needs the TUI:
 
     patch-cc apply [PATCH ...] [--brand [NAME]] [--model AGENT=MODEL]
-                   [--suffix TEXT] [--codex MODEL] [--codex-port N]
+                   [--suffix TEXT] [--org-label [TEXT]]
+                   [--codex MODEL] [--codex-port N]
     patch-cc status
     patch-cc doctor [PATH]       # PATH: check any binary, e.g. an old backup
     patch-cc list
@@ -102,6 +103,12 @@ def _list_hint(patch: Patch, cached: cache.Selection) -> str:
         parts.append(f"default {DEFAULT_SUFFIX!r}")
         if opts.version_suffix != DEFAULT_SUFFIX:
             parts.append(f"cached {opts.version_suffix!r}")
+    elif patch.id == "org-label":
+        parts.append("default hides it")
+        if "org-label" in cached.patches:
+            parts.append(
+                f"cached {opts.org_label!r}" if opts.org_label else "cached hidden"
+            )
     elif patch.id == "subagent-models" and opts.subagent_models:
         picks = ", ".join(f"{a}={m}" for a, m in opts.subagent_models.items())
         parts.append(f"cached {picks}")
@@ -218,6 +225,11 @@ def _requested(args, source: str) -> tuple[list[str], Options]:
         if "version-marker" not in selected:
             selected.append("version-marker")
 
+    if args.org_label is not None:
+        options.org_label = args.org_label.strip()
+        if "org-label" not in selected:
+            selected.append("org-label")
+
     # Order-preserving, and deduplicated: a repeated `--codex` is one model asked
     # for twice, and every array it reaches -- the enum, the routing list, the
     # remembered selection, the manifest `status` reads back -- would otherwise
@@ -272,6 +284,7 @@ def _has_selection_args(args) -> bool:
         or args.brand is not None
         or args.model
         or args.suffix
+        or args.org_label is not None
         or args.codex
         or args.codex_port is not None
     )
@@ -332,7 +345,8 @@ def _from_cache(args, source: str) -> tuple[list[str], Options]:
     if _has_selection_args(args):
         err(
             "--from-cache replays your last interactive selection; do not combine "
-            "it with patch ids or --brand / --model / --suffix / --codex."
+            "it with patch ids or --brand / --model / --suffix / --org-label / "
+            "--codex."
         )
         raise SystemExit(2)
     if not cache.cache_path().exists():
@@ -494,6 +508,8 @@ def cmd_status(args) -> int:
             console.print(f"  brand:     {st.manifest['brand']}")
         if "suffix" in st.manifest:
             console.print(f"  suffix:    {st.manifest['suffix']}")
+        if "org" in st.manifest:
+            console.print(f"  org:       {st.manifest['org'] or '(hidden)'}")
         for agent, model in (st.manifest.get("models") or {}).items():
             console.print(f"  model:     {agent} = {model}")
         codex = st.manifest.get("codex")
@@ -863,6 +879,7 @@ def _apply_epilog() -> str:
         "configuring patches:",
         f"  --brand [NAME]       selects branding  ·  no value -> {derived_brand()!r}",
         f"  --suffix TEXT        selects version-marker  ·  default {DEFAULT_SUFFIX!r}",
+        "  --org-label [TEXT]   selects org-label  ·  no value -> hide the segment",
         "  --model AGENT=MODEL  selects subagent-models  ·  repeatable, one per agent",
     ]
     if agents:
@@ -1003,6 +1020,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="TEXT",
         help="`claude --version` marker text; selects `version-marker` "
         "(default: (patched))",
+    )
+    p_apply.add_argument(
+        "--org-label",
+        nargs="?",
+        const="",
+        metavar="TEXT",
+        help="welcome-screen org/email text; selects `org-label` "
+        "(no value: hide the segment)",
     )
     p_apply.add_argument(
         "--codex",

@@ -29,11 +29,12 @@ uvx patch-cc                   # fullscreen menu, no install needed
 
 The menu is a single centered panel: move with `↑ ↓`, toggle with `space`,
 press `s` to save. Patches that carry a setting — subagent models, Codex models,
-the startup name, the `--version` marker — open a centered modal on `enter`, and
-the row then shows what you chose. Everything choosable is a picker: the agent
-names and model aliases are **discovered from your binary itself** (and the
-Codex ones from your plan), so the menu can never offer something your build
-would reject. Typing exists only for the genuinely free-text values.
+the startup name, the `--version` marker, the org/email label — open a centered
+modal on `enter`, and the row then shows what you chose. Everything choosable
+is a picker: the agent names and model aliases are **discovered from your
+binary itself** (and the Codex ones from your plan), so the menu can never
+offer something your build would reject. Typing exists only for the genuinely
+free-text values.
 
 A patched binary records what was applied inside itself, so the menu always
 comes up showing the real current state, and `patch-cc status` answers
@@ -50,17 +51,19 @@ patch-cc                       # then just run it
 
 | Group | Patch | |
 |---|---|---|
-| Output & diffs | Detailed tool calls | Show full read/search calls, not collapsed summaries |
+| Output & display | Detailed tool calls | Show full read/search calls, not collapsed summaries |
 | | Colour new files as diffs | Created files render with `+` lines and green |
-| Thinking | Fix blank thinking blocks | Opt out of the server-side experiment that can empty every thinking block |
+| | Fix blank thinking blocks | Opt out of the server-side experiment that can empty every thinking block |
 | | Always show thinking | Thinking blocks stay inline — no `ctrl+o` |
 | | Stream thinking live | See reasoning as it is generated, inline and in order |
-| Subagents | Show subagent prompts | Prompt blocks visible during normal use |
+| | Show subagent prompts | Prompt blocks visible during normal use |
+| Models & effort | Persist max effort | `/effort max` saves as your default for new sessions, like the other levels |
+| | Codex models | Use OpenAI/Codex-plan models in Claude Code — see [Codex models](#codex-models) |
 | | Override subagent models | Pick the model per built-in agent (discovered from your binary) |
-| Chrome | Disable spinner tips | No rotating tips on the spinner |
-| | Custom startup name | Defaults to `<your username>'s Code` |
+| Chrome & branding | Disable spinner tips | No rotating tips on the spinner |
 | | Mark `--version` | Appends `(patched)` — or any marker you choose |
-| Codex | Codex models | Use OpenAI/Codex-plan models in Claude Code — see [Codex models](#codex-models) |
+| | Custom startup name | Defaults to `<your username>'s Code` |
+| | Startup org/email label | Replace the org/email on the welcome screen — or hide it |
 
 ## Usage
 
@@ -74,6 +77,8 @@ uvx patch-cc apply --brand                    # + branding as <username>'s Code
 uvx patch-cc apply --brand "Ada's Code"       # + branding, explicit name
 uvx patch-cc apply --model Explore=haiku --model general-purpose=opus
 uvx patch-cc apply --suffix "(mine)"          # custom --version marker
+uvx patch-cc apply --org-label                # hide the welcome screen's org/email
+uvx patch-cc apply --org-label "Ada's Lab"    # ...or show this instead
 uvx patch-cc apply --codex gpt-5.6-sol        # + a Codex model (see below)
 uvx patch-cc apply --from-cache               # replay your last remembered selection
 uvx patch-cc status                           # exactly what is applied
@@ -83,9 +88,9 @@ uvx patch-cc list                             # every patch, described
 uvx patch-cc restore                          # put the original back
 ```
 
-`--brand`, `--model` and `--codex` imply their patches; agents and models are
-validated against what your installed binary actually ships, and Codex model ids
-against what your plan offers. `apply --help` lists all three.
+A flag that configures a patch also selects it — `apply --help` lists them
+all. Agents and models are validated against what your installed binary
+actually ships, and Codex model ids against what your plan offers.
 
 ## Codex models
 

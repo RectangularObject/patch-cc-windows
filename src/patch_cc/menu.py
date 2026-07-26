@@ -4,9 +4,10 @@ A fullscreen frame: fixed title and status on top, fixed key hints at the
 bottom, and only the patch list scrolling in between. Every choice is a picker
 driven by what the binary itself offers -- agents and models are discovered,
 never typed -- and typing exists only where a value is genuinely free text
-(the startup name, the --version marker). All configuration happens in
-centered modals floating over the dimmed list; the list itself never grows
-sub-rows. ``s`` saves, and the same frame then shows the per-patch results.
+(the startup name, the --version marker, the org/email label). All
+configuration happens in centered modals floating over the dimmed list; the
+list itself never grows sub-rows. ``s`` saves, and the same frame then shows
+the per-patch results.
 
 The engine is deliberately small: ``blessed`` owns the terminal (fullscreen,
 cbreak, parsed keystrokes, live size) and Rich owns every pixel drawn. A frame
@@ -43,6 +44,7 @@ from .bun import Bundle, BunError, container
 from .codex import DEFAULT_PORT, is_valid_port
 from .codex.models import CodexModel, discover, reconcile
 from .patches import (
+    ALL_PATCHES,
     DEFAULT_BRAND,
     DEFAULT_SUFFIX,
     GROUP_ORDER,
@@ -83,8 +85,11 @@ def _hints(*pairs: tuple[str, str]) -> Text:
     return text
 
 
-#: Patches whose row opens a modal on enter instead of plain toggling.
-_CONFIGURABLE = {"subagent-models", "branding", "version-marker", "codex-models"}
+#: Patches whose row opens a modal on enter instead of plain toggling --
+#: exactly the ones that carry a configurable value, which is what
+#: :attr:`Patch.option` declares. Derived, so a new option-carrying patch
+#: cannot be left off this list with its hint reading "enter toggle".
+_CONFIGURABLE = {patch.id for patch in ALL_PATCHES if patch.option}
 
 
 # ----------------------------------------------------------------- rows
@@ -182,6 +187,7 @@ class MenuModel:
         model.text_rows["suffix"] = TextRow(
             "suffix", "marker", seed.options.version_suffix
         )
+        model.text_rows["org"] = TextRow("org", "label", seed.options.org_label)
         return model
 
     def _seed(self) -> cache.Selection:
@@ -191,6 +197,7 @@ class MenuModel:
             codex = manifest.get("codex")
             codex = codex if isinstance(codex, dict) else {}
             port = codex.get("port")
+            org = manifest.get("org")
             seed = cache.Selection()
             seed.patches = [
                 p for p in manifest.get("patches", []) if isinstance(p, str)
@@ -198,6 +205,9 @@ class MenuModel:
             seed.options = Options(
                 brand=manifest.get("brand") or DEFAULT_BRAND,
                 version_suffix=manifest.get("suffix") or DEFAULT_SUFFIX,
+                # `or ""` would also be right, but only by luck: "" (hidden) is
+                # a meaningful manifest value, unlike an absent brand/suffix.
+                org_label=org if isinstance(org, str) else "",
                 subagent_models={
                     a: m
                     for a, m in (manifest.get("models") or {}).items()
@@ -269,6 +279,10 @@ class MenuModel:
             options.version_suffix = (
                 self.text_rows["suffix"].value.strip() or DEFAULT_SUFFIX
             )
+        if "org-label" in selected:
+            # Empty stays empty: it is the "hide the segment" value, so unlike
+            # brand and suffix there is no default to fall back to.
+            options.org_label = self.text_rows["org"].value.strip()
         # A subagent pinned to a Codex model needs codex-models applied too -- it
         # registers the id and installs the redirect, without which the pin
         # resolves to nothing. That coupling is enforced where the user can see
@@ -709,15 +723,20 @@ class MenuApp:
     def _activate(self, row: PatchRow) -> None:
         """Enter on a patch: toggle plain ones, configure configurable ones."""
         patch_id = row.patch.id
+        text_keys = {
+            "branding": "brand",
+            "version-marker": "suffix",
+            "org-label": "org",
+        }
         if patch_id == "subagent-models":
             if not self.model.agent_rows:
                 self.flash = "no agents discovered in this bundle"
                 return
             row.on = True
             self._open_agents_modal()
-        elif patch_id in ("branding", "version-marker"):
+        elif patch_id in text_keys:
             row.on = True
-            self._open_text_modal("brand" if patch_id == "branding" else "suffix")
+            self._open_text_modal(text_keys[patch_id])
         elif patch_id == "codex-models":
             self._open_codex_menu(row)  # submenu: pick models / set gateway port
         else:
@@ -813,10 +832,16 @@ class MenuApp:
 
     def _open_text_modal(self, key: str) -> None:
         row = self.model.text_rows[key]
-        titles = {"brand": "Startup name", "suffix": "--version marker"}
+        titles = {
+            "brand": "Startup name",
+            "suffix": "--version marker",
+            "org": "Org/email label (empty hides it)",
+        }
 
         def entered(value: object) -> None:
-            if isinstance(value, str) and value.strip():
+            # For the org label an emptied field is the point -- it means hide
+            # the segment -- where an empty brand or marker means "never mind".
+            if isinstance(value, str) and (value.strip() or key == "org"):
                 row.value = value.strip()
 
         self._push(InputModal(titles[key], row.value), entered)
@@ -1412,6 +1437,9 @@ class MenuApp:
             return Text(model.text_rows["brand"].value, style=_VALUE)
         if row.patch.id == "version-marker":
             return Text(model.text_rows["suffix"].value, style=_VALUE)
+        if row.patch.id == "org-label":
+            value = model.text_rows["org"].value
+            return Text(value, style=_VALUE) if value else Text("hidden", style="dim")
         if row.patch.id == "codex-models":
             count = len(model.codex_models)
             if not count:

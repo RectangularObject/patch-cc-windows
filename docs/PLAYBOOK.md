@@ -233,9 +233,10 @@ that broke a patch along with every note.
 
 ## Patch reference
 
-Grouped by source module — the UI folds `live-thinking` into the Thinking group,
-but it still lives in `streaming.py`. Each entry: what it changes, the stable
-anchor, and where it lives.
+Grouped by source module. The menu's three groups (Output & display, Models &
+effort, Chrome & branding) are display categories that each draw from several
+modules — module says where a matcher lives, group says what the patch changes
+for you. Each entry: what it changes, the stable anchor, and where it lives.
 
 ### Output & diffs — `output.py`
 
@@ -287,6 +288,36 @@ anchor, and where it lives.
 
   A column of `0`s is this patch missing (or a bucket it does not yet cover);
   a spread of real lengths means the text arrived and the problem is rendering.
+
+- **`max-effort`** — let `/effort max` save as the session default, as
+  low–xhigh already do. `max` is first-class in session (the binary's level
+  list is `["low","medium","high","xhigh","max"]`; the CLI `--effort` and
+  `CLAUDE_CODE_EFFORT_LEVEL` both accept it) — only *persistence* runs through
+  two whitelists that stop at xhigh, and both are required rewrites because
+  either alone changes nothing:
+
+  - **`gate`** — one tiny whitelist function
+    (`if(e==="low"||…||e==="xhigh")return e;return`), and the whole choke
+    point: the `/effort` save path writes `effortLevel` to userSettings only
+    when it returns a value, the startup resolver reads the setting back
+    through it, and the model-picker flow persists through it too — so write
+    and read widen together in one rewrite. The matcher accepts both
+    minifier statement forms and the whole-body match keeps it off any other
+    function that merely compares levels.
+  - **`schema`** — the settings validator's
+    `effortLevel:*.enum(["low","medium","high","xhigh"])`, anchored on the
+    prop name (the describe-string `Persisted effort level` is the listed
+    anchor). Its `.catch(void 0)` is the safety property: a **clean** binary
+    reading a settings file that still says `"max"` (baked, then reverted by
+    a Claude update) treats it as unset — the default effort, never a broken
+    settings parse. Losing the patch costs the preference, nothing else.
+
+  Both matchers tolerate the level already being present and count it as
+  landed — an upstream that adopts `max` persistence itself is the goal
+  achieved, not a miss (the same judged-on-achievement rule
+  `subagent-models` follows). Effort semantics downstream are untouched: the
+  org-limit clamp runs before the save, and a model that cannot run `max`
+  clamps at request time exactly as an interactive `/effort max` does today.
 
 - **`thinking-inline`** — make historical thinking blocks render inline.
   Anchor: `case"thinking":` containing `isTranscriptMode:`. Two rewrites:
@@ -516,6 +547,20 @@ anchor, and where it lives.
   chosen name. Several string shapes, each its own sub-step. On by default,
   deriving `<username>'s Code`; `--brand NAME` names it explicitly, and selects
   the patch when it is not already in the set.
+- **`org-label`** — replace or hide the welcome screen's third segment
+  (`model · plan · <organizationName>`; for a personal claude.ai account the
+  org name *is* the account email). Anchor: the one conditional template
+  joining `.organizationName` behind `!process.env.IS_DEMO`, whose false
+  branch is upstream's own no-org shape `` `${model} \xB7 ${plan}` ``. An
+  empty label (`--org-label` with no value — empty is the *value* "hide", not
+  "unset") emits that false branch verbatim, so the separator leaves with the
+  segment; a label takes the org text's place, escaped for the template
+  literal it lands in. Candidates count off the `\xB7 ${*.organizationName}`
+  composition, so a reshaped ternary reads as `candidates > 0, applied == 0`
+  — a matcher to repair — rather than the zero that would equally mean
+  upstream retired the segment. Only this line is touched: the `/status`
+  Organization/Email rows, the login screen, and the org's startup message
+  (`"Message from <org>:"`) still show the real account.
 
 ## Removed patches
 

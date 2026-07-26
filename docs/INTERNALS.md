@@ -93,7 +93,7 @@ its shape; [PLAYBOOK.md](PLAYBOOK.md) covers what it means for matcher health:
 
 ```
 //patch-cc {"v":1,"tool":"<version>","patches":[...],"brand":...,"models":{...},
-            "codex":{"port":8817,"models":["gpt-5.6-sol", ...]}}
+            "org":...,"codex":{"port":8817,"models":["gpt-5.6-sol", ...]}}
 ```
 
 That line is why `patch-cc status` can name exactly what is applied: several

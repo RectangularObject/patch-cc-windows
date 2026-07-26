@@ -22,6 +22,9 @@ Rendering is only half of it. A fourth gate is not in the UI at all: the
 account's server-side experiment bucket, which decides whether the API puts any
 text in the thinking blocks it returns. `thinking-summaries` is that half, and
 without it the other three render an empty string perfectly.
+
+`max-effort` lives here too: effort is thinking depth, so the module that owns
+how thinking is shown also owns how hard it is asked for.
 """
 
 from __future__ import annotations
@@ -29,7 +32,8 @@ from __future__ import annotations
 import re
 
 from .base import (
-    GROUP_THINKING,
+    GROUP_MODELS,
+    GROUP_OUTPUT,
     IDENT,
     Options,
     Outcome,
@@ -189,12 +193,73 @@ def _thinking_summaries(content: str, _options: Options, outcome: Outcome) -> st
     return _CLIENT_BUCKET.sub(rewrite, content)
 
 
+# ------------------------------------------------------------- max effort
+#
+# `max` is a first-class level in session -- the level list the binary ships is
+# ["low","medium","high","xhigh","max"], and the CLI and env var both accept it
+# -- but persistence runs through two whitelists that stop at xhigh. Both are
+# widened; either alone changes nothing (docs/PLAYBOOK.md), which is also why
+# both steps are required.
+#
+# The gate is one tiny function, and it is the whole choke point: the /effort
+# save path writes settings only when it returns a value, the startup resolver
+# reads settings back through it, and the model-picker flow persists through it
+# too. The statement variants and the optional `||x==="max"` follow the matcher
+# rules: minifiers flip `return e;` and `{return e}`, and a build where upstream
+# has adopted the level itself is the goal already achieved, not a miss.
+_EFFORT_GATE = compile_js(
+    rf"function ({IDENT})\(({IDENT})\)\{{"
+    rf'if\(\2==="low"\|\|\2==="medium"\|\|\2==="high"\|\|\2==="xhigh"'
+    rf'(\|\|\2==="max")?\)'
+    rf"(?:\{{return \2\}}|return \2;?)return;?\}}"
+)
+
+# The persisted-settings schema entry. Its zod chain ends in `.catch(void 0)`,
+# so a clean binary reading a settings file that carries "max" (baked by us,
+# then reverted by a Claude update) treats it as unset rather than failing the
+# whole settings parse -- the property that makes this patch safe to lose.
+_EFFORT_SCHEMA = compile_js(
+    rf'effortLevel:({IDENT})\.enum\(\["low","medium","high","xhigh"(,"max")?\]\)'
+)
+
+
+def _max_effort(content: str, _options: Options, outcome: Outcome) -> str:
+    """Let ``/effort max`` save as the default for new sessions."""
+    gate = outcome.step("gate", expect=True)
+    schema = outcome.step("schema", expect=True)
+
+    def widen_gate(match: re.Match[str]) -> str:
+        gate.candidates += 1
+        gate.applied += 1
+        if match.group(3):
+            return match.group(0)
+        name, value = match.group(1), match.group(2)
+        return (
+            f"function {name}({value}){{"
+            f'if({value}==="low"||{value}==="medium"||{value}==="high"'
+            f'||{value}==="xhigh"||{value}==="max")return {value};return}}'
+        )
+
+    output = _EFFORT_GATE.sub(widen_gate, content)
+
+    def widen_schema(match: re.Match[str]) -> str:
+        schema.candidates += 1
+        schema.applied += 1
+        if match.group(2):
+            return match.group(0)
+        return (
+            f'effortLevel:{match.group(1)}.enum(["low","medium","high","xhigh","max"])'
+        )
+
+    return _EFFORT_SCHEMA.sub(widen_schema, output)
+
+
 PATCHES = [
     Patch(
         id="thinking-summaries",
         title="Fix blank thinking blocks",
         summary="Opt out of the server-side experiment bucket that can return empty thinking blocks on some accounts. Drops all experiment enrollment, not just this one.",
-        group=GROUP_THINKING,
+        group=GROUP_OUTPUT,
         fn=_thinking_summaries,
         anchors=(_BUCKET_HEADER, "?.atis"),
     ),
@@ -202,8 +267,20 @@ PATCHES = [
         id="thinking-inline",
         title="Always show thinking",
         summary="Render thinking blocks inline instead of hiding them behind ctrl+o.",
-        group=GROUP_THINKING,
+        group=GROUP_OUTPUT,
         fn=_thinking_inline,
         anchors=('case"thinking":', "isTranscriptMode:", "latestThinkingSummary"),
+    ),
+    Patch(
+        id="max-effort",
+        title="Persist max effort",
+        summary="Let /effort max save as your default for new sessions, like the other levels.",
+        group=GROUP_MODELS,
+        fn=_max_effort,
+        anchors=(
+            '==="low"||',
+            '"low","medium","high","xhigh"]',
+            "Persisted effort level",
+        ),
     ),
 ]

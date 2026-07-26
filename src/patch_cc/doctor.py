@@ -110,7 +110,12 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
         if (target := next((m for m in models if m != agent.effective_model), None))
     }
     return Options(
-        brand="patch-cc doctor", subagent_models=overrides, codex_models=codex
+        brand="patch-cc doctor",
+        subagent_models=overrides,
+        codex_models=codex,
+        # The replace branch; the hidden form differs only in the emitted tail,
+        # so one configuration holds the whole matcher in the net.
+        org_label="patch-cc doctor",
     )
 
 

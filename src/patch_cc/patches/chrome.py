@@ -175,6 +175,52 @@ def _branding(content: str, options: Options, outcome: Outcome) -> str:
     return output
 
 
+# ---------------------------------------------------------- startup org label
+
+# The separator as the bundle may spell it: today's bundler writes the `·` as
+# the escape text `\xB7`, and a charset flip would emit the raw character. Both
+# spell the same string, so both are accepted -- a representation variant like
+# the minifier's brace flips, not a second shape.
+_SEP = r"(?:\\xB7|\xB7)"
+
+# The welcome screen's info line: `model · plan` -- and, when the account has an
+# organizationName (for personal claude.ai accounts, that is the account email),
+# ` · <organizationName>` after it. One conditional template, and upstream ships
+# the no-org variant as its own false branch, so hiding the segment is selecting
+# a shape the bundle already carries -- separator and all -- not inventing one.
+_ORG_LINE = compile_js(
+    rf"!process\.env\.IS_DEMO&&({IDENT})\?\.organizationName\?"
+    rf"`\$\{{({IDENT})\}} {_SEP} \$\{{({IDENT})\}} {_SEP} \$\{{\1\.organizationName\}}`"
+    rf":`\$\{{\2\}} {_SEP} \$\{{\3\}}`"
+)
+
+#: The composition itself -- a separator joining the account's organizationName
+#: into a template -- is the durable fingerprint; candidates count off it so a
+#: reshaped ternary reads as "found it, rewrote nothing" (a matcher to repair)
+#: instead of the zero that would equally mean upstream retired the segment.
+_ORG_NEEDLE = compile_js(rf"{_SEP} \$\{{{IDENT}\.organizationName\}}")
+
+
+def _org_label(content: str, options: Options, outcome: Outcome) -> str:
+    """Replace -- or, with an empty label, drop -- the welcome line's org segment.
+
+    One rule builds the replacement either way: the line is `model · plan`,
+    plus ` · <label>` exactly when there is a label. Empty therefore removes
+    the separator with the segment, and a custom label takes the org text's
+    place. The `IS_DEMO`/has-org gate goes with the ternary: a baked label is
+    unconditional by construction, and the hidden form needs no gate at all.
+    """
+    outcome.candidates += len(_ORG_NEEDLE.findall(content))
+    label = options.org_label
+    tail = f" \\xB7 {_js_template_escape(label)}" if label else ""
+
+    def rewrite(match: re.Match[str]) -> str:
+        outcome.applied += 1
+        return f"`${{{match.group(2)}}} \\xB7 ${{{match.group(3)}}}{tail}`"
+
+    return _ORG_LINE.sub(rewrite, content)
+
+
 PATCHES = [
     Patch(
         id="spinner-tips",
@@ -202,5 +248,15 @@ PATCHES = [
         fn=_branding,
         option="--brand",
         anchors=('"Welcome to Claude Code"', '{bold:!0},"Claude Code"'),
+    ),
+    Patch(
+        id="org-label",
+        title="Startup org/email label",
+        summary="Replace or hide the org/email shown after the plan name on the welcome screen.",
+        group=GROUP_CHROME,
+        fn=_org_label,
+        default=False,
+        option="--org-label",
+        anchors=("organizationName", "IS_DEMO"),
     ),
 ]

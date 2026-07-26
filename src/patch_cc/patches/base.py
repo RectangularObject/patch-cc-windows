@@ -37,11 +37,12 @@ if TYPE_CHECKING:
 #: indistinguishable from the 11 that upstream already ships.
 SENTINEL = "__cc_"
 
-# Groups, in display order.
-GROUP_OUTPUT = "Output & diffs"
-GROUP_THINKING = "Thinking"
-GROUP_AGENTS = "Subagents"
-GROUP_CODEX = "Codex models"
+# Groups, in display order: what renders, what runs (and how hard), how it is
+# dressed. Generic on purpose -- a group named after a feature (Thinking,
+# Subagents, Codex) fits exactly that feature, and the next patch that is
+# about behaviour rather than a surface has no home.
+GROUP_OUTPUT = "Output & display"
+GROUP_MODELS = "Models & effort"
 GROUP_CHROME = "Chrome & branding"
 
 #: Default brand: the name shown unless the user overrides it. One home so the
@@ -88,6 +89,11 @@ class Options:
     #: from the one home (:data:`patch_cc.codex.DEFAULT_PORT`) so the number
     #: never lives in two places.
     codex_port: int = DEFAULT_PORT
+    #: The welcome screen's org segment (for personal claude.ai accounts,
+    #: upstream shows the account email there). Empty is a *value* -- hide the
+    #: segment -- not "unset": whether the patch acts at all is the selection's
+    #: question, never this field's.
+    org_label: str = ""
 
     @property
     def rebrands(self) -> bool:

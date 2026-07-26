@@ -16,7 +16,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .base import GROUP_AGENTS, IDENT, Options, Outcome, Patch, compile_js, splice
+from .base import (
+    GROUP_MODELS,
+    GROUP_OUTPUT,
+    IDENT,
+    Options,
+    Outcome,
+    Patch,
+    compile_js,
+    splice,
+)
 
 # ------------------------------------------------------- prompt visibility
 
@@ -366,7 +375,7 @@ PATCHES = [
         id="subagent-prompt",
         title="Show subagent prompts",
         summary="Show a subagent's Prompt block during normal use, not only in transcript mode.",
-        group=GROUP_AGENTS,
+        group=GROUP_OUTPUT,
         fn=_subagent_prompt,
         anchors=('"Backgrounded agent"', 'action:"app:toggleTranscript"'),
     ),
@@ -374,7 +383,7 @@ PATCHES = [
         id="subagent-models",
         title="Override subagent models",
         summary="Choose the default model for the built-in agents found in your binary.",
-        group=GROUP_AGENTS,
+        group=GROUP_MODELS,
         fn=_subagent_models,
         default=False,
         option="--model",

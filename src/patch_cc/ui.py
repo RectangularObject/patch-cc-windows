@@ -57,6 +57,8 @@ def applied_value(patch: Patch, outcome: Outcome, options: Options) -> str | Non
         return options.brand
     if patch.id == "version-marker":
         return options.version_suffix
+    if patch.id == "org-label":
+        return options.org_label or "hidden"
     if patch.id == "subagent-models" and options.subagent_models:
         return ", ".join(f"{a}={m}" for a, m in options.subagent_models.items())
     if patch.id == "codex-models" and options.codex_models:

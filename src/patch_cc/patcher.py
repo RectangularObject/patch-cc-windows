@@ -92,6 +92,11 @@ def manifest_payload(landed: list[str], options: Options) -> dict:
         payload["suffix"] = options.version_suffix
     if options.subagent_models and "subagent-models" in applied:
         payload["models"] = options.subagent_models
+    if "org-label" in applied:
+        # Recorded even when empty: "" is the asked-for value (hide the
+        # segment), and omitting it would make hidden indistinguishable from
+        # never-configured when the menu seeds from this manifest.
+        payload["org"] = options.org_label
     if options.codex_models and "codex-models" in applied:
         # Ids and a port -- the whole of what was asked for. A model's name and
         # context window are baked into the bundle itself (the picker rows, the
