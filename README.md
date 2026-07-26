@@ -5,8 +5,16 @@
 
 An interactive patcher for the **Claude Code native binary**. Pick the tweaks
 you want — inline and live thinking, detailed tool calls, subagent model
-overrides, your own startup name — and apply them to your installed `claude`
-in one keystroke. Pure Python; no Node, no Bun.
+overrides, your own startup name, your **ChatGPT/Codex-plan GPT models as
+native models** — and apply them to your installed `claude` in one keystroke.
+Fully reversible: a pristine backup is kept, `patch-cc restore` puts it back.
+Pure Python; no Node, no Bun.
+
+```bash
+uvx patch-cc                   # fullscreen menu, no install needed
+```
+
+![patch-cc: pick tweaks, register a Codex model, pin the Plan agent to it, bake — the patched binary is 161 MB smaller](https://raw.githubusercontent.com/anfreire/patch-cc/main/docs/demo.gif)
 
 ## Requirements
 
@@ -18,10 +26,6 @@ in one keystroke. Pure Python; no Node, no Bun.
   it is an ordinary PyPI package.
 - **macOS only:** the Xcode command line tools, for `codesign` — a patched
   binary has to be re-signed or macOS refuses to run it.
-
-```bash
-uvx patch-cc                   # fullscreen menu, no install needed
-```
 
 The menu is a single centered panel: move with `↑ ↓`, toggle with `space`,
 press `s` to save. Patches that carry a setting — subagent models, Codex models,
