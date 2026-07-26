@@ -185,3 +185,7 @@ bundle rather than with clodex's TLS interception.
 ## License
 
 MIT
+
+---
+
+**More agent tooling** — [summon-cc](https://github.com/anfreire/summon-cc): give your agent a crew of Claude Code workers · [cc-oc](https://github.com/anfreire/cc-oc): drive opencode from inside Claude Code · [omoctl](https://github.com/anfreire/omoctl): manage oh-my-openagent profiles · [wiki-spaces](https://github.com/anfreire/wiki-spaces): a wiki your AI agent keeps
