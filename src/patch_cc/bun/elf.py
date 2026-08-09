@@ -224,11 +224,11 @@ def write_section(buf: bytes, payload: bytes, name: str = ".bun") -> bytes:
             and seg.filesz
             and seg.offset >= end
             and seg.align
+            and (seg.offset + delta) % seg.align != seg.vaddr % seg.align
         ):
-            if (seg.offset + delta) % seg.align != seg.vaddr % seg.align:
-                raise ElfError(
-                    f"shifting LOAD segment {seg.index} would break its alignment"
-                )
+            raise ElfError(
+                f"shifting LOAD segment {seg.index} would break its alignment"
+            )
 
     new_size = bun.size + delta
     body = bytearray(payload)

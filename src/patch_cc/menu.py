@@ -27,8 +27,9 @@ from __future__ import annotations
 import sys
 import textwrap
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 from blessed import Terminal
 from rich import box
@@ -140,7 +141,7 @@ class MenuModel:
     """Everything the menu operates on, independent of the rendering engine."""
 
     install: locate.Installation
-    status: "Status"
+    status: Status
     pristine: Bundle
     agents: list[BuiltinAgent]
     models: list[str]
@@ -154,8 +155,8 @@ class MenuModel:
 
     @classmethod
     def build(
-        cls, install: locate.Installation, status: "Status", pristine: Bundle
-    ) -> "MenuModel":
+        cls, install: locate.Installation, status: Status, pristine: Bundle
+    ) -> MenuModel:
         agents = discover_agents(pristine.source)
         models = [INHERIT, *discover_models(pristine.source)]
         model = cls(
@@ -577,7 +578,7 @@ class MenuApp:
         self.view = "select"  # select | busy | report | doctor
         self.stack: list[tuple[Modal, Callable[[object], None] | None]] = []
         self.report: patcher.PatchReport | None = None
-        self.doctor_result: "DryRun | None" = None
+        self.doctor_result: DryRun | None = None
         self.busy_message = ""
         self.flash = ""
         self.exit_code = 0
@@ -642,7 +643,7 @@ class MenuApp:
             attrs = termios.tcgetattr(fd)
             attrs[0] &= ~(termios.IXON | termios.IXOFF)
             termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 - best effort; no termios, no freeze risk
             pass
 
     def _key_name(self, keystroke) -> str:
@@ -1080,7 +1081,7 @@ class MenuApp:
 
     def _apply(
         self, selection: cache.Selection
-    ) -> tuple[patcher.PatchReport, "Status | None"]:
+    ) -> tuple[patcher.PatchReport, Status | None]:
         options = selection.options
         if options.codex_models:
             # Fill in each model's name and window right before baking. A pick
@@ -1154,7 +1155,7 @@ class MenuApp:
         def run() -> None:
             try:
                 self._worker_result = (kind, work(), None)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - the worker's failure IS the result
                 self._worker_result = (kind, None, str(exc) or exc.__class__.__name__)
 
         threading.Thread(target=run, daemon=True).start()

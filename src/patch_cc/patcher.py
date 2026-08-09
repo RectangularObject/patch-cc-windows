@@ -326,7 +326,7 @@ def restore(install: locate.Installation) -> Path:
             "for this version was never saved -- reinstall to get a clean binary."
         )
     # A full-file copy-back, so it works for both ELF and Mach-O.
-    from .bun.elf import atomic_write  # noqa: PLC0415
+    from .bun.elf import atomic_write
 
     atomic_write(str(install.binary), backup.read_bytes(), mode_from=str(backup))
     return install.binary

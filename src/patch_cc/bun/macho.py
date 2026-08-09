@@ -27,7 +27,7 @@ class MachOError(BunError):
 
 def _lief():
     try:
-        import lief  # noqa: PLC0415
+        import lief
     except ImportError as exc:  # pragma: no cover - platform dependent
         raise MachOError(
             "LIEF is required to patch macOS binaries. Install it with "
@@ -107,6 +107,7 @@ def codesign(path: str) -> None:
         ["codesign", "--sign", "-", "--force", path],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:  # pragma: no cover - macOS only
         raise MachOError(f"codesign failed: {result.stderr.strip()}")

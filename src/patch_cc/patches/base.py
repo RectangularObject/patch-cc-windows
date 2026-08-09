@@ -69,7 +69,7 @@ def derived_brand() -> str:
 
     try:
         user = getpass.getuser().strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 - however it fails, the answer is the same
         user = ""
     return f"{user}'s Code" if user else DEFAULT_BRAND
 
@@ -84,7 +84,7 @@ class Options:
     #: Codex models to register and route -- ordinary patch configuration, like
     #: every field here: chosen in the menu or with ``--codex``, and recorded in
     #: the manifest by the patch that bakes it.
-    codex_models: list["CodexModel"] = field(default_factory=list)
+    codex_models: list[CodexModel] = field(default_factory=list)
     #: Localhost port shared by the redirect patch and the gateway. Defaulted
     #: from the one home (:data:`patch_cc.codex.DEFAULT_PORT`) so the number
     #: never lives in two places.
@@ -116,7 +116,7 @@ class Outcome:
     applied: int = 0
     notes: list[str] = field(default_factory=list)
     #: Named sub-steps, for patches built from several independent rewrites.
-    steps: dict[str, "Outcome"] = field(default_factory=dict)
+    steps: dict[str, Outcome] = field(default_factory=dict)
     #: What this sub-step's absence means (set via :meth:`step`). ``False`` --
     #: a shape some builds simply lack; ``True`` -- the patch is broken without
     #: it; a string -- name of a group of which at least one member must land.
@@ -153,7 +153,7 @@ class Outcome:
     def note(self, message: str) -> None:
         self.notes.append(message)
 
-    def step(self, name: str, expect: bool | str = False) -> "Outcome":
+    def step(self, name: str, expect: bool | str = False) -> Outcome:
         """Get (or create) a named sub-outcome.
 
         A single scalar count cannot distinguish "all twelve rewrites landed"
@@ -167,7 +167,7 @@ class Outcome:
             sub.expect = expect
         return sub
 
-    def finalize(self) -> "Outcome":
+    def finalize(self) -> Outcome:
         """Roll sub-step totals up into this outcome."""
         if self.steps:
             self.candidates += sum(s.candidates for s in self.steps.values())

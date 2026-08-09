@@ -304,12 +304,8 @@ def _register_picker(
     # because this is the only place in the picker where a model leaves Anthropic,
     # and nothing else in the list would say so.
     entries = ",".join(
-        "{value:%s,label:%s,description:%s}"
-        % (
-            js_string(value),
-            js_string(_display_name(value)),
-            js_string(_describe(model)),
-        )
+        f"{{value:{js_string(value)},label:{js_string(_display_name(value))},"
+        f"description:{js_string(_describe(model))}}}"
         for value, model in picks
     )
     # Every row is emitted with no build-time "already present?" filter, and dedup

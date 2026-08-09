@@ -79,7 +79,7 @@ def _subagent_prompt(content: str, _options: Options, outcome: Outcome) -> str:
         transcript_var = transcript.group(1)
         gate_pattern = compile_js(rf"{re.escape(transcript_var)}&&({IDENT})&&")
 
-        def drop_gate(match: re.Match[str]) -> str:
+        def drop_gate(match: re.Match[str], segment: str = segment) -> str:
             prompt_var = match.group(1)
             nearby = segment[match.end() : match.end() + 260]
             if f"{{prompt:{prompt_var},theme:" not in nearby:

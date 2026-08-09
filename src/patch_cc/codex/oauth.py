@@ -74,7 +74,7 @@ class Credentials:
         }
 
     @classmethod
-    def from_json(cls, data: object) -> "Credentials | None":
+    def from_json(cls, data: object) -> Credentials | None:
         if not isinstance(data, dict):
             return None
         access, refresh = data.get("access"), data.get("refresh")

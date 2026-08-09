@@ -78,7 +78,7 @@ def _resolve(path: Path) -> Installation | None:
 
 def _is_native(binary: Path) -> bool:
     """Is this file one of the containers we can actually open?"""
-    from .bun import BunError, container  # noqa: PLC0415 - keeps import order flat
+    from .bun import BunError, container
 
     try:
         container.detect(str(binary))

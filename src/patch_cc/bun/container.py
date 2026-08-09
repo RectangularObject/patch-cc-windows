@@ -85,7 +85,7 @@ def write(
     compared against ``source`` -- *before* it is moved into place. A rebuild
     bug therefore fails without ever touching the live binary.
     """
-    import shutil  # noqa: PLC0415
+    import shutil
 
     new_blob = blobmod.rebuild(
         bundle.blob, source.encode("utf8"), drop_bytecode=drop_bytecode
@@ -120,7 +120,7 @@ def verify(path: str, expected: str) -> None:
     """Re-extract from a written binary and assert it round-trips exactly."""
     try:
         written = read(path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ContainerError(f"patched binary could not be re-read: {exc}") from exc
     if written.source != expected:
         raise ContainerError(

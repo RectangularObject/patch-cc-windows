@@ -36,7 +36,7 @@ from pathlib import Path
 from rich.markup import escape
 
 from . import cache, locate, patcher
-from .bun import BunError, Bundle
+from .bun import Bundle, BunError
 from .codex import DEFAULT_PORT, is_valid_port
 from .codex.models import CodexModel, catalogue, is_reserved_id, is_valid_id, reconcile
 from .patches import (
@@ -549,7 +549,7 @@ def _doctor_target(path: str | None) -> tuple[Bundle, str] | None:
     given -- that is how any kept backup becomes a regression corpus -- while the
     installed binary falls back to its pristine copy when it is already patched.
     """
-    from .bun import container  # noqa: PLC0415
+    from .bun import container
 
     if path is not None:
         # A name the user typed is data, not markup: an unescaped `claude[old]`
@@ -695,7 +695,7 @@ def _baked_port() -> int | None:
     why ``serve`` asks once at startup rather than per request -- and why a re-bake
     onto a different port needs a ``serve`` restart, as the apply report says.
     """
-    from .bun import container  # noqa: PLC0415
+    from .bun import container
 
     install = locate.find()
     if install is None:

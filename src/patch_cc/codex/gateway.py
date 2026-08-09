@@ -155,7 +155,7 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args) -> None:  # keep the terminal clean
         pass
 
-    def do_POST(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler's name)
+    def do_POST(self) -> None:
         # One request per connection: an SSE reply is open-ended (no
         # Content-Length), so the stream ends by connection close.
         self.close_connection = True
@@ -177,7 +177,9 @@ class _Handler(BaseHTTPRequestHandler):
                 # this API just as unparseable bytes are, and is answered the same
                 # way. Reaching `_messages` with one used to raise straight out of
                 # the handler thread: a traceback, a reset connection, no reply.
-                raise ValueError("not a JSON object")
+                raise ValueError(  # noqa: TRY004 - lands in json's own handler below
+                    "not a JSON object"
+                )
         except ValueError:
             return self._error(
                 400, "invalid_request_error", "request body must be a JSON object"

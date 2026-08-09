@@ -85,7 +85,7 @@ def gateway_note(port: int) -> tuple[str, str]:
     """
     # Imported here so the server (and its http/threading machinery) stays out of
     # every patch-cc invocation that never asks about the gateway.
-    from .codex.gateway import running  # noqa: PLC0415
+    from .codex.gateway import running
 
     # Spaced to fit the menu's 72-column panel at a five-digit port, so the half
     # that says what to do cannot be the half an ellipsis eats.
