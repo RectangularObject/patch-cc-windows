@@ -4,7 +4,7 @@ This is the single most fragile patch in the set: upstream has reshaped the
 stream reducer at least three times, and most of their commit traffic lands
 here. Two structural choices follow from that:
 
-1. It is built from ~11 **named steps**, each recording its own outcome. A
+1. It is built from ~20 **named steps**, each recording its own outcome. A
    scalar hit count cannot tell "everything landed" from "half of it silently
    drifted", which is precisely how this patch hides its own regressions.
 2. Steps share discovered identifiers through :class:`Discovery` rather than
@@ -12,7 +12,7 @@ here. Two structural choices follow from that:
    shape does not take the rest down with it.
 
 Tolerating failure is not the same as ignoring it: the steps the feature cannot
-live without are marked *required*, and the three reducer shapes form a group of
+live without are marked *required*, and the two reducer shapes form a group of
 which at least one must land. Everything else -- the legacy cleanups upstream has
 since dropped -- stays optional, so `doctor` distinguishes "this build lacks that
 shape" from "live thinking is dead".
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from .base import GROUP_OUTPUT, IDENT, Options, Outcome, Patch, compile_js, splice
 
 #: The mutually-exclusive reducer variants. On any one build one of them lands;
-#: none landing means upstream shipped a fourth shape and live thinking is dead.
+#: none landing means upstream shipped a new head shape and live thinking is dead.
 REDUCER = "reducer"
 
 #: The two rewrites that *are* live thinking: one creates the virtual message
@@ -561,190 +561,30 @@ def _step_bottom_row(content: str, outcome: Outcome) -> str:
 
 # ------------------------------------------------------ steps 10-11: reducer
 
-_PROGRESS_ONLY = (
-    r'case"thinking_delta":\{{let\{{delta:({ident})\}}={event}\.event;'
-    r'if\("estimated_tokens"in \1&&typeof \1\.estimated_tokens==="number"\)'
-    r'({ident})\?\.\(\{{type:"thinking_progress",'
-    r"estimatedTokensDelta:\1\.estimated_tokens\}}\);return\}}"
-)
-_PROGRESS_WITH_TEXT = (
-    r'case"thinking_delta":\{{let\{{delta:({ident})\}}={event}\.event;'
-    r'if\("estimated_tokens"in \1&&typeof \1\.estimated_tokens==="number"\)'
-    r'({ident})\?\.\(\{{type:"thinking_progress",'
-    r"estimatedTokensDelta:\1\.estimated_tokens\}}\);"
-    r'else if\("thinking"in \1&&typeof \1\.thinking==="string"&&\1\.thinking\.length>0\)'
-    r'\2\?\.\(\{{type:"thinking_progress",'
-    r"estimatedTokensDelta:({ident})\(\1\.thinking\)\}}\);return\}}"
-)
+# The reducer rewrites are *insertions at dispatch points*, never edits of what
+# an arm already does. Each state update is spliced in where the reducer
+# dispatches on an event-type string -- after a run of ``case`` labels, or into
+# an ``if`` condition -- and the arm's own body is left byte-untouched. The body
+# is upstream's busiest surface (2.1.226 threaded a progress flag through five
+# arms in one release) and modelling any of it means enumerating spellings that
+# churn per build; the dispatch strings are the API's own vocabulary and do not.
 
-
-def _apply_pairs(segment: str, pairs: list[tuple[str, str]], step: Outcome) -> str:
-    """Apply literal before/after rewrites, counting each independently."""
-    for before, after in pairs:
-        if before and before in segment:
-            step.candidates += 1
-            segment = segment.replace(before, after, 1)
-            if after in segment:
-                step.applied += 1
-    return segment
-
-
-def _apply_progress_variants(
-    segment: str, event: str, delta_body: str, step: Outcome
-) -> str:
-    """Keep upstream's thinking-progress metrics while adding our state update."""
-    for template in (_PROGRESS_ONLY, _PROGRESS_WITH_TEXT):
-        pattern = compile_js(template.format(ident=IDENT, event=re.escape(event)))
-
-        def rewrite(match: re.Match[str]) -> str:
-            groups = match.groups()
-            delta_var, metrics = groups[0], groups[1]
-            tail = (
-                f"let{{delta:{delta_var}}}={event}.event;"
-                f'if("estimated_tokens"in {delta_var}&&'
-                f'typeof {delta_var}.estimated_tokens==="number")'
-                f'{metrics}?.({{type:"thinking_progress",'
-                f"estimatedTokensDelta:{delta_var}.estimated_tokens}});"
-            )
-            if len(groups) > 2:
-                estimator = groups[2]
-                tail += (
-                    f'else if("thinking"in {delta_var}&&'
-                    f'typeof {delta_var}.thinking==="string"&&'
-                    f"{delta_var}.thinking.length>0)"
-                    f'{metrics}?.({{type:"thinking_progress",'
-                    f"estimatedTokensDelta:{estimator}({delta_var}.thinking)}});"
-                )
-            return f'case"thinking_delta":{{{delta_body}{tail}return}}'
-
-        updated = pattern.sub(rewrite, segment, count=1)
-        if updated != segment:
-            step.candidates += 1
-            step.applied += 1
-            segment = updated
-    return segment
-
-
-def _reducer_pairs(
-    event: str,
-    setter: str,
-    mode: str,
-    tools: str,
-    helper: str,
-    *,
-    optional: bool,
-    options_param: str | None = None,
-    display_transform: str | None = None,
-) -> list[tuple[str, str]]:
-    """Before/after rewrites for one stream-reducer shape.
-
-    ``optional`` selects whether upstream calls the setters directly or through
-    ``?.`` -- both spellings exist in the wild.
-    """
-    call = "?." if optional else ""
-    ended = _reset(setter, "Date.now()")
-    cleared = _reset(setter, "void 0")
-    pairs: list[tuple[str, str]] = [
-        (
-            f'if({event}.type==="stream_request_start"){{{mode}("requesting");return}}',
-            f'if({event}.type==="stream_request_start"){{{setter}?.(null),{mode}{call}("requesting");return}}',
-        ),
-        (
-            f'if({event}.type==="stream_request_start"){{{mode}?.("requesting");return}}',
-            f'if({event}.type==="stream_request_start"){{{setter}?.(null),{mode}?.("requesting");return}}',
-        ),
-    ]
-
-    if options_param:
-        pairs.append(
-            (
-                f'if({event}.event.type==="message_stop"){{{options_param}.displayTransform?.finalize(),'
-                f'{mode}("tool-use"),{tools}(()=>[]);return}}',
-                f'if({event}.event.type==="message_stop"){{{options_param}.displayTransform?.finalize(),'
-                f'{ended},{mode}("tool-use"),{tools}(()=>[]);return}}',
-            )
-        )
-    if display_transform:
-        for prefix in (
-            f"{display_transform}.finalize()",
-            f"{display_transform}?.finalize()",
-        ):
-            for mo, to in ((mode, tools), (f"{mode}?.", f"{tools}?.")):
-                pairs.append(
-                    (
-                        f'if({event}.event.type==="message_stop"){{{prefix},'
-                        f'{mo}("tool-use"),{to}(()=>[]);return}}',
-                        f'if({event}.event.type==="message_stop"){{{display_transform}?.finalize(),'
-                        f'{ended},{mode}?.("tool-use"),{tools}?.(()=>[]);return}}',
-                    )
-                )
-
-    pairs += [
-        (
-            f'if({event}.event.type==="message_stop"){{{mode}("tool-use"),{tools}(()=>[]);return}}',
-            f'if({event}.event.type==="message_stop"){{{ended},{mode}{call}("tool-use"),'
-            f"{tools}{call}(()=>[]);return}}",
-        ),
-        (
-            f'if({event}.event.type==="message_stop"){{{mode}?.("tool-use"),{tools}?.(()=>[]);return}}',
-            f'if({event}.event.type==="message_stop"){{{ended},{mode}?.("tool-use"),'
-            f"{tools}?.(()=>[]);return}}",
-        ),
-        (
-            f'case"thinking":case"redacted_thinking":{mode}("thinking");return;',
-            f'case"thinking":case"redacted_thinking":{_block_start(event, setter, helper)},'
-            f'{mode}{call}("thinking");return;',
-        ),
-        (
-            f'case"thinking":case"redacted_thinking":{mode}?.("thinking");return;',
-            f'case"thinking":case"redacted_thinking":{_block_start(event, setter, helper)},'
-            f'{mode}?.("thinking");return;',
-        ),
-        (
-            f'case"text":{mode}("responding");return;',
-            f'case"text":{cleared},{mode}{call}("responding");return;',
-        ),
-        (
-            f'case"text":{mode}?.("responding");return;',
-            f'case"text":{cleared},{mode}?.("responding");return;',
-        ),
-        (
-            f'case"message_delta":if({mode}("responding"),{event}.event.usage.output_tokens!=null)',
-            f'case"message_delta":if({cleared},{mode}("responding"),'
-            f"{event}.event.usage.output_tokens!=null)",
-        ),
-        (
-            f'case"message_delta":{mode}("responding");return;',
-            f'case"message_delta":{cleared},{mode}{call}("responding");return;',
-        ),
-        (
-            f'case"message_delta":{mode}?.("responding");return;',
-            f'case"message_delta":{cleared},{mode}?.("responding");return;',
-        ),
-        (
-            f'case"message_delta":{{{mode}("responding");',
-            f'case"message_delta":{{{cleared},{mode}{call}("responding");',
-        ),
-        (
-            f'case"message_delta":{{{mode}?.("responding");',
-            f'case"message_delta":{{{cleared},{mode}?.("responding");',
-        ),
-    ]
-    return pairs
-
-
-_DESTRUCTURED_HANDLER = compile_js(
-    rf"function {IDENT}\(({IDENT}),({IDENT})\)\{{let\{{([^}}]*onStreamingThinking:{IDENT}[^}}]*)\}}=\2;"
-)
-_MISSING_HANDLER = compile_js(
-    rf"function {IDENT}\(({IDENT}),({IDENT})(?:,{IDENT})?\)\{{let\{{([^}}]*)\}}=\2;"
-)
 _LEGACY_ANCHOR = 'type!=="stream_event"&&'
 _FN_SIG = compile_js(rf"^function {IDENT}\(([^)]*)\)\{{")
 
+#: The options-bag reducer head, 2.1.138 to date. Bounded at the grammar's
+#: declarator edge: in this one-line minified bundle only ``;`` (statement end)
+#: or ``,`` (next declarator) can follow ``}=<param>``, and which one is
+#: minifier noise -- 2.1.226 broke the old matcher purely by appending
+#: ``,d=...`` to the ``let``.
+_OPTIONS_HANDLER = compile_js(
+    rf"function {IDENT}\(({IDENT}),({IDENT})(?:,{IDENT})*\)"
+    rf"\{{let\{{([^{{}}]*)\}}=\2(?=[;,])"
+)
+
 
 def _prop_var(props: str, name: str, *, shorthand: bool = False) -> str | None:
-    alias = compile_js(rf"{re.escape(name)}:({IDENT})").search(props)
+    alias = compile_js(rf"(?:^|,){re.escape(name)}:({IDENT})").search(props)
     if alias:
         return alias.group(1)
     if shorthand and compile_js(rf"(?:^|,){re.escape(name)}(?:,|$)").search(props):
@@ -763,9 +603,106 @@ def _handler_is_stream_reducer(segment: str) -> bool:
     )
 
 
-def _step_reducer_destructured(content: str, found: Discovery, outcome: Outcome) -> str:
-    """2.1.138+ shape: options bag that already destructures onStreamingThinking."""
-    step = outcome.step("reducer-destructured", expect=REDUCER)
+def _insert_after_labels(
+    segment: str, labels: tuple[str, ...], expr: str, step: Outcome
+) -> str:
+    """Run ``expr`` first in every arm dispatching on one of these ``case`` labels.
+
+    The insertion lands after the whole consecutive label chain, so a fused
+    ``case"thinking":case"redacted_thinking":`` arm gets one update and split
+    *terminating* arms get one each -- both spellings of the same dispatch.
+    Inserting a statement is valid whatever the arm holds: a following braced
+    arm simply becomes a bare block, whose ``let``s stay scoped inside it.
+    """
+    chain = compile_js("(?:" + "|".join(rf'case"{label}":' for label in labels) + ")+")
+    text = expr + ";"
+    for match in reversed(list(chain.finditer(segment))):
+        step.candidates += 1
+        if segment[match.end() : match.end() + len(text)] == text:
+            step.applied += 1  # already carries the update: the goal, achieved
+            continue
+        segment = splice(segment, match.end(), match.end(), text)
+        step.applied += 1
+    return segment
+
+
+def _guard_dispatch(segment: str, needle: str, expr: str, step: Outcome) -> str:
+    """Run ``expr`` first wherever the reducer evaluates this dispatch test.
+
+    The test expression itself is wrapped -- ``(test&&((expr),!0))`` -- which
+    preserves its value exactly: true stays true through the comma, false never
+    reaches ``expr``. Value-equivalence is what makes the wrap survive any
+    surrounding composition unread -- an ``if`` of its own, a compound
+    condition (short-circuit keeps ``expr`` off the paths that did not
+    dispatch), a ternary, an assignment -- where guarding the *enclosing*
+    condition would run the update for the other side of a bare ``||``.
+    """
+    guard = f"&&(({expr}),!0)"
+    for match in reversed(list(compile_js(re.escape(needle)).finditer(segment))):
+        step.candidates += 1
+        if segment[match.end() : match.end() + len(guard)] == guard:
+            step.applied += 1  # already guarded: the goal, achieved
+            continue
+        segment = splice(segment, match.start(), match.end(), f"({needle}{guard})")
+        step.applied += 1
+    return segment
+
+
+def _rewrite_reducer_segment(
+    segment: str, event: str, setter: str, helper: str, outcome: Outcome
+) -> str:
+    """Splice the live-thinking state updates into one recognised reducer.
+
+    Each dispatch point is its own named step, so a build that drops one --
+    upstream folding an arm away -- reads as that point's absence by name,
+    never as a bare count drop inside an aggregate. The two updates that *are*
+    the feature stay credited by their markers (:data:`_CORE_UPDATES`), not by
+    these insertion counts.
+    """
+    ended = _reset(setter, "Date.now()")
+    cleared = _reset(setter, "void 0")
+
+    segment = _guard_dispatch(
+        segment,
+        f'{event}.type==="stream_request_start"',
+        f"{setter}?.(null)",
+        outcome.step("request-start"),
+    )
+    segment = _guard_dispatch(
+        segment,
+        f'{event}.event.type==="message_stop"',
+        ended,
+        outcome.step("message-stop"),
+    )
+    segment = _insert_after_labels(
+        segment, ("text",), cleared, outcome.step("text-clear")
+    )
+    segment = _insert_after_labels(
+        segment, ("message_delta",), cleared, outcome.step("message-delta-clear")
+    )
+    segment = _insert_after_labels(
+        segment,
+        ("thinking", "redacted_thinking"),
+        _block_start(event, setter, helper),
+        outcome.step("thinking-start"),
+    )
+    return _insert_after_labels(
+        segment,
+        ("thinking_delta",),
+        _delta(event, setter, helper),
+        outcome.step("thinking-append"),
+    )
+
+
+def _step_reducer_options(content: str, found: Discovery, outcome: Outcome) -> str:
+    """2.1.138+ shape: an options bag destructured at the head.
+
+    One step for every options-bag build: whether the bag already destructures
+    ``onStreamingThinking`` (2.1.138-183) or dropped it (2.1.183+) is the same
+    shape with the prop present or absent, so the setter is reused when found
+    and threaded into the destructuring when not -- one code path, no variant.
+    """
+    step = outcome.step("reducer-options", expect=REDUCER)
     helper = found.create_message_helper
     if helper is None:
         step.note("no virtual-message helper discovered; skipped")
@@ -773,106 +710,42 @@ def _step_reducer_destructured(content: str, found: Discovery, outcome: Outcome)
 
     output, pos = content, 0
     while True:
-        match = _DESTRUCTURED_HANDLER.search(output, pos)
+        match = _OPTIONS_HANDLER.search(output, pos)
         if not match:
             break
-        event, options_param, props = match.groups()
+        event, props = match.group(1), match.group(3)
         pos = match.end()
-
-        mode = _prop_var(props, "onSetStreamMode")
-        tools = _prop_var(props, "onStreamingToolUses")
-        setter = _prop_var(props, "onStreamingThinking")
-        if not (mode and tools and setter):
+        if _prop_var(props, "onSetStreamMode", shorthand=True) is None:
             continue
 
         end = output.find("function ", match.end())
         if end == -1:
             continue
-        segment = output[match.start() : end]
-        if not _handler_is_stream_reducer(segment):
+        original = output[match.start() : end]
+        if not _handler_is_stream_reducer(original):
             continue
+        step.candidates += 1
 
-        delta_body = _delta(event, setter, helper) + ";"
-        pairs = _reducer_pairs(
-            event,
-            setter,
-            mode,
-            tools,
-            helper,
-            optional=False,
-            options_param=options_param,
-        )
-        pairs.append(
-            (
-                'case"thinking_delta":return;',
-                f'case"thinking_delta":{{{delta_body}return;}}',
+        segment = original
+        setter = _prop_var(props, "onStreamingThinking", shorthand=True)
+        if setter is None:
+            # Threaded at the *front* of the pattern, which is valid whatever
+            # the pattern ends with -- a rest element or trailing comma there
+            # would make an append a SyntaxError the write verifier cannot see.
+            setter = "__cc_onStreamingThinking"
+            props_start = match.start(3) - match.start()
+            segment = splice(
+                segment, props_start, props_start, f"onStreamingThinking:{setter},"
             )
-        )
 
-        updated = _apply_pairs(segment, pairs, step)
-        updated = _apply_progress_variants(updated, event, delta_body, step)
-        if updated != segment:
-            _record_core_updates(updated, outcome)
+        updated = _rewrite_reducer_segment(segment, event, setter, helper, outcome)
+        _record_core_updates(updated, outcome)
+        if updated != original:
+            step.applied += 1
             output = splice(output, match.start(), end, updated)
             pos = match.start() + len(updated)
-    return output
-
-
-def _step_reducer_inner(content: str, found: Discovery, outcome: Outcome) -> str:
-    """2.1.183+ shape: inner handler that dropped onStreamingThinking."""
-    step = outcome.step("reducer-inner", expect=REDUCER)
-    helper = found.create_message_helper
-    if helper is None:
-        step.note("no virtual-message helper discovered; skipped")
-        return content
-
-    setter = "__cc_onStreamingThinking"
-    output, pos = content, 0
-    while True:
-        match = _MISSING_HANDLER.search(output, pos)
-        if not match:
-            break
-        event, options_param, props = match.groups()
-        pos = match.end()
-        if "onStreamingThinking:" in props:
-            continue
-
-        mode = _prop_var(props, "onSetStreamMode", shorthand=True)
-        tools = _prop_var(props, "onStreamingToolUses", shorthand=True)
-        display = _prop_var(props, "displayTransform", shorthand=True)
-        if not (mode and tools):
-            continue
-
-        end = output.find("function ", match.end())
-        if end == -1:
-            continue
-        segment = output[match.start() : end]
-        if not _handler_is_stream_reducer(segment):
-            continue
-
-        delta_body = _delta(event, setter, helper) + ";"
-        pairs = [
-            (
-                f"let{{{props}}}={options_param};",
-                f"let{{{props},onStreamingThinking:{setter}}}={options_param};",
-            )
-        ]
-        pairs += _reducer_pairs(
-            event, setter, mode, tools, helper, optional=True, display_transform=display
-        )
-        pairs.append(
-            (
-                'case"thinking_delta":return;',
-                f'case"thinking_delta":{{{delta_body}return;}}',
-            )
-        )
-
-        updated = _apply_pairs(segment, pairs, step)
-        updated = _apply_progress_variants(updated, event, delta_body, step)
-        if updated != segment:
-            _record_core_updates(updated, outcome)
-            output = splice(output, match.start(), end, updated)
-            pos = match.start() + len(updated)
+        elif all(marker in original for _, marker in _CORE_UPDATES):
+            step.applied += 1  # a previous run already did the work: achieved
     return output
 
 
@@ -900,42 +773,21 @@ def _step_reducer_legacy(content: str, found: Discovery, outcome: Outcome) -> st
     if len(params) < 7:
         return content
 
-    event, append_output, mode, tools, setter = (
-        params[0],
-        params[2],
-        params[3],
-        params[4],
-        params[6],
-    )
     helper = found.create_message_helper
-
-    pairs = _reducer_pairs(event, setter, mode, tools, helper or "", optional=False)
     if helper is None:
-        # Without the helper we cannot synthesise virtual messages; keep only
-        # the rewrites that do not need it.
-        pairs = [p for p in pairs if "__cc_streamingThinkingMessage" not in p[1]]
-    else:
-        delta_body = _delta(event, setter, helper) + ";"
-        pairs += [
-            (
-                f'case"thinking_delta":{append_output}({event}.event.delta.thinking);return;',
-                f'case"thinking_delta":{{{append_output}({event}.event.delta.thinking);'
-                f"{delta_body}return;}}",
-            ),
-            (
-                'case"thinking_delta":return;',
-                f'case"thinking_delta":{{{delta_body}return;}}',
-            ),
-        ]
-
-    updated = _apply_pairs(segment, pairs, step)
-    if helper is not None:
-        updated = _apply_progress_variants(
-            updated, event, _delta(event, setter, helper) + ";", step
-        )
-    if updated == segment:
+        # Without the helper the two marker steps can never land, so the
+        # fixpoint always drops the patch: a resets-only rewrite ships nothing.
+        step.note("no virtual-message helper discovered; skipped")
         return content
+    step.candidates += 1
+
+    updated = _rewrite_reducer_segment(segment, params[0], params[6], helper, outcome)
     _record_core_updates(updated, outcome)
+    if updated == segment:
+        if all(marker in segment for _, marker in _CORE_UPDATES):
+            step.applied += 1  # a previous run already did the work: achieved
+        return content
+    step.applied += 1
     return splice(content, start, end, updated)
 
 
@@ -959,8 +811,7 @@ def _live_thinking(content: str, _options: Options, outcome: Outcome) -> str:
     output = _step_transcript_signature(output, found, outcome)
     output = _step_inline_extras(output, found, outcome)
     output = _step_bottom_row(output, outcome)
-    output = _step_reducer_destructured(output, found, outcome)
-    output = _step_reducer_inner(output, found, outcome)
+    output = _step_reducer_options(output, found, outcome)
     output = _step_reducer_legacy(output, found, outcome)
 
     if found.streaming_var is None:

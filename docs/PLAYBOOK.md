@@ -46,6 +46,27 @@ constantly. These rules are what keep matchers alive:
   every backup before removing any part of it: under the older, tighter callee
   that same probe read 1 on all 8 builds, so a measurement taken before the
   callee was dissolved does not survive it.
+- **Rewrite at the dispatch point; never model the arm.** When an update is
+  valid at arm entry, splice it in where the code dispatches on the semantic
+  string — after a `case` label chain, or by wrapping the dispatch test
+  itself, `(test&&((update),!0))`, which preserves the test's value exactly
+  and so survives any surrounding composition (wrapping the *enclosing*
+  condition instead would run the update for the other side of a bare `||`) —
+  and say nothing about what the arm already does. Arm bodies are upstream's
+  busiest surface: 2.1.226 threaded one flag through five arms of the stream
+  reducer (`stmt1,stmt2;` became `if(stmt1,stmt2,d)call;`) and appended a
+  declarator to the head's `let`, and every literal that had modelled those
+  bodies — a cross-product of `mode(` vs `mode?.(`, braced vs unbraced arms,
+  four `displayTransform` spellings — died or was already dead weight. The
+  dispatch strings themselves (`"thinking_delta"`, `"message_stop"`) are the
+  API's vocabulary and do not churn. Same doctrine as the callee rule above:
+  the arm is *reached through*, the dispatch point is what the update is
+  *applied to*. Entry insertion does reorder against mid-arm work (the
+  message-stop reset now runs before upstream's `finalize()`), so it asks
+  that the update be independent of the arm's own channels — decide that,
+  don't assume it. Bound heads at grammar edges for the same reason — in a
+  minified bundle only `;` or `,` can follow `let{…}=t`, and which one is
+  noise (`(?=[;,])`, not `;`).
 - Match an optional brace **pair** conditionally (`(\{)?…(?(1)\})`), never as
   two independent `\{?` / `\}?`. A lone optional closing brace eats the
   *enclosing* block's `}` on the unbraced shape, and a rewrite that emits its
@@ -174,7 +195,7 @@ first is how a manifest starts lying. The manifest is held to the same rule:
 
 ## Sub-steps, and why `live-thinking` has them
 
-Most patches are one rewrite. `live-thinking` is ~11 named sub-steps, because
+Most patches are one rewrite. `live-thinking` is ~20 named sub-steps, because
 upstream has reshaped the stream reducer at least three times and a single hit
 count cannot tell "all landed" from "half silently drifted".
 
@@ -183,9 +204,16 @@ kinds:
 
 - **Independent fixes** (`memo-cache`, `linger`, `display-mode`, `bottom-row`,
   …) — each may or may not be present on a given build.
-- **Mutually-exclusive reducer variants** — `reducer-destructured` (2.1.138+),
-  `reducer-inner` (2.1.183+), `reducer-legacy` (pre-2.1.138). On any one build
-  exactly one should land. On 2.1.216 it is `reducer-inner`.
+- **Mutually-exclusive reducer variants** — `reducer-options` (2.1.138+, the
+  options-bag head; whether the bag still destructures `onStreamingThinking`
+  is the same shape with the prop present or absent, not a second variant) and
+  `reducer-legacy` (pre-2.1.138, positional parameters). On any one build
+  exactly one should land; its count is *recognition*, one per reducer. The
+  state updates themselves are per-dispatch-point steps (`request-start`,
+  `message-stop`, `text-clear`, `message-delta-clear`, `thinking-start`,
+  `thinking-append`), so a build that folds one arm away reads as that point's
+  absence by name, never as a bare count drop inside an aggregate. On
+  2.1.216–2.1.226 the variant is `reducer-options` with all six points.
 
 An *optional* sub-step that finds nothing is reported as absent, not broken —
 it is just a shape this build doesn't have. A sub-step that finds a shape but
@@ -201,11 +229,11 @@ The rest carry expectations, so their absence is checked rather than noted:
   but *proof*: they are credited only when the rewritten reducer body actually
   contains the state updates, which is what recognising a reducer does not by
   itself establish.
-- **The `reducer` group** — `reducer-destructured`, `reducer-inner`,
-  `reducer-legacy`. At least one must land; none landing is the signal that
-  upstream shipped a fourth reducer shape that needs a new variant. Two landing
-  is allowed on purpose — a transitional build carrying two reducers would have
-  both correctly patched, and that is no reason to cry wolf.
+- **The `reducer` group** — `reducer-options`, `reducer-legacy`. At least one
+  must land; none landing is the signal that upstream shipped a new reducer
+  head that needs a new variant. Two landing is allowed on purpose — a
+  transitional build carrying two reducers would have both correctly patched,
+  and that is no reason to cry wolf.
 - **Optional** — `memo-cache`, `memo-removal`, `linger`, `bottom-row`,
   `final-summary`. The first four match nothing on 2.1.216+ and are kept for
   older builds; `discover` is a notes-only channel that records how far back the
@@ -354,11 +382,13 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
 
 ### Live thinking — `streaming.py`
 
-- **`live-thinking`** — the ~11-step patch above. Discovery anchor is
+- **`live-thinking`** — the ~20-step patch above. Discovery anchor is
   `onStreamingThinking:` → `useState(null)` (the older `hidePastThinking`
   anchor is gone as of 2.1.216 — the fallback back-scan is load-bearing).
   Reducer anchors: `type==="stream_request_start"`, `case"thinking_delta"`,
-  `content_block_start`.
+  `content_block_start` — the reducer is the function carrying all three, its
+  head bounded at the declarator edge, and every state update is an insertion
+  at a dispatch point (the rule above); the arm bodies are never matched.
   The `display-mode` sub-step defaults the request's thinking display to
   `"summarized"`; without it the API only streams summary text when the
   `showThinkingSummaries` setting is on. Two shapes: the legacy inline env
