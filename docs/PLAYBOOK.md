@@ -116,10 +116,18 @@ can finish.
 Every patched bundle ends with one comment line recording what was applied; its
 shape lives in [INTERNALS.md](INTERNALS.md#the-manifest). What matters here is
 that it makes `status` a parse instead of a guess — several patches are value
-flips (`verbose:!0`) that leave no other fingerprint — and that `is_patched`
-also still recognises the legacy fingerprints (`__cc_` identifiers, the old
-`--version` marker), so binaries patched by pre-manifest versions are not
-mistaken for clean.
+flips (`verbose:!0`) that leave no other fingerprint — and that it is the
+**only** evidence `is_patched` accepts. Authorship is declared, never inferred:
+`is_patched` once also took side effects of our edits as proof — the `__cc_`
+identifier prefix, the old `--version` marker — until 2.1.227 shipped
+`__cc_name`/`__cc_line`/`__cc_set` shell variables of its own and every
+pristine install read as patched, hard-blocking `apply`. A prefix tracks
+upstream's naming fashion, never authorship (the same lesson as the `.enum(`
+callee above), and once upstream ships it, it fires on every later build, so no
+narrowing rescues an inferred fingerprint — `__cc_line` was already both our
+arrow-param and their shell variable. Binaries patched by pre-manifest versions
+therefore read as clean, which costs nothing now that Claude's daily
+auto-update has long since replaced that population.
 
 ## How resilience is detected
 

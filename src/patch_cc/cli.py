@@ -525,11 +525,6 @@ def cmd_status(args) -> int:
             if isinstance(codex.get("port"), int):
                 style, note = gateway_note(codex["port"])
                 console.print(f"  gateway:   [{style}]{note}[/{style}]")
-    elif st.patched:
-        console.print(
-            "  [dim]patched by an older patch-cc (no manifest); "
-            "re-apply to record one[/dim]"
-        )
     console.print(
         f"  bytecode:  "
         f"{'stripped' if st.bytecode_stripped else f'{st.bytecode_size / 1e6:.0f} MB present'}"

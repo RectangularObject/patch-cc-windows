@@ -3,8 +3,8 @@
 Two different questions, deliberately kept apart:
 
 * **status** -- is the *installed* binary patched right now? Answered by the
-  manifest comment every patched bundle ends with (plus legacy fingerprints),
-  and the bytecode-stripped invariant.
+  manifest comment every patched bundle ends with, and the bytecode-stripped
+  invariant.
 * **dryrun** -- would our patches still apply to *this* bundle? Answered by
   running every patch and reporting per-step hits, so a silently drifted
   matcher shows up as a concrete "reducer.message_stop missed" instead of a
@@ -21,19 +21,22 @@ from dataclasses import dataclass, field
 
 from .bun import Bundle
 from .codex.models import CodexModel
-from .patcher import is_patched, read_manifest
+from .patcher import read_manifest
 from .patches import ALL_PATCHES, Options, Outcome, Patch
 from .patches.agents import INHERIT, BuiltinAgent, discover_agents, discover_models
 
 
 @dataclass(slots=True)
 class Status:
-    patched: bool
     bytecode_stripped: bool
     bytecode_size: int
     #: Parsed manifest for binaries patched by this tool; ``None`` when the
-    #: binary is pristine or predates the manifest.
+    #: binary is pristine.
     manifest: dict | None
+
+    @property
+    def patched(self) -> bool:
+        return self.manifest is not None
 
     @property
     def patch_ids(self) -> list[str]:
@@ -48,12 +51,10 @@ class Status:
 
 
 def status(bundle: Bundle) -> Status:
-    source = bundle.source
     return Status(
-        patched=is_patched(source),
         bytecode_stripped=bundle.bytecode_size == 0,
         bytecode_size=bundle.bytecode_size,
-        manifest=read_manifest(source),
+        manifest=read_manifest(bundle.source),
     )
 
 

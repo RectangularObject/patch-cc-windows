@@ -32,11 +32,6 @@ from ..codex import DEFAULT_PORT
 if TYPE_CHECKING:
     from ..codex.models import CodexModel
 
-#: Prefix for every identifier we inject. These are the only reliable
-#: fingerprints of our work -- value flips like ``verbose:!0`` are
-#: indistinguishable from the 11 that upstream already ships.
-SENTINEL = "__cc_"
-
 # Groups, in display order: what renders, what runs (and how hard), how it is
 # dressed. Generic on purpose -- a group named after a feature (Thinking,
 # Subagents, Codex) fits exactly that feature, and the next patch that is

@@ -11,16 +11,13 @@ from pathlib import Path
 
 from . import __version__, locate
 from .bun import Bundle, container
-from .patches import ALL_PATCHES, DEFAULT_SUFFIX, SENTINEL, Options, Outcome, Patch
+from .patches import ALL_PATCHES, DEFAULT_SUFFIX, Options, Outcome, Patch
 
 #: Every patched bundle ends with one comment line recording exactly what was
 #: applied. Comments cannot collide with code, survive re-extraction, and make
 #: ``status`` a parse instead of a guess -- value-flip patches leave no other
 #: fingerprint.
 MANIFEST_PREFIX = "//patch-cc "
-
-#: Fingerprints of binaries patched by versions before the manifest existed.
-_LEGACY_MARKER = "(Claude Code)\\n" + DEFAULT_SUFFIX
 
 
 class AlreadyPatchedError(RuntimeError):
@@ -132,11 +129,16 @@ def read_manifest(source: str) -> dict | None:
 
 
 def is_patched(source: str) -> bool:
-    return (
-        ("\n" + MANIFEST_PREFIX) in source
-        or SENTINEL in source
-        or _LEGACY_MARKER in source
-    )
+    """Whether the bundle carries our manifest -- the one mark of our work.
+
+    Authorship is declared, never inferred. This used to also sniff side
+    effects of our edits (the ``__cc_`` identifier prefix, the old
+    ``--version`` marker), until 2.1.227 shipped ``__cc_``-prefixed shell
+    variables of its own and every pristine install read as patched. An
+    inferred fingerprint is a bet that upstream's vocabulary never overlaps
+    ours, and once upstream ships it, it fires on every build after, forever.
+    """
+    return read_manifest(source) is not None
 
 
 def selected_patches(ids: list[str]) -> list[Patch]:
