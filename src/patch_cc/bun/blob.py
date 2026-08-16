@@ -35,16 +35,9 @@ FIELDS_NEW = (
 )
 FIELDS_OLD = FIELDS_NEW[:4]
 
-#: Names Bun gives the Claude entrypoint module across platforms/versions.
-ENTRY_NAMES = ("claude", "claude.exe", "src/entrypoints/cli.js")
-
 
 class BlobError(BunError):
     """The .bun payload did not look like a Bun module graph."""
-
-
-def is_entry_module(name: str) -> bool:
-    return any(name == n or name.endswith("/" + n) for n in ENTRY_NAMES)
 
 
 @dataclass(slots=True)
@@ -52,10 +45,6 @@ class Module:
     index: int
     ranges: dict[str, tuple[int, int]]
     trailing: bytes  # encoding, loader, module_format, side
-
-    @property
-    def name_range(self) -> tuple[int, int]:
-        return self.ranges["name"]
 
 
 @dataclass(slots=True)
@@ -77,14 +66,25 @@ class Blob:
         off, length = rng
         return self.data[off : off + length]
 
-    def module_name(self, module: Module) -> str:
-        return self.payload(module.name_range).decode("utf8", "replace")
-
     def entry_module(self) -> Module:
-        for module in self.modules:
-            if is_entry_module(self.module_name(module)):
-                return module
-        raise BlobError("no Claude entrypoint module in the Bun blob")
+        """The module Bun runs -- as the container itself declares it.
+
+        ``entry_point_id`` indexes the module table, and Bun resolves its own
+        entrypoint with exactly this expression, so we agree with the runtime by
+        construction rather than by coincidence.
+
+        This used to scan a list of names the entrypoint had been seen under. A
+        name is a *correlate* of entrypoint-ness, never the thing itself: 2.1.229
+        renamed the module from ``/$bunfs/root/src/entrypoints/cli.js`` to
+        ``/$bunfs/root/cli`` and the tool stopped reading binaries at all -- with
+        the answer already parsed and sitting one field away, and already written
+        back unchanged by :func:`rebuild`. A list that only ever grows (this one
+        was at three names) is answering the wrong question. Prefer what the
+        artifact declares over anything you can correlate with it, the same rule
+        that makes agents and model aliases discovered rather than listed
+        (docs/PLAYBOOK.md).
+        """
+        return self.modules[self.entry_point_id]
 
     def entry_source(self) -> bytes:
         return self.payload(self.entry_module().ranges["contents"])
@@ -101,12 +101,28 @@ class Blob:
 
 
 def _detect_struct_size(modules_len: int) -> int:
-    new_ok = modules_len % 52 == 0
+    """The module-record stride: 52 bytes (Bun >=1.3.7) or 36 (older).
+
+    The table is a whole number of records, so the stride is the one of the two
+    that divides its length. When neither does, the layout is one this code does
+    not know, and picking a stride would scatter every pointer silently -- so it
+    raises, the same answer :func:`parse` gives a corrupt ``entry_point_id``,
+    rather than the old guess of 52 that left the entrypoint readable (its first
+    pairs are common to both layouts) while every other module pointed at
+    rubble. When *both* divide -- a length that is a multiple of both, which only
+    some record counts produce -- the current era's 52 is taken, and the record
+    loop's own bounds check is what would catch that guess if it were wrong: a
+    36-byte table read as 52 runs its last records off the end of the blob.
+    """
     old_ok = modules_len % 36 == 0
-    if new_ok and not old_ok:
-        return 52
-    if old_ok and not new_ok:
+    if old_ok and modules_len % 52 != 0:
         return 36
+    if modules_len % 52 != 0:
+        raise BlobError(
+            f"module table length {modules_len} is a whole number of neither "
+            "52- nor 36-byte records -- not a Bun module-table layout patch-cc "
+            "knows"
+        )
     return 52
 
 
@@ -137,11 +153,32 @@ def parse(data: bytes) -> Blob:
             field: struct.unpack_from("<II", data, base + i * 8)
             for i, field in enumerate(fields)
         }
+        # Every pair points into the blob; one that runs past it means either a
+        # corrupt table or a stride guessed wrong (a 36-byte table read as 52
+        # scatters its ranges). Either way this is not a graph to write back, so
+        # it raises here rather than surfacing as garbage payloads downstream --
+        # which is also what settles the both-strides-divide case for free.
+        for off, length in ranges.values():
+            if off + length > len(data):
+                raise BlobError(
+                    f"module {index} names a payload [{off}:{off + length}] past "
+                    f"the {len(data)}-byte blob; the record layout does not fit"
+                )
         trailing = data[base + len(fields) * 8 : base + len(fields) * 8 + 4]
         modules.append(Module(index=index, ranges=ranges, trailing=trailing))
 
     if not modules:
         raise BlobError("Bun blob contains no modules")
+    if entry_point_id >= len(modules):
+        # Checked here, where a bad value means the blob is corrupt, rather than
+        # left to fail as an IndexError deep in a patch run. Bun refuses the same
+        # condition when it loads the graph. There is deliberately no fallback to
+        # guessing by name: a container that cannot say which module it runs is
+        # not one we should be writing to.
+        raise BlobError(
+            f"entry point id {entry_point_id} is past the end of the "
+            f"{len(modules)}-module table"
+        )
 
     return Blob(
         data=data,
@@ -163,11 +200,12 @@ def rebuild(blob: Blob, source: bytes, *, drop_bytecode: bool = True) -> bytes:
 
     ``drop_bytecode`` removes the entrypoint's precompiled Bun bytecode. Editing
     the source invalidates that bytecode anyway -- Bun recompiles from source --
-    so keeping it costs ~154 MB for no benefit. See docs/INTERNALS.md.
+    so keeping it costs more than half the binary for no benefit. What that is in
+    megabytes is a fact about the build, and :meth:`Blob.bytecode_size` reads it;
+    docs/INTERNALS.md has the measurements.
     """
     entry = blob.entry_module()
     fields = blob.fields
-    has_bytecode = "bytecode" in fields
 
     # Every payload, in the order it appears in the source arena.
     placed: list[
@@ -229,8 +267,14 @@ def rebuild(blob: Blob, source: bytes, *, drop_bytecode: bool = True) -> bytes:
     struct.pack_into("<II", out, offsets_at + 20, argv_off, len(argv))
     struct.pack_into("<I", out, offsets_at + 28, blob.flags)
 
-    if has_bytecode and drop_bytecode:
-        assert new_ranges[(entry.index, "bytecode")] == (0, 0)
+    if drop_bytecode:
+        # The entry now carries no bytecode -- whether we dropped a real payload
+        # or it had none to begin with. Reading the outcome with a ``(0, 0)``
+        # default is what lets the had-none case flow through the same check
+        # instead of raising ``KeyError`` past both CLI handlers: a field the
+        # ``placed`` loop never saw a length for is absent from ``new_ranges``,
+        # and absent *is* stripped.
+        assert new_ranges.get((entry.index, "bytecode"), (0, 0)) == (0, 0)
     return bytes(out)
 
 

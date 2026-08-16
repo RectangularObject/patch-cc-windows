@@ -50,6 +50,17 @@ BACKEND_UA = (
 #: default that lived in one of them would be the other's remembered copy.
 DEFAULT_PORT = 8817
 
+#: Claude Code's reasoning-effort levels, lowest to highest -- the one spelling
+#: of the ladder. Three surfaces read it, at three layers, so it lives at the
+#: lowest they share: the gateway clamps a Codex request one rung at a time
+#: against it (:func:`patch_cc.codex.translate.clamp_effort`), the `max-effort`
+#: patch persists its top rung past the binary's whitelist
+#: (:mod:`patch_cc.patches.thinking`), and the dry run's synthetic model carries
+#: the whole ladder so the registry step bakes every capability. Spelled once,
+#: an upstream level moves one place rather than four -- the "must stay in step"
+#: the doctor comment used to ask of the reader.
+EFFORT_LADDER = ("low", "medium", "high", "xhigh", "max")
+
 
 def is_valid_port(port: object) -> TypeGuard[int]:
     """A usable TCP port. One home for the rule; each surface owns its wording.

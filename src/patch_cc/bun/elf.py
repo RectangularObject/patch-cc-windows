@@ -146,7 +146,24 @@ def _check_growth_is_safe(elf: Elf, bun: Section, shifted: list[Section]) -> Non
         names = ", ".join(s.name or f"<{s.index}>" for s in overlapping)
         raise ElfError(f".bun overlaps later section payloads: {names}")
 
+    # Allocated sections that follow `.bun` -- by file offset (they are in
+    # `shifted` and would be moved) or, for `SHT_NOBITS`, by virtual address.
+    # A `.bss`-shaped section carries no file bytes, so it never enters
+    # `shifted` and slipped past this check entirely -- yet it lives in the tail
+    # of the containing `PT_LOAD`'s `memsz`, which a shrink resizes, so a smaller
+    # `.bun` could truncate its virtual range. Same promise for both: we do not
+    # move an allocated section, and INTERNALS says so.
+    virt_end = bun.addr + bun.size
     alloc = [s for s in shifted if s.is_alloc]
+    alloc += [
+        s
+        for s in elf.sections
+        if s.index != bun.index
+        and s.is_alloc
+        and s.type == SHT_NOBITS
+        and s.size > 0
+        and s.addr >= virt_end
+    ]
     if alloc:
         names = ", ".join(s.name or f"<{s.index}>" for s in alloc)
         raise ElfError(f"cannot move allocated sections that follow .bun: {names}")

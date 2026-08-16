@@ -4,7 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "patch-cc"
-version = "0.2.4"
+# Read from `patch_cc.__version__`, which is the one home: the manifest every
+# patched bundle ends with records that value, so a second copy here could have
+# `status` name a release PyPI never shipped.
+dynamic = ["version"]
 description = "Interactive patcher for the Claude Code native binary"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -32,6 +35,16 @@ dependencies = [
     "rich>=13.7",
     "blessed>=1.47.0",
     "lief>=0.15; sys_platform == 'darwin'",
+    # How the bundle is located in and checked before writing
+    # (src/patch_cc/js.py). No Node or Bun runtime is involved: the grammar is a
+    # C library, shipped by `tree-sitter-javascript` as one abi3 wheel per
+    # platform. `tree-sitter` itself is not abi3 -- it builds a wheel per
+    # CPython version -- so an interpreter it has not published for compiles the
+    # sdist instead, which needs a C toolchain. Every version `requires-python`
+    # admits is covered today; a new CPython is what changes that, not a release
+    # of ours.
+    "tree-sitter>=0.25",
+    "tree-sitter-javascript>=0.23",
 ]
 
 [project.scripts]
@@ -55,6 +68,9 @@ python_version = "3.11"
 [[tool.mypy.overrides]]
 module = "lief.*"
 ignore_missing_imports = true
+
+[tool.hatch.version]
+path = "src/patch_cc/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/patch_cc"]

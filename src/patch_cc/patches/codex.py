@@ -6,15 +6,13 @@ Two things happen here, and only when at least one model has been chosen:
   subagent ``model`` enum, the known-model validator, the ``/model`` picker, the
   model resolver, the context-window table, and the binary's own **model
   registry** (which names the model in the status line and banners, declares
-  its effort capabilities, and makes it advisor-eligible). This is the same
-  surface clodex's binary patcher touches, re-anchored on 2.1.217's real shapes
-  (its own context-window anchor had already drifted off this build). Alongside each
-  id, a short **family shortcut** (``sol`` -> the newest chosen
-  ``gpt-<ver>-sol``) is registered in the validator, *both* resolvers, and the
-  picker, mirroring the binary's own ``opus`` -> ``claude-opus-4-8``: it resolves
-  to the id before a request is built, so routing needs no separate knowledge of
-  it (see :func:`patch_cc.codex.models.family_aliases`). The binary keeps two
-  resolvers -- a general one every request uses and an override one for managed
+  its effort capabilities, and makes it advisor-eligible). Alongside each id, a
+  short **family shortcut** (``sol`` -> the newest chosen ``gpt-<ver>-sol``) is
+  registered in the validator, *both* resolvers, and the picker, mirroring the
+  binary's own ``opus`` -> ``claude-opus-4-8``: it resolves to the id before a
+  request is built, so routing needs no separate knowledge of it (see
+  :func:`patch_cc.codex.models.family_aliases`). The binary keeps two resolvers
+  -- a general one every request uses and an override one for managed
   ``availableModels`` -- and a shortcut needs an arm in both; it is gated on the
   general one, so a drift there costs the shortcuts, never the bridge.
 
@@ -45,212 +43,365 @@ a 200k default under the model's raw id.
 from __future__ import annotations
 
 import json
-import re
 
-from ..codex.models import family_aliases, family_of
-from .agents import MODEL_ENUM
-from .base import (
-    GROUP_MODELS,
-    IDENT,
-    Options,
-    Outcome,
-    Patch,
-    compile_js,
-    js_string,
-    splice,
-)
+from .. import js
+from ..codex import DEFAULT_PORT, is_valid_port
+from ..codex.models import CodexModel, family_aliases, family_of
+from ..js import Edit, Source
+from .agents import model_enums
+from .base import GROUP_MODELS, Options, Outcome, Patch, Setting, js_string
 
-# A JS double-quoted string literal (handles escapes), for scanning array bodies.
-_STR = r'"(?:[^"\\]|\\.)*"'
+# --- anchors: authored names and the grammar around them (docs/PLAYBOOK.md) ---
 
-# --- anchors, each locked against the installed bundle (see docs/PLAYBOOK.md) ---
+#: The known-model master list. Found by membership -- the built-in names it
+#: holds -- never by their order. The regex this replaced spelled
+#: ``["sonnet","opus","haiku","fable",...,"opusplan"]`` and was one upstream
+#: reshuffle from death for it; the array on 2.1.232 already interleaves
+#: ``"best"`` and three ``[1m]`` variants between those two ends.
+_BUILT_IN_MODELS = ("sonnet", "opus", "haiku", "opusplan")
 
-# The known-model master list: ["sonnet",...,"opusplan",...]. Anchored on the
-# built-in prefix and "opusplan" so new built-ins in the middle don't shift it.
-_VALIDATOR = compile_js(
-    r'\["sonnet","opus","haiku","fable"(?:,"[^"]+")*,"opusplan"(?:,"[^"]+")*\]'
-)
-# The binary has TWO model resolvers; a shortcut needs an arm in both.
-# `_RESOLVER` (minified `J9n`) is the override/availability resolver, reached
-# only when managed `availableModels` are active -- its `case"best"` is a block.
-# New cases go right after it.
-_RESOLVER = compile_js(r'case"best":\{[^{}]*\}')
-# `_GENERAL_RESOLVER` (minified `Ei`) is the resolver *every ordinary request*
-# uses -- the one that turns `opus` into `claude-opus-4-8`. Unlike `J9n` it passes
-# an unknown-but-valid name straight through (`return e`), so a family shortcut
-# resolves only if it gets an explicit arm here. Shape-anchored: `Ei`'s `case"best"`
-# ends `return X();default:}` (vs `J9n`'s `case"best":{...}`), and the minified `X`
-# is matched, never baked in. Group 1 is the arm; new cases splice at its end.
-_GENERAL_RESOLVER = compile_js(r'(case"best":return [A-Za-z_$][\w$]*\(\);)default:\}')
-# The exact shape of an arm we generate, for a *bounded* "already added?" check:
-# matched contiguously from the insertion point, it spans only our own prior arms
-# and stops at the first foreign token -- so it can never run into an unrelated
-# later switch the way a `find("default:")` scan could on a default-less build.
-_RESOLVER_ARMS = compile_js(rf"(?:case{_STR}:return {_STR};)*")
-# The /model picker choke-point: `?[n,r]:[r];for(let i of o)push(e,i,t);`, where
-# `e` (group 6) is the options array every model is pushed onto.
-_PICKER = compile_js(
-    rf"\?\[({IDENT}),({IDENT})\]:\[\2\];for\(let ({IDENT}) of ({IDENT})\)"
-    rf"({IDENT})\(({IDENT}),\3,({IDENT})\);"
-)
-# The Anthropic SDK's buildRequest: options var (group 3) and the built URL
-# (group 8) are both in scope, and `r.body.model` is still the parsed object
-# here (buildBody runs later). The middle is brace-free, matched as one span.
-_REDIRECT = compile_js(
-    rf"buildRequest\(({IDENT}),\{{retryCount:({IDENT})=0\}}=\{{\}}\)\{{"
-    rf"let ({IDENT})=\{{\.\.\.\1\}},"
-    rf"\{{method:({IDENT}),path:({IDENT}),query:({IDENT}),defaultBaseURL:({IDENT})\}}=\3;"
-    rf"[^{{}}]*?let ({IDENT})=this\.buildURL\(\5,\6,\7\);"
-)
-# The context-window resolver: a brace-free `(e,t)` body that reads the max-tokens
-# env override. `e` (group 2) is the model string; group 4 is the body.
-_CONTEXT = compile_js(
-    rf"function ({IDENT})\(({IDENT}),({IDENT})\)\{{"
-    rf"([^{{}}]*CLAUDE_CODE_MAX_CONTEXT_TOKENS[^{{}}]*)\}}"
-)
-# The embedded model registry -- the binary's own single table of what a model
-# is called, what it can do, and whether it may advise. Its `models:[...]`
-# array closes immediately before the `aliases` table, whose first entry
-# defaults to a Claude id; that boundary occurs once in the bundle and cannot
-# belong to anything else. Group 1 opens at the `]` new entries splice before.
-_REGISTRY = compile_js(r'\}(\],aliases:\{[a-z][\w]*:\{default:"claude-)')
+_BEST = '"best"'
+_ALIASES = "aliases"
+_MODELS = "models"
+_REGISTRY_FIELDS = ("id", "family", "display_name")
+_BUILD_REQUEST = "buildRequest"
+_BUILD_URL = "buildURL"
+_DEFAULT_BASE_URL = "defaultBaseURL"
+_MAX_CONTEXT = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 
-# The JS regex literal that strips a URL's scheme+host, leaving path+query. A raw
-# string keeps the backslashes as the JS engine needs them.
+#: The JS regex literal that strips a URL's scheme+host, leaving path+query. A
+#: raw string keeps the backslashes as the JS engine needs them.
 _ORIGIN = r"/^https?:\/\/[^\/]+/"
 
 
-def _extend_array_body(body: str, names: list[str]) -> tuple[str, bool]:
-    """Append names not already present in a comma-joined quoted-string body."""
-    present = set(re.findall(_STR, body))
-    add = [n for n in names if js_string(n) not in present]
-    if not add:
-        return body, False
-    return body + "," + ",".join(js_string(n) for n in add), True
+def _append_strings(array: js.Node, names: list[str]) -> tuple[Edit, ...]:
+    """Add the names an array does not already carry, after its last element."""
+    present = set(js.strings(array))
+    add = [name for name in names if name not in present]
+    elements = js.elements(array)
+    if not add or not elements:
+        return ()
+    joined = ",".join(js_string(name) for name in add)
+    return (Edit.after(elements[-1], f",{joined}"),)
 
 
-def _register_enum(content: str, names: list[str], step: Outcome) -> str:
-    """Extend the Task tool's ``model`` enum, the anchor `subagent-models` reads."""
-    match = MODEL_ENUM.search(content)
-    if not match:
-        return content
-    step.candidates += 1
-    body, changed = _extend_array_body(match.group(1), names)
-    if changed:
-        content = splice(content, match.start(1), match.end(1), body)
-        step.applied += 1
-    return content
+# ------------------------------------------------------------------- accept
 
 
-def _register_validator(content: str, names: list[str], step: Outcome) -> str:
-    match = _VALIDATOR.search(content)
-    if not match:
-        return content
-    step.candidates += 1
-    body, changed = _extend_array_body(match.group(0)[1:-1], names)
-    if changed:
-        content = splice(content, match.start(), match.end(), "[" + body + "]")
-        step.applied += 1
-    return content
+def _register(
+    source: Source, arrays: list[js.Node], names: list[str], step: Outcome
+) -> Source:
+    """Add these names to every array of the kind, and say so once per array.
+
+    Registration is a fact about a *set* -- these names belong in every list of
+    the kind this bundle keeps -- so it neither has to know which list upstream
+    meant nor can be starved by a second one. A decoy carrying the four built-in
+    model names absorbed the whole registration when this took the first match:
+    real list untouched, ids nowhere, eight of eight steps green.
+
+    A name already there counts as landed, for the reason `max-effort` and
+    `subagent-models` say: the step is judged on what it achieved, and an
+    upstream that ships the name itself has achieved it.
+    """
+    edits: list[Edit] = []
+    for array in arrays:
+        step.candidates += 1
+        added = _append_strings(array, names)
+        step.applied += bool(added) or set(names) <= set(js.strings(array))
+        edits += added
+    return source.apply(edits)
 
 
-def _register_resolver(content: str, resolution: dict[str, str], step: Outcome) -> str:
-    """Add arms to the override resolver (`J9n`) -- the managed-settings path.
+def _validators(source: Source) -> list[js.Node]:
+    """Every known-model array -- the list that gates *resolution*, not just use."""
+    found = []
+    for node in source.find(f'"{_BUILT_IN_MODELS[-1]}"'):
+        array = js.up(node, "array")
+        if array is not None and set(_BUILT_IN_MODELS) <= set(js.strings(array)):
+            found.append(array)
+    return found
+
+
+def claimed_model_names(source: Source) -> set[str]:
+    """Every name the bundle's own model machinery already answers to.
+
+    Registering a chosen Codex id that collides with one of these is what bricks
+    the binary or hijacks a real model, so it is what the id must be refused
+    against -- *derived* from the bundle in hand, never a hardcoded snapshot that
+    upstream can outgrow (`codex.models._RESERVED`, docs/PLAYBOOK.md):
+
+    * a duplicate ``provider_ids`` value makes the registry's own ``safeParse``
+      throw ``provider id collision across distinct entries`` at first use, so
+      every command dies -- and 13 of these on 2.1.233 (``us.anthropic.claude-
+      opus-5`` and kin) are valid slugs that the ``claude-`` prefix guard never
+      catches;
+    * a name a validator or resolver already owns (``opus``) registers as a
+      no-op the step counts as landed, then bakes ``["opus"].includes(...)`` into
+      the redirect and diverts that model's own requests to the gateway.
+
+    Both live in tables this module already reads (`_validators`, `model_enums`,
+    `_model_table`), so the guard is the same fact the registration uses, read
+    once more to refuse rather than to write.
+    """
+    names: set[str] = set()
+    for array in (*_validators(source), *model_enums(source)):
+        names |= set(js.strings(array))
+    table = _model_table(source)
+    for entry in js.elements(table) if table is not None else []:
+        fields = js.props(entry)
+        identity = fields.get("id")
+        if identity is not None and identity.type == "string":
+            names.add(js.text(identity)[1:-1])
+        providers = fields.get("provider_ids")
+        if providers is not None and providers.type == "object":
+            names |= {
+                js.text(value)[1:-1]
+                for value in js.props(providers).values()
+                if value.type == "string"
+            }
+    return names
+
+
+# ----------------------------------------------------------------- resolvers
+#
+# The binary has TWO model resolvers and a shortcut needs an arm in both. They
+# are told apart by what they *answer*, never by their minified names or by a
+# statement form: the override resolver (reached only when managed
+# `availableModels` are active) rejects an unknown name with `null`; the general
+# resolver -- the one every ordinary request uses, which turns `opus` into
+# `claude-opus-4-8` -- has no answer of its own for one and falls through to
+# passing it straight back.
+
+
+def _best_arms(source: Source) -> list[js.Node]:
+    """Every arm labelled ``"best"``, which is where new model arms are spliced.
+
+    The label is the name and the arm is the node; ``case"best":`` written out
+    is the two of them with the minifier's spacing in between.
+    """
+    found = []
+    for node in source.find(_BEST):
+        arm = js.up(node, "switch_case")
+        if arm is not None and arm.child_by_field_name("value") == node:
+            found.append(arm)
+    return found
+
+
+def _rejects_unknown(arm: js.Node) -> bool:
+    """Does this arm's ``switch`` answer ``null`` when nothing matched?
+
+    The two resolvers differ in what an unknown model means to them, which is a
+    fact about what each is *for*: the override resolver has a closed list and
+    rejects, the general one passes the name through for something downstream to
+    judge. Whether either spells an arm as ``case"best":return f()`` or
+    ``case"best":{return f()}`` is the minifier's business -- and telling them
+    apart by that was a silent failure waiting: brace the general resolver (a
+    `let` in the arm is enough) and every family shortcut disappeared with the
+    patch still green.
+    """
+    default = next(
+        (
+            sibling
+            for sibling in js.children(arm.parent)
+            if sibling.type == "switch_default"
+        ),
+        None,
+    )
+    if default is None:
+        return False
+    answer = js.first(default, js.of_type("return_statement"))
+    return answer is not None and [c.type for c in answer.named_children] == ["null"]
+
+
+def _existing_arms(arm: js.Node) -> set[str]:
+    """The case labels already spliced in immediately after ``arm``.
+
+    Bounded to the arms at *this* insertion point, never the whole bundle: a
+    short word like ``auto`` legitimately occurs as ``case"auto":return`` in
+    unrelated code, and a bundle-wide check would skip its arm here while the
+    full-id arms still marked the step applied -- shipping a shortcut that
+    resolves nowhere.
+    """
+    labels = set()
+    node = arm.next_named_sibling
+    while node is not None and node.type == "switch_case":
+        label = node.child_by_field_name("value")
+        if label is not None:
+            labels.add(js.text(label)[1:-1])
+        node = node.next_named_sibling
+    return labels
+
+
+def _arms(resolution: dict[str, str]) -> str:
+    return "".join(
+        f"case{js_string(name)}:return {js_string(target)};"
+        for name, target in resolution.items()
+    )
+
+
+def _override_resolvers(source: Source) -> list[js.Node]:
+    """Every resolver reached only when managed ``availableModels`` are active."""
+    return [arm for arm in _best_arms(source) if _rejects_unknown(arm)]
+
+
+def _general_resolvers(source: Source) -> list[js.Node]:
+    """Every resolver an ordinary request goes through."""
+    return [arm for arm in _best_arms(source) if not _rejects_unknown(arm)]
+
+
+def _register_arms(
+    source: Source, arms: list[js.Node], resolution: dict[str, str], step: Outcome
+) -> Source:
+    """Splice resolution arms in after each of these, skipping any already there.
 
     An id resolves to *itself* (its identity everywhere else); a family shortcut
-    resolves to the newest id in its family. This resolver only fires when managed
-    ``availableModels`` are active; the ordinary path goes through
-    :func:`_register_general_resolver`, so both carry the same arms.
+    resolves to the newest id in its family -- ``case"sol":return
+    "gpt-5.6-sol";``, right here, before the request is built, exactly as
+    ``opus`` resolves. Only shortcuts need the general resolver: an id already
+    passes through it.
+
+    Every resolver of the kind, for the reason :func:`_register` gives: a second
+    ``switch`` answering `null` for an unknown model is another resolver a
+    shortcut has to survive, and picking the first one to appear left the real
+    one without arms -- two decoy functions were enough, at 8/8 and green.
+
+    Skipping the arms already present is also the idempotency: a second pass
+    adds nothing rather than a duplicate arm the switch would never reach.
     """
-    match = _RESOLVER.search(content)
-    if not match:
-        return content
-    step.candidates += 1
-    # Scope the "already present?" check to the arms already generated at THIS
-    # insertion point, never the whole 21MB bundle: a short word like `auto`
-    # legitimately occurs as `case"auto":return` in unrelated code, and a global
-    # check would skip its arm here while the full-id arms still marked the step
-    # applied -- shipping a short alias that never resolves on the managed path. The
-    # contiguous-arm match is bounded to our own output (empty on a pristine arm, so
-    # every arm is added), so it can't run into a later switch on a default-less build.
-    arms = _RESOLVER_ARMS.match(content, match.end())
-    region = arms.group() if arms else ""
-    add = {
-        name: target
-        for name, target in resolution.items()
-        if f"case{js_string(name)}:return" not in region
-    }
-    if add:
-        cases = "".join(
-            f"case{js_string(name)}:return {js_string(target)};"
-            for name, target in add.items()
-        )
-        content = splice(content, match.end(), match.end(), cases)
+    edits = []
+    for arm in arms:
+        step.candidates += 1
+        add = {
+            name: target
+            for name, target in resolution.items()
+            if name not in _existing_arms(arm)
+        }
         step.applied += 1
-    return content
+        if add:
+            edits.append(Edit.after(arm, _arms(add)))
+    return source.apply(edits)
 
 
-def _register_general_resolver(
-    content: str, shorts: dict[str, str], step: Outcome
-) -> str:
-    """Add shortcut arms to the general resolver (`Ei`) -- the ordinary path.
+# -------------------------------------------------------------------- route
 
-    ``case"sol":return "gpt-5.6-sol";`` -- the short handle resolves to the newest
-    id in its family right here, before the request is built, exactly as ``opus``
-    does. Only shortcuts need this: `Ei` already passes an id through unchanged.
+
+def _builds_url(node: js.Node) -> bool:
+    """Is this the call that assembles the request URL?
+
+    By the method it calls, not by the receiver in front of it: `this` is where
+    the helper lives today and says nothing about what the call does.
     """
-    match = _GENERAL_RESOLVER.search(content)
-    if not match:
-        return content
-    step.candidates += 1
-    # The anchor requires `default:}` immediately after `case"best"`, so it only
-    # matches the *pristine* arm; once arms are spliced in, re-application no longer
-    # finds it -- that adjacency is the idempotency guard. A global "already
-    # present?" check would instead false-match the identical arms the override
-    # resolver was just given, and wrongly skip this one.
-    cases = "".join(
-        f"case{js_string(name)}:return {js_string(target)};"
-        for name, target in shorts.items()
+    return node.type == "call_expression" and js.reads(
+        node.child_by_field_name("function"), _BUILD_URL
     )
-    content = splice(content, match.end(1), match.end(1), cases)
-    step.applied += 1
-    return content
 
 
-def _redirect(content: str, options: Options, step: Outcome) -> str:
-    match = _REDIRECT.search(content)
-    if not match:
-        return content
+def _build_request(source: Source) -> js.Node | None:
+    """The SDK method that assembles a request -- the one that builds the URL.
+
+    Several methods carry the name -- two to four across the corpus -- and all
+    but one only delegate to ``super``. The one meant here is identified by
+    what it does, which is why the count is free to move.
+    """
+    return js.only(
+        [
+            method
+            for node in source.find(_BUILD_REQUEST)
+            for method in [js.up(node, "method_definition")]
+            if method is not None
+            and method.child_by_field_name("name") == node
+            and js.first(method, _builds_url) is not None
+        ],
+        "request builders",
+    )
+
+
+def _redirect(source: Source, options: Options, step: Outcome) -> Source:
+    """Swap the request origin to the gateway, for the chosen ids only."""
+    method = _build_request(source)
+    if method is None:
+        return source
+    body = js.body(method)
+    built = js.only(
+        js.every(
+            body,
+            lambda n: (
+                n.type == "variable_declarator"
+                and _builds_url(n.child_by_field_name("value") or n)
+            ),
+            scoped=True,
+        ),
+        "URLs built in this request builder",
+    )
+    if built is None:
+        return source
+    # The options copy the request is assembled from, named by the destructuring
+    # that takes the request's parts out of it -- and taken from a scope the
+    # injected test can see. Both names are spliced into a statement of the
+    # method's own, so a nested helper that happens to destructure the same
+    # property binds a name that does not exist there: the block read
+    # `if(z.body&&...)` off a helper's parameter, at `redirect` 1/1 and green,
+    # and every request the method built threw.
+    statement = js.declared(built)
+    if statement is None:
+        return source
+    copies = js.every(
+        body,
+        lambda n: (
+            n.type == "variable_declarator"
+            and (name := n.child_by_field_name("name")) is not None
+            and name.type == "object_pattern"
+            and _DEFAULT_BASE_URL in js.props(name)
+            # Destructured from a *name* the method already holds, because that
+            # name is what the injected test reads three times; an expression
+            # there would be evaluated three times over, per request.
+            and (taken_from := n.child_by_field_name("value")) is not None
+            and taken_from.type == "identifier"
+        ),
+    )
+    taken = js.only(
+        [copy for copy in copies if js.visible(copy, statement)],
+        "request option copies",
+    )
+    if taken is None:
+        return source
+    url = js.text(built.child_by_field_name("name"))
+    opts = js.text(taken.child_by_field_name("value"))
+
     step.candidates += 1
-    opts, url = match.group(3), match.group(8)
     routed = "[" + ",".join(js_string(m.id) for m in options.codex_models) + "]"
     # The URL is all this changes, and a diverted request still carries the
     # Anthropic credential: measured on the wire, `Authorization: Bearer
-    # sk-ant-oat01-...` and the whole prompt arrive at whatever holds the gateway
-    # port. Our gateway never reads it; a process that squatted the port would.
+    # sk-ant-oat01-...` and the whole prompt arrive at whatever holds the
+    # gateway port. Our gateway never reads it; a process that squatted the port
+    # would.
     #
     # Stripping it from here does not work, and the obvious attempt is worth
     # recording so it is not retried blind. `options.headers` is the last source
     # `buildHeaders` merges and its merge treats `null` as delete, so setting
-    # either a null or an inert value there should win. Neither reaches the wire:
-    # with the block proven to run (a marker spliced into the path arrived), a
-    # probe header set on the options object *and* on the local copy was absent
-    # from the request both times. Something between `buildRequest` and `fetch`
-    # discards `options.headers` on this build. A real fix therefore needs its
-    # own anchor further down -- `prepareRequest`, which receives the final
-    # `Headers` object and the URL -- which is a new required step and new
+    # either a null or an inert value there should win. Neither reaches the
+    # wire: with the block proven to run (a marker spliced into the path
+    # arrived), a probe header set on the options object *and* on the local copy
+    # was absent from the request both times. Something between `buildRequest`
+    # and `fetch` discards `options.headers` on this build. A real fix therefore
+    # needs its own anchor further down -- `prepareRequest`, which receives the
+    # final `Headers` object and the URL -- which is a new required step and new
     # matcher surface, not a line added here.
-    inject = (
-        f'if({opts}.body&&typeof {opts}.body=="object"&&'
-        f"{routed}.includes({opts}.body.model))"
-        f"{url}={url}.replace("
-        + _ORIGIN
-        + f',"http://127.0.0.1:{options.codex_port}");'
+    step.applied += 1
+    return source.apply(
+        [
+            Edit.after(
+                statement,
+                f'if({opts}.body&&typeof {opts}.body=="object"&&'
+                f"{routed}.includes({opts}.body.model))"
+                f"{url}={url}.replace({_ORIGIN},"
+                f'"http://127.0.0.1:{options.codex_port}");',
+            )
+        ]
     )
-    if inject not in content:
-        content = splice(content, match.end(), match.end(), inject)
-        step.applied += 1
-    return content
+
+
+# ------------------------------------------------------------------- display
 
 
 def _display_name(handle: str) -> str:
@@ -277,14 +428,48 @@ def _describe(model) -> str:
     return f"{_display_name(model.label)}{window} from codex"
 
 
+def _row_assembler(source: Source) -> js.Node | None:
+    """The ``/model`` picker's choke point: the call every row list ends at.
+
+    Every branch of the picker builds its own list and hands it here to have the
+    default rows appended, so this is the one place all of them pass through.
+    It is identified by what it does -- take a list, add to it in a loop, and
+    give it back -- and by the model names it decides between, which are the
+    API's vocabulary rather than anything minified.
+
+    One function, or none: rows spliced into a list some other function keeps
+    is not a weaker version of this rewrite, it is a different list growing
+    entries nobody asked it for.
+    """
+    found: list[js.Node] = []
+    for node in source.find('"opus"'):
+        assembler = js.climb(node, lambda n: n.type in js.FUNCTIONS)
+        taken = js.positional(assembler) if assembler is not None else []
+        if assembler is None or not taken:
+            continue
+        block = js.body(assembler)
+        if block is None or js.first(block, js.of_type("for_in_statement")) is None:
+            continue
+        returned = js.first(block, js.returns(js.text(js.binding(taken[0]))))
+        if returned is not None and returned.start_byte not in {
+            node.start_byte for node in found
+        }:
+            found.append(returned)
+    return js.only(found, "row assemblers")
+
+
 def _register_picker(
-    content: str, models, shorts: dict[str, str], step: Outcome
-) -> str:
-    match = _PICKER.search(content)
-    if not match:
-        return content
+    source: Source, models, shorts: dict[str, str], step: Outcome
+) -> Source:
+    returned = _row_assembler(source)
+    if returned is None:
+        return source
     step.candidates += 1
-    array = match.group(6)
+    # The node the return answers with, not its text with the keyword sliced off
+    # and a semicolon this build may or may not emit trimmed back: `js.returns`
+    # already proved the shape, so reaching back through the spelling is a
+    # second and weaker claim about a node already in hand.
+    array = js.text(js.children(returned)[0])
     by_id = {m.id: m for m in models}
     covered = set(shorts.values())
     # (value you pick, the model it stands for), shortcuts first. A shortcut *is*
@@ -308,26 +493,59 @@ def _register_picker(
         f"description:{js_string(_describe(model))}}}"
         for value, model in picks
     )
-    # Every row is emitted with no build-time "already present?" filter, and dedup
-    # is left to the runtime `.some()` guard below. A per-value check would false-
-    # skip (a short value like `auto` occurs as `value:"auto"` in the theme picker,
-    # dropping its row while the id rows still mark the step applied); a whole-block
-    # check can't be a stable key either, since the block depends on `shorts`, which
-    # the drift gate zeroes on a second pass. Neither matters in practice: the
-    # patcher always runs from a pristine source (never its own output), and even a
-    # hypothetical double-append is dead bytes behind `.some()`, not a behaviour
-    # change.
-    inject = (
-        f"[{entries}].forEach(function(__cc_row){{"
-        f"if(!{array}.some(function(__cc_seen){{return __cc_seen.value===__cc_row.value}}))"
-        f"{array}.push(__cc_row)}});"
-    )
-    content = splice(content, match.end(), match.end(), inject)
+    # Dedup is left to the runtime `.some()` guard rather than a build-time
+    # check: a short value like `auto` occurs as `value:"auto"` in the theme
+    # picker, so a per-value check would false-skip its row while the id rows
+    # still marked the step applied. It cannot matter in practice either -- the
+    # patcher always runs from a pristine source, never its own output.
     step.applied += 1
-    return content
+    return source.apply(
+        [
+            Edit.before(
+                returned,
+                f"[{entries}].forEach(function(__cc_row){{"
+                f"if(!{array}.some(function(__cc_seen){{"
+                f"return __cc_seen.value===__cc_row.value}}))"
+                f"{array}.push(__cc_row)}});",
+            )
+        ]
+    )
 
 
-def _register_context(content: str, models, outcome: Outcome) -> str:
+def _window_resolver(source: Source) -> js.Node | None:
+    """The function that answers with a model's context window.
+
+    Identity is what it does with the env override, which is the question the
+    table answers too: it *reads* ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` and
+    *returns* what it read -- the same "the value admitted is the value
+    returned" proof `max-effort`'s whitelist and the picker's row assembler are
+    identified by. Two other functions read the same name and neither is this
+    one: the compaction override answers with it but takes no model to key on,
+    and the unknown-model warning reads it only to decide whether to complain.
+
+    The read must be a *member* read. Climbing from any occurrence of the name
+    took the first one in the bundle, which is a key in esbuild's export map --
+    so the climb landed on the CommonJS module wrapper, whose five parameters
+    satisfied every check, and the window table was spliced into byte 91 of the
+    bundle keyed on ``String(exports)``. It reported ``candidates=1 applied=1``
+    on every build in the corpus and never once answered a question.
+    """
+    found = []
+    for node in source.find(_MAX_CONTEXT):
+        read = js.up(node, "member_expression")
+        if read is None or read.child_by_field_name("property") != node:
+            continue
+        resolver = js.climb(read, lambda n: n.type in js.FUNCTIONS)
+        declared = js.up(read, "variable_declarator")
+        window = declared.child_by_field_name("name") if declared is not None else None
+        if resolver is None or window is None or not js.positional(resolver):
+            continue
+        if js.first(resolver, js.returns(js.text(window))) is not None:
+            found.append(resolver)
+    return js.only(found, "context-window resolvers")
+
+
+def _register_context(source: Source, models, outcome: Outcome) -> Source:
     """Bake the real context window for each chosen model that reports one.
 
     Takes the parent outcome, not a step, so the step exists only when there is a
@@ -338,29 +556,49 @@ def _register_context(content: str, models, outcome: Outcome) -> str:
     windows = {m.id: m.context for m in models if m.context > 0}
     if not windows:
         outcome.note("no chosen model reports a context window; 200k default stands")
-        return content
-    match = _CONTEXT.search(content)
-    if not match:
-        return content
+        return source
+
+    # There *is* a window to bake, so the step exists before the search for the
+    # place to bake it -- a drifted window resolver then reads as this step
+    # finding nothing, not as no step at all. Created *after* the search, a
+    # renamed CLAUDE_CODE_MAX_CONTEXT_TOKENS produced seven steps, no note and no
+    # absent-step line, the exact silence PLAYBOOK's "declare an expectation
+    # before the work" rule (and `_live_thinking`) exists to break.
     step = outcome.step("context")
+    resolver = _window_resolver(source)
+    body = js.body(resolver) if resolver is not None else None
+    if body is None or not body.named_children:
+        return source
+
     step.candidates += 1
-    model_var = match.group(2)
-    table = json.dumps(windows, separators=(",", ":"))
-    # At the top of the resolver, so it answers before the fallbacks below it --
-    # the 200k default this function ends on, and its own
+    model_var = js.text(js.binding(js.positional(resolver)[0]))
+    # `__proto__:null` in the literal, so the table is only the ids it holds. An
+    # ordinary object literal inherits `Object.prototype`, and the lookup below is
+    # keyed on a name from outside: `constructor` is already lowercase, so it
+    # would answer with a *function*, pass the `!==void 0` guard, and be returned
+    # as a context window. The guard is not the fix -- a table with nothing behind
+    # it is, and it dissolves the case rather than testing for it. Quoted is the
+    # spelling json emits and still sets the prototype (measured on
+    # JavaScriptCore, which is what Bun runs, and on V8).
+    table = json.dumps({"__proto__": None, **windows}, separators=(",", ":"))
+    # Before the resolver's first statement, so it answers ahead of everything
+    # below it -- the 200k default this function ends on, and its own
     # CLAUDE_CODE_MAX_CONTEXT_TOKENS read, which applies to exactly the non-Claude
     # models we are registering. It does not (and should not) outrank the caller's
     # own env override or long-context clamp, which are decided before this
     # function is reached. Only our ids are answered; an unknown key falls
     # through untouched.
-    inject = (
-        f'var __cc_window=({table})[String({model_var}||"").trim().toLowerCase()];'
-        f"if(__cc_window!==void 0)return __cc_window;"
+    step.applied += 1
+    return source.apply(
+        [
+            Edit.before(
+                body.named_children[0],
+                f"var __cc_window=({table})"
+                f'[String({model_var}||"").trim().toLowerCase()];'
+                f"if(__cc_window!==void 0)return __cc_window;",
+            )
+        ]
     )
-    if inject not in content:
-        content = splice(content, match.start(4), match.start(4), inject)
-        step.applied += 1
-    return content
 
 
 #: Advisor rank claimed for every registered Codex model: Opus 5's own rank in
@@ -371,6 +609,11 @@ def _register_context(content: str, models, outcome: Outcome) -> str:
 #: nothing above it. Per-model precision here would be a catalogue of ours:
 #: the plan reports no rank, so one honest number beats four invented ones.
 _ADVISOR_RANK = 4
+
+#: The two effort rungs the registry names with a capability of their own; the
+#: base ladder (low/medium/high) is the bare ``effort`` capability. A level
+#: upstream adds above ``max`` is one entry here, not a new branch.
+_EFFORT_CAPABILITIES = {"xhigh": "xhigh_effort", "max": "max_effort"}
 
 
 def _effort_capabilities(model) -> list[str]:
@@ -386,12 +629,14 @@ def _effort_capabilities(model) -> list[str]:
     """
     if not model.efforts:
         return []
-    capabilities = ["effort"]
-    if "xhigh" in model.efforts:
-        capabilities.append("xhigh_effort")
-    if "max" in model.efforts:
-        capabilities.append("max_effort")
-    return capabilities
+    return [
+        "effort",
+        *(
+            capability
+            for level, capability in _EFFORT_CAPABILITIES.items()
+            if level in model.efforts
+        ),
+    ]
 
 
 def _registry_entry(model) -> str:
@@ -430,7 +675,36 @@ def _registry_entry(model) -> str:
     return json.dumps(entry, separators=(",", ":"))
 
 
-def _register_registry(content: str, models, step: Outcome) -> str:
+def _model_table(source: Source) -> js.Node | None:
+    """The binary's own model table: the ``models`` array beside ``aliases``.
+
+    One embedded object holds everything Claude Code knows about a model it did
+    not hardcode a check for. It is found by the pair of properties that make it
+    that table, and confirmed by its entries carrying the fields every record
+    has -- so the two look-alikes in the bundle (a ``models`` built by a call,
+    and an empty one) are excluded by what they contain rather than by where
+    they sit.
+
+    One table, or none: a second one is a question about which of them the
+    status line reads, and adding models to the wrong one is how they would be
+    accepted everywhere and named nowhere.
+    """
+    found = []
+    for node in source.find(_ALIASES):
+        pair = js.named(node)
+        if pair is None:
+            continue
+        table = js.owner(pair)
+        array = js.props(table).get(_MODELS) if table is not None else None
+        if array is None or array.type != "array":
+            continue
+        first = next(iter(js.elements(array)), None)
+        if first is not None and js.carries(first, *_REGISTRY_FIELDS):
+            found.append(array)
+    return js.only(found, "model tables")
+
+
+def _register_registry(source: Source, models, step: Outcome) -> Source:
     """Add each chosen model to the binary's own model table.
 
     This is what makes the models first-class rather than merely accepted:
@@ -441,18 +715,25 @@ def _register_registry(content: str, models, step: Outcome) -> str:
     hand-built upstream; the window resolver ends on a flat 200k), which is why
     those two steps still exist alongside this one.
     """
-    match = _REGISTRY.search(content)
-    if not match:
-        return content
+    array = _model_table(source)
+    if array is None:
+        return source
     step.candidates += 1
-    inject = "," + ",".join(_registry_entry(model) for model in models)
-    if inject not in content:
-        content = splice(content, match.start(1), match.start(1), inject)
-        step.applied += 1
-    return content
+    entries = js.elements(array)
+    if not entries:
+        return source
+    step.applied += 1
+    return source.apply(
+        [
+            Edit.after(
+                entries[-1],
+                "," + ",".join(_registry_entry(model) for model in models),
+            )
+        ]
+    )
 
 
-def _codex_models(content: str, options: Options, outcome: Outcome) -> str:
+def _codex_models(source: Source, options: Options, outcome: Outcome) -> Source:
     """Register and route the chosen Codex models.
 
     A no-op with no models configured -- like ``subagent-models``, the patch is
@@ -460,7 +741,23 @@ def _codex_models(content: str, options: Options, outcome: Outcome) -> str:
     """
     if not options.codex_models:
         outcome.note("no codex models chosen; pick some in `patch-cc` or with --codex")
-        return content
+        return source
+
+    # Fail closed on a would-brick collision. An id the bundle already claims
+    # registers as a duplicate the registry's zod parse refuses at first use --
+    # bricking every command -- or as a resolver no-op that hijacks that model.
+    # The CLI refuses these up front (cli._codex_selection); this is the backstop
+    # that keeps CONDUCT's promise about the binary on the paths that do not pass
+    # through it, and it is derived from the bundle rather than remembered.
+    collisions = sorted(
+        m.id for m in options.codex_models if m.id in claimed_model_names(source)
+    )
+    if collisions:
+        outcome.note(
+            "refused: chosen id(s) collide with a model the bundle already claims "
+            f"and would brick the binary: {', '.join(collisions)}"
+        )
+        return source
 
     model_ids = [m.id for m in options.codex_models]
     # Family shortcuts (`sol` -> the newest `gpt-<ver>-sol`) resolve to an id
@@ -473,29 +770,91 @@ def _codex_models(content: str, options: Options, outcome: Outcome) -> str:
     # so absent it, no shortcut is registered anywhere and the ids (which need none
     # of this) carry on untouched.
     shorts = family_aliases(options.codex_models)
-    if shorts and _GENERAL_RESOLVER.search(content) is None:
+    if shorts and not _general_resolvers(source):
         outcome.note("general model resolver anchor drifted; shortcuts skipped")
         shorts = {}
 
-    content = _register_enum(content, model_ids, outcome.step("enum", expect=True))
-    content = _register_validator(
-        content, model_ids + list(shorts), outcome.step("validator", expect=True)
+    source = _register(
+        source, model_enums(source), model_ids, outcome.step("enum", expect=True)
     )
-    content = _register_resolver(
-        content,
+    source = _register(
+        source,
+        _validators(source),
+        model_ids + list(shorts),
+        outcome.step("validator", expect=True),
+    )
+    source = _register_arms(
+        source,
+        _override_resolvers(source),
         {i: i for i in model_ids} | shorts,
         outcome.step("resolver", expect=True),
     )
     if shorts:
-        content = _register_general_resolver(
-            content, shorts, outcome.step("general-resolver", expect=True)
+        source = _register_arms(
+            source,
+            _general_resolvers(source),
+            shorts,
+            outcome.step("general-resolver", expect=True),
         )
-    content = _redirect(content, options, outcome.step("redirect", expect=True))
-    content = _register_picker(
-        content, options.codex_models, shorts, outcome.step("picker")
+    source = _redirect(source, options, outcome.step("redirect", expect=True))
+    source = _register_picker(
+        source, options.codex_models, shorts, outcome.step("picker")
     )
-    content = _register_context(content, options.codex_models, outcome)
-    return _register_registry(content, options.codex_models, outcome.step("registry"))
+    source = _register_context(source, options.codex_models, outcome)
+    return _register_registry(source, options.codex_models, outcome.step("registry"))
+
+
+def _ids_from(value: object) -> list[CodexModel]:
+    """Codex models from a stored id list -- ids only, as both stores keep them.
+
+    Deduplicated at the boundary, because a *store* is untrusted input the way a
+    command line is not: the CLI already collapses a repeated ``--codex`` with
+    ``dict.fromkeys`` (cli._requested), but the cache and the manifest are files
+    a hand can edit, and one id listed twice bakes two identical registry
+    entries -- a duplicate ``provider_ids`` the registry's own ``safeParse``
+    rejects with ``provider id collision across distinct entries``, bricking
+    every command (the very outcome `claimed_model_names` guards the *bundle's*
+    names against, which cannot see a duplicate among the *chosen* ids). One
+    home for parsing a stored id list, so `--from-cache` and a seeded menu
+    cannot smuggle in the collision the front door refuses -- the same reason
+    `is_valid_port` refuses a hand-edited ``"port": true``.
+    """
+    items = value if isinstance(value, list) else []
+    ids = dict.fromkeys(i for i in items if isinstance(i, str) and i)
+    return [CodexModel(i) for i in ids]
+
+
+def _codex_from_manifest(options: Options, value: object) -> None:
+    codex = value if isinstance(value, dict) else {}
+    options.codex_models = _ids_from(codex.get("models"))
+    port = codex.get("port")
+    options.codex_port = port if is_valid_port(port) else DEFAULT_PORT
+
+
+def _codex_from_cache(options: Options, cache: dict[str, object]) -> None:
+    options.codex_models = _ids_from(cache.get("codex_models"))
+    port = cache.get("codex_port")
+    options.codex_port = port if is_valid_port(port) else DEFAULT_PORT
+
+
+#: Codex is the setting whose two stores differ in *shape*: the manifest nests
+#: the port beside the ids (one ``codex`` object), the cache keeps two flat keys.
+#: A model's name and window are the plan's to report and are never stored, so
+#: only ids ride here -- the same rule the gateway follows.
+_CODEX_SETTING = Setting(
+    manifest_key="codex",
+    recorded=lambda o: bool(o.codex_models),
+    to_manifest=lambda o: {
+        "port": o.codex_port,
+        "models": [m.id for m in o.codex_models],
+    },
+    from_manifest=_codex_from_manifest,
+    to_cache=lambda o: {
+        "codex_models": [m.id for m in o.codex_models],
+        "codex_port": o.codex_port,
+    },
+    from_cache=_codex_from_cache,
+)
 
 
 PATCHES = [
@@ -510,10 +869,11 @@ PATCHES = [
         anchors=(
             "Optional model override",
             '"opusplan"',
-            'case"best":',
-            "defaultBaseURL:",
-            "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
-            "],aliases:{",
+            f"case{_BEST}:",
+            f"{_DEFAULT_BASE_URL}:",
+            _MAX_CONTEXT,
+            f"{_ALIASES}:",
         ),
+        setting=_CODEX_SETTING,
     ),
 ]

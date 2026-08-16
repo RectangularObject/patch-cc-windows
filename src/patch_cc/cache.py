@@ -16,9 +16,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .codex import DEFAULT_PORT, is_valid_port
-from .codex.models import CodexModel
-from .patches import DEFAULT_BRAND, DEFAULT_SUFFIX, Options, default_ids, ids
+from .patches import ALL_PATCHES, Options, default_ids, ids
 
 
 def cache_path() -> Path:
@@ -31,6 +29,11 @@ def cache_path() -> Path:
 class Selection:
     patches: list[str] = field(default_factory=default_ids)
     options: Options = field(default_factory=Options)
+    #: Patch ids the cache named that this build no longer has, dropped from
+    #: :attr:`patches` while loading. Transient (never saved), so a caller that
+    #: *acts* on a replay can say it applied fewer patches than were saved
+    #: instead of doing so silently. Empty for a pre-fill, which does not act.
+    dropped_patches: list[str] = field(default_factory=list)
 
 
 def load() -> Selection:
@@ -56,35 +59,27 @@ def load_strict() -> Selection | None:
     """
     try:
         data = json.loads(cache_path().read_text("utf8"))
-        known = set(ids())
-        brand = data.get("brand", DEFAULT_BRAND)
-        suffix = data.get("suffix", DEFAULT_SUFFIX)
-        org = data.get("org_label", "")
-        models = data.get("subagent_models", {})
-        # Codex ids only, the same as the manifest keeps: a name and a context
-        # window are the plan's to report, and remembering either would let a
-        # window that has since changed outlive it.
-        codex = data.get("codex_models", [])
-        port = data.get("codex_port")
-        return Selection(
-            patches=[p for p in data.get("patches", default_ids()) if p in known],
-            options=Options(
-                brand=brand if isinstance(brand, str) and brand else DEFAULT_BRAND,
-                version_suffix=suffix
-                if isinstance(suffix, str) and suffix
-                else DEFAULT_SUFFIX,
-                org_label=org if isinstance(org, str) else "",
-                subagent_models={
-                    a: m
-                    for a, m in models.items()
-                    if isinstance(a, str) and isinstance(m, str)
-                },
-                codex_models=[CodexModel(i) for i in codex if isinstance(i, str) and i],
-                codex_port=port if is_valid_port(port) else DEFAULT_PORT,
-            ),
-        )
-    except (OSError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+    except (OSError, json.JSONDecodeError, ValueError):
         return None
+    if not isinstance(data, dict):
+        return None  # a cache that is not a JSON object holds no selection
+    known = set(ids())
+    saved = data.get("patches", default_ids())
+    if not isinstance(saved, list):
+        saved = default_ids()
+    # Each configurable patch reads its own value back off the cache dict, under
+    # the key it also writes (`Patch.setting`), with the shape validation the
+    # setting owns -- so the cache and the manifest cannot spell the same fact
+    # two ways, which is exactly how `org_label` and `models` came to differ.
+    options = Options()
+    for patch in ALL_PATCHES:
+        if patch.setting is not None:
+            patch.setting.from_cache(options, data)
+    return Selection(
+        patches=[p for p in saved if p in known],
+        dropped_patches=[p for p in saved if isinstance(p, str) and p not in known],
+        options=options,
+    )
 
 
 def save(selection: Selection) -> None:
@@ -94,22 +89,14 @@ def save(selection: Selection) -> None:
         path = cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(
-                {
-                    "patches": selection.patches,
-                    "brand": selection.options.brand,
-                    "suffix": selection.options.version_suffix,
-                    "org_label": selection.options.org_label,
-                    "subagent_models": selection.options.subagent_models,
-                    "codex_models": [m.id for m in selection.options.codex_models],
-                    "codex_port": selection.options.codex_port,
-                },
-                indent=2,
-            )
-            + "\n",
-            "utf8",
-        )
+        # Each configurable patch writes its own cache key(s) from the same
+        # `Options` it reads at bake time, so the cache format is the settings'
+        # to declare, not a second hand-kept list beside the manifest's.
+        data: dict[str, object] = {"patches": selection.patches}
+        for patch in ALL_PATCHES:
+            if patch.setting is not None:
+                data.update(patch.setting.to_cache(selection.options))
+        tmp.write_text(json.dumps(data, indent=2) + "\n", "utf8")
         tmp.replace(path)
     except OSError:
         pass

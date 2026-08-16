@@ -21,9 +21,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX; patch-cc targets Linux/macOS
+    fcntl = None  # type: ignore[assignment]
 
 #: OpenAI's public Codex client id (device-code grant). Not a secret.
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -334,13 +340,47 @@ def refresh(creds: Credentials) -> Credentials:
     return refreshed
 
 
+@contextmanager
+def _refresh_lock() -> Iterator[None]:
+    """Serialise token refresh across *processes*, not just threads.
+
+    The refresh token rotates: the OpenAI server invalidates the old one each
+    time, so two refreshes of the same token race, and the loser saves a token
+    whose refresh has been rotated out. A process-local lock cannot stop that,
+    because the token lives in a file that ``apply``, ``list``, the menu and a
+    running ``codex serve`` all reach from separate processes. So the lock lives
+    in the file too. Best-effort: where ``flock`` is unavailable the body still
+    runs, unlocked -- the same narrow race as before, never a hang.
+    """
+    if fcntl is None:
+        yield
+        return
+    path = auth_path().with_suffix(".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def valid_access(creds: Credentials) -> tuple[str, Credentials]:
     """Return a live access token, refreshing and re-persisting if it is expiring."""
     if not creds.expiring():
         return creds.access, creds
-    refreshed = refresh(creds)
-    save(refreshed)
-    return refreshed.access, refreshed
+    with _refresh_lock():
+        # Re-read inside the lock: whoever held it before us may have just
+        # refreshed, and the fresh token is on disk. Only refresh if it is still
+        # expiring, so the waiters ride the one rotation rather than each racing
+        # another off the same rotated-out token.
+        current = load() or creds
+        if not current.expiring():
+            return current.access, current
+        refreshed = refresh(current)
+        save(refreshed)
+        return refreshed.access, refreshed
 
 
 def login(

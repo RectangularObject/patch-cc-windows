@@ -114,10 +114,11 @@ def iter_sse(fp) -> Iterator[dict]:
             buffer.append(line[5:].lstrip())
 
 
-#: Flat character cost charged for one image (~1.5k vision tokens x ~4), so a
-#: screenshot's inline base64 -- tokenized upstream as vision, not text -- is not
-#: counted at its ~40x-larger encoded length and made to trip auto-compaction.
-_IMAGE_CHARS = 6000
+#: Flat character cost charged for one media block (~1.5k vision tokens x ~4),
+#: so a screenshot's or a PDF's inline base64 -- which the translator ships as a
+#: real vision/file part, not text -- is not counted at its ~40x-larger encoded
+#: length and made to trip auto-compaction early.
+_MEDIA_CHARS = 6000
 
 
 def estimate_tokens(body: dict) -> int:
@@ -125,8 +126,10 @@ def estimate_tokens(body: dict) -> int:
 
     Claude Code diverts count_tokens for a Codex model here too; OpenAI exposes
     no counting endpoint, so this keeps the context meter roughly honest rather
-    than erroring. Images are charged a flat vision cost, not their base64
-    length, which would otherwise dwarf the real prompt and compact it early.
+    than erroring. A media block (image or document) is charged a flat cost, not
+    its base64 length: the translator lifts it out as a vision/file part shipping
+    none of that base64 as text, so counting the base64 here made this and the
+    request disagree by ~350k tokens on a 1 MB PDF and compact the session early.
     """
     chars = len(json.dumps(body.get("system", ""))) + len(
         json.dumps(body.get("tools", []))
@@ -136,10 +139,16 @@ def estimate_tokens(body: dict) -> int:
 
 
 def _content_chars(value: object) -> int:
-    """Characters in a message tree, each image block counted flat, not by base64."""
+    """Characters in a message tree, each media block counted flat, not by base64.
+
+    A block is media when it carries a ``source`` -- an image or a document --
+    the same test the translator lifts on, so the two agree on what a block
+    costs. A multi-page document is only roughly served by one flat cost, but
+    that is the honest unknown; its base64 length is a known wrong answer.
+    """
     if isinstance(value, dict):
-        if value.get("type") == "image":
-            return _IMAGE_CHARS
+        if value.get("source") is not None:
+            return _MEDIA_CHARS
         return sum(_content_chars(v) for v in value.values())
     if isinstance(value, list):
         return sum(_content_chars(v) for v in value)
@@ -202,6 +211,14 @@ class _Handler(BaseHTTPRequestHandler):
                 400, "invalid_request_error", "request body must name a model"
             )
 
+        # A tool the request *requires* but the backend cannot run is refused
+        # here, not silently dropped: dropping it left the model answering a
+        # forced WebSearch from memory. A 400 does not read as retryable, so the
+        # SDK surfaces it instead of re-sending the doomed turn.
+        refusal = translate.refused_tool_reason(body)
+        if refusal is not None:
+            return self._error(400, "invalid_request_error", refusal)
+
         session = self.headers.get("X-Claude-Code-Session-Id")
         payload = translate.translate_request(
             body, upstream_model=model, session_id=session
@@ -229,7 +246,13 @@ class _Handler(BaseHTTPRequestHandler):
                     )
                 payload = clamped
                 upstream = self.gateway.open_responses(payload)
-        except (oauth.OAuthError, *_TURN_FAILED) as exc:
+        except oauth.OAuthError as exc:
+            # A sign-in failure -- not signed in, or a rotated-out session -- is
+            # authentication, not a transient upstream fault. A 502 reads as
+            # retryable, so the SDK re-uploaded the whole prompt against a token
+            # that will keep failing; 401 says stop and fix the credential.
+            return self._error(401, "authentication_error", str(exc))
+        except _TURN_FAILED as exc:
             return self._error(502, "api_error", str(exc))
 
         try:

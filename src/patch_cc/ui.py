@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rich.console import Console
 
 from .patches.base import Options, Outcome, Patch
+
+if TYPE_CHECKING:
+    from .doctor import DryRun
 
 console = Console()
 
@@ -35,6 +40,45 @@ def findings(outcome: Outcome) -> list[tuple[str, str]]:
         lines.append(("dim", f"not on this build: {', '.join(absent)}"))
     notes = (*outcome.notes, *(n for s in outcome.steps.values() for n in s.notes))
     return lines + [("dim", note) for note in notes]
+
+
+def verdicts(result: DryRun) -> list[tuple[str, str]]:
+    """The summary under a dry run's per-patch list, as ``(style, text)`` lines.
+
+    One source for *what a dry run concludes*, the level up from :func:`findings`
+    (which words one patch): the parse defect, the broken patches with the anchor
+    counts that point at what moved, the drift note for a build that matched but
+    could not rewrite, and the all-clear. Both the CLI and the menu draw these,
+    so neither can reach a verdict the other does not -- the exit code is
+    :attr:`DryRun.clean`, read once and rendered here once.
+    """
+    lines: list[tuple[str, str]] = []
+    _grammar_hint = (
+        "not a drifted matcher -- the JS grammar is likely older than the "
+        "build; upgrade tree-sitter-javascript"
+    )
+    _drift = (
+        "found a shape they could not rewrite -- drift on a clean bundle, not applied"
+    )
+    if result.defect is not None:
+        lines.append(
+            ("yellow", "this build's bundle does not parse; apply would refuse it:")
+        )
+        lines.append(("red", f"  {result.defect}"))
+        lines.append(("dim", _grammar_hint))
+    for patch in result.broken:
+        lines.append(("yellow", f"{patch.id}: no longer matches -- anchor counts:"))
+        for anchor, count in result.anchors.get(patch.id, {}).items():
+            lines.append(("red" if count == 0 else "dim", f"  {count:3d}  {anchor}"))
+    if result.broken:
+        lines.append(
+            ("dim", "a 0 is where upstream moved; see docs/PLAYBOOK.md to repair")
+        )
+    if not result.broken and result.defect is None and result.unhealthy:
+        lines.append(("yellow", f"{len(result.unhealthy)} patch(es) {_drift}"))
+    if result.clean:
+        lines.append(("green", "all patches still match this build, and it parses."))
+    return lines
 
 
 def applied_value(patch: Patch, outcome: Outcome, options: Options) -> str | None:

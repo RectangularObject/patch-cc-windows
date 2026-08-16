@@ -19,7 +19,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from . import js
 from .bun import Bundle
+from .codex import EFFORT_LADDER
 from .codex.models import CodexModel
 from .patcher import read_manifest
 from .patches import ALL_PATCHES, Options, Outcome, Patch
@@ -68,6 +70,11 @@ class DryRun:
     #: override patch would offer.
     agents: list[BuiltinAgent] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
+    #: Where this build's *pristine* bundle stopped parsing, when it did --
+    #: which `apply` refuses to patch at all. A rewrite that produces rubble is
+    #: already reported as the patch that produced it, so this is the one
+    #: parse failure no patch can be blamed for and none would survive.
+    defect: js.Defect | None = None
 
     @property
     def broken(self) -> list[Patch]:
@@ -77,8 +84,44 @@ class DryRun:
         cross and "all patches still match" in the same report: it judged on
         counts alone, so a patch that raised half-way was red on its own line
         and absent from this list.
+
+        Kept apart from :attr:`unhealthy` because only these have an anchor
+        count worth printing: a patch that found its shape and failed to rewrite
+        it has already told you the anchor is there.
         """
         return [p for p, o in self.results if o.health == "broken"]
+
+    @property
+    def unhealthy(self) -> list[Patch]:
+        """Every patch not fully ``ok`` -- what the verdict answers for.
+
+        A dry run is the one place ``candidates > 0, applied == 0`` cannot mean
+        "already applied": ``doctor`` runs against a **clean** bundle (the
+        pristine backup when the install is patched), so the reading that makes
+        a missed sub-step benign is unavailable here and what is left is a
+        matcher to repair. Ending green over one is the same silence ``expect``
+        exists to break -- the per-patch line said ``~`` while the closing
+        sentence said every patch still matched.
+
+        ``apply`` judges the same outcome differently on purpose
+        (:attr:`patch_cc.patcher.PatchReport.regressions` reads ``broken``
+        alone): there a partial patch has still landed and still ships, and
+        dropping it would cost the user a working feature over a missing
+        refinement. Two questions, one health verdict, neither re-derived.
+        """
+        return [p for p, o in self.results if o.health != "ok"]
+
+    @property
+    def clean(self) -> bool:
+        """The one green verdict: every patch fully ``ok`` *and* the bundle parses.
+
+        The single home for the dry-run exit code, so no surface can disagree
+        about it. The menu once read :attr:`broken` alone where the CLI read
+        :attr:`unhealthy` (partial included) and :attr:`defect` together, so a
+        partially-drifted or unparseable build showed thirteen green ticks and
+        exit 0 in the menu and red in the CLI.
+        """
+        return not self.unhealthy and self.defect is None
 
 
 def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options:
@@ -86,10 +129,12 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
 
     Each discovered agent is assigned a model different from its current one, so
     the rewrite (not the already-desired no-op) is what gets tested. Targets come
-    from the bundle's own aliases, because each patch here runs against pristine
-    in isolation: a Codex id would not be registered in the bundle a lone
-    ``subagent-models`` run reads, and would correctly fail. What the two do
-    together is an apply-time ordering, not something a dry run can show.
+    from the bundle's own aliases: they are what a user without a Codex plan
+    picks, so they are what the common path must keep working. The dry run
+    composes the patches, so pinning an agent to the synthetic Codex id below
+    would also be honest now -- `codex-models` runs first and registers it --
+    but the aliases exercise the same rewrite without making the model
+    overrides depend on the Codex patch landing.
     """
     # Codex models are chosen by the user and described by their plan, neither of
     # which a dry run has, so it supplies a synthetic one -- with a context window
@@ -97,14 +142,7 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
     # shortcut is derived, exercising the general-resolver step too), and the full
     # effort ladder (so the registry step bakes every capability string) -- to
     # hold every one of codex-models' anchors in the net like the other patches.
-    codex = [
-        CodexModel(
-            "gpt-9.9-doctor",
-            "Doctor",
-            272_000,
-            efforts=("low", "medium", "high", "xhigh", "max"),
-        )
-    ]
+    codex = [CodexModel("gpt-9.9-doctor", "Doctor", 272_000, efforts=EFFORT_LADDER)]
     overrides = {
         agent.name: target
         for agent in agents
@@ -121,16 +159,35 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
 
 
 def dryrun(bundle: Bundle) -> DryRun:
-    """Run every patch against the bundle without writing anything."""
+    """Run every patch against the bundle without writing anything.
+
+    The patches are *composed*, exactly as one pass of ``apply``'s fixpoint
+    composes them, and the result is parsed. Running each patch against the
+    pristine source and discarding its output was cheaper and answered a
+    question nobody asks: it could not see `codex-models` registering the ids
+    that `subagent-models` then pins -- the one ordering the playbook calls
+    load-bearing -- and it could not see the bundle at all, only counters. The
+    bug that motivated the parse was invisible twice over: the patch reported
+    ``candidates=2 applied=2``, and the string it had corrupted was thrown away
+    on the next line.
+
+    Anchor counts and the parse both stay measured against the *pristine*
+    source. They answer "what did this build ship", which is a question about
+    the build, not about what our own edits left behind -- and a rewrite that
+    left rubble is already reported against the patch that made it, by the same
+    gate that stops it being applied.
+    """
     source = bundle.source
     result = DryRun(
         agents=discover_agents(source),
         models=[INHERIT, *discover_models(source)],
+        defect=source.defect(),
     )
     options = _synthetic_options(result.agents, result.models)
 
+    current = source
     for patch in ALL_PATCHES:
-        _, outcome = patch.run(source, options)
+        current, outcome = patch.run(current, options)
         result.results.append((patch, outcome))
         if patch.anchors:
             result.anchors[patch.id] = {a: source.count(a) for a in patch.anchors}

@@ -14,9 +14,12 @@ token cost). They are called out at the site that handles them:
 
 * the backend rejects ``system`` -- it wants ``instructions`` -- and rejects an
   explicit output-token cap, and only ever answers as a stream;
-* an image left inside ``tool_result`` content is JSON-stringified into the
-  function output and tokenized as *text* (a screenshot -> 200k+ tokens), so
-  images are lifted out into the following user turn as real vision parts;
+* a media block (an image, or a ``document`` a PDF ``Read`` emits) left inside
+  ``tool_result`` content is JSON-stringified into the function output and
+  tokenized as *text* (a screenshot -> 200k+ tokens), so any block carrying a
+  ``source`` is lifted out into the following user turn as a real vision/file
+  part -- dispatched on the ``source``, never the block's tag, so a new media
+  type rides the same lift instead of falling through;
 * GPT-family models emit filler (top-level ``null``, empty arrays) that Claude
   Code forwards verbatim into server-side tool configs where an empty list is a
   400 -- so filler is stripped, except an empty array on a *required* property,
@@ -36,6 +39,8 @@ import hashlib
 import json
 from collections.abc import Iterator
 from typing import Any
+
+from . import EFFORT_LADDER
 
 #: The Codex OAuth backend rejects an empty/absent instruction set.
 DEFAULT_SYSTEM = "You are a coding assistant."
@@ -287,8 +292,11 @@ def _user_items(blocks: list[dict[str, Any]], out: list[dict[str, Any]]) -> None
         kind = block.get("type")
         if kind == "text":
             parts.append({"type": "input_text", "text": block.get("text") or ""})
-        elif kind == "image":
-            parts.append(_input_image(block.get("source")))
+        elif block.get("source") is not None:
+            # Any block carrying a `source` -- an image, or a `document` (a PDF
+            # `Read` emits) -- rides the media lift, keyed on media_type. Keyed on
+            # the tag instead, a document fell off the end and was dropped.
+            parts.append(_media_part(block.get("source")))
         elif kind == "tool_result":
             output, images = _tool_result_output(block)
             if block.get("is_error"):
@@ -331,19 +339,26 @@ def _tool_result_output(block: dict[str, Any]) -> tuple[str, list[dict[str, Any]
         if not isinstance(part, dict):
             serialized.append(part)
             continue
-        if part.get("type") == "image":
+        if part.get("source") is not None:
+            # An image *or* a document: lifted out as a real vision/file part, so
+            # its base64 never lands in the function output. A document reached
+            # the `else` below and was JSON-stringified into the output and
+            # tokenized as text -- a 1 MB PDF as ~350k tokens, the very hazard
+            # this lift exists to prevent.
             n += 1
+            media = (part.get("source") or {}).get("media_type") or ""
+            noun = "image" if media.startswith("image/") else "file"
             lifted.append(
                 {
                     "type": "input_text",
-                    "text": f"The following image is image {n} of tool call {tool_use_id}:",
+                    "text": f"The following {noun} is {noun} {n} of tool call {tool_use_id}:",
                 }
             )
-            lifted.append(_input_image(part.get("source")))
+            lifted.append(_media_part(part.get("source")))
             serialized.append(
                 {
-                    "type": "image",
-                    "note": f"attached to the next user message as image {n} of tool call {tool_use_id}",
+                    "type": part.get("type") or noun,
+                    "note": f"attached to the next user message as {noun} {n} of tool call {tool_use_id}",
                 }
             )
         elif part.get("type") == "text":
@@ -353,14 +368,30 @@ def _tool_result_output(block: dict[str, Any]) -> tuple[str, list[dict[str, Any]
     return json.dumps(serialized, separators=(",", ":")), lifted
 
 
-def _input_image(source: Any) -> dict[str, Any]:
+def _media_part(source: Any) -> dict[str, Any]:
+    """A Responses vision/file part for any block carrying a ``source``.
+
+    Dispatched on the source's ``media_type``, not the block's tag, so a
+    ``document`` (a PDF ``Read`` emits) becomes a real ``input_file`` instead of
+    being dropped or stringified as text. An image stays ``input_image``; any
+    other media type is sent as ``input_file`` carrying the same base64 data URL.
+
+    The Codex backend's acceptance of ``input_file`` is not verifiable here (no
+    credentials), but a clean 400 for a file it will not take beats a screenshot
+    tokenized as 350k tokens of text or a page the model never sees.
+    """
     source = source or {}
     if source.get("type") == "url":
         return {"type": "input_image", "image_url": source.get("url") or ""}
     media = source.get("media_type") or "image/png"
+    data_url = f"data:{media};base64,{source.get('data') or ''}"
+    if media.startswith("image/"):
+        return {"type": "input_image", "image_url": data_url}
+    subtype = media.rsplit("/", 1)[-1] or "bin"
     return {
-        "type": "input_image",
-        "image_url": f"data:{media};base64,{source.get('data') or ''}",
+        "type": "input_file",
+        "filename": f"attachment.{subtype}",
+        "file_data": data_url,
     }
 
 
@@ -381,6 +412,32 @@ def _translate_tools(tools: Any) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def refused_tool_reason(body: dict[str, Any]) -> str | None:
+    """Why this request cannot be honestly served, if a *required* tool is missing.
+
+    A server-side tool (WebSearch, ``/advisor``) has no ``input_schema`` and is
+    not a function the Responses backend can call, so :func:`_translate_tools`
+    drops it. When the request merely *offers* it that is a fair degrade -- the
+    model codes on without it. But when ``tool_choice`` *requires* it, dropping
+    it (and, with the ``if tools:`` gate, the ``tool_choice`` too) left the model
+    a bare "Perform a web search for: X" and an answer from memory rendered as a
+    web result. The honest translation of "the backend cannot run the tool you
+    require" is a refusal, so the gateway answers 400 ``invalid_request_error``
+    -- which :func:`patch_cc.codex.gateway._status_for` already keeps the SDK
+    from retrying -- rather than a confident wrong answer.
+    """
+    choice = body.get("tool_choice")
+    if not isinstance(choice, dict):
+        return None
+    supported = {tool["name"] for tool in _translate_tools(body.get("tools"))}
+    kind = choice.get("type")
+    if kind == "tool" and (name := choice.get("name")) and name not in supported:
+        return f"the required tool `{name}` is not one the Codex backend can run"
+    if kind == "any" and body.get("tools") and not supported:
+        return "this request requires a tool, but none of its tools can run on the Codex backend"
+    return None
 
 
 def _translate_tool_choice(choice: Any) -> Any:
@@ -431,14 +488,12 @@ def _wants_reasoning_summary(body: dict[str, Any]) -> bool:
     return isinstance(thinking, dict) and thinking.get("type") != "disabled"
 
 
-#: Claude Code's effort taxonomy, lowest to highest -- the one spelling of the
-#: ladder, shared by the request mapping and :func:`clamp_effort`. The Codex
-#: backend speaks the same words (verified on the wire: ``xhigh`` and ``max``
-#: both reach it and run), though not every model accepts every rung -- which is
-#: the clamp's whole subject. ``minimal`` (a Responses-API level Claude never
-#: emits) is deliberately left out: dropping the field falls back to the backend
-#: default, which never 400s.
-EFFORT_LADDER = ("low", "medium", "high", "xhigh", "max")
+# EFFORT_LADDER is imported from the package's one home (see the top of this
+# file): the clamp steps a Codex request one rung at a time against it. The
+# backend speaks the same words (verified on the wire: xhigh and max both reach
+# it and run), though not every model accepts every rung -- which is the clamp's
+# whole subject. `minimal` (a Responses-API level Claude never emits) is not on
+# the ladder: dropping the field falls back to the backend default, never a 400.
 
 
 def _map_effort(effort: str | None) -> str | None:

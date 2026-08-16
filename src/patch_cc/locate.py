@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 _VERSION_DIR = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
@@ -100,6 +100,8 @@ def find() -> Installation | None:
     the container layer gets to say precisely what the file is instead of this
     reporting nothing found at all.
     """
+    on_path = shutil.which("claude")
+    wrapper = Path(on_path) if on_path else None
     fallback: Installation | None = None
     seen: set[Path] = set()
     for candidate in _candidates():
@@ -114,6 +116,15 @@ def find() -> Installation | None:
         if install is None:
             continue
         if _is_native(install.binary):
+            # A `claude` on PATH that is not itself native -- a launcher script
+            # pinning a version -- is still what the user runs, so when the
+            # native binary was found elsewhere (the newest under versions/) that
+            # wrapper is kept as the launcher. Otherwise the binary has
+            # launcher==binary, `is_symlinked` is False, and the CLI's launcher
+            # line -- the one fact that would explain why a different version is
+            # patched than the one being run -- stays silent.
+            if wrapper is not None and candidate != wrapper:
+                install = replace(install, launcher=wrapper)
             return install
         fallback = fallback or install
     return fallback

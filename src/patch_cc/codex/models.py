@@ -96,12 +96,14 @@ class CodexModel:
         return self.name or self.id
 
 
-#: Short handles a derived family shortcut must never take: the binary's own
-#: built-ins and the menu's model sentinels. Real families
-#: (``sol``/``terra``/``luna``/...) never collide, but a pathological slug like
-#: ``gpt-5.6-opus`` would shadow the real ``opus`` -- so this is a guard, not
-#: decoration. It is a snapshot and may fall behind upstream; docs/PLAYBOOK.md
-#: explains why that is safe, and why the bundle is the real guard.
+#: Short handles a derived family shortcut must never take, plus the menu's own
+#: sentinels (``inherit``/``keep``/``default``). Its one irreducible job is the
+#: path with no binary in hand: :func:`family_aliases` derives a shortcut from
+#: the chosen ids alone, so a pathological ``gpt-5.6-opus`` cannot mint an
+#: ``opus`` shortcut. For that it is a snapshot, and upstream outgrowing it costs
+#: at most a shortcut that resolves nowhere. A *typed* ``--codex`` id is refused
+#: against the bundle's own tables instead (`patches.codex.claimed_model_names`)
+#: -- derived, and so unable to fall behind. docs/PLAYBOOK.md has the split.
 _RESERVED = frozenset(
     {
         "sonnet",

@@ -39,6 +39,7 @@ from . import cache, locate, patcher
 from .bun import Bundle, BunError
 from .codex import DEFAULT_PORT, is_valid_port
 from .codex.models import CodexModel, catalogue, is_reserved_id, is_valid_id, reconcile
+from .js import Source, SyntaxGateError
 from .patches import (
     DEFAULT_BRAND,
     DEFAULT_SUFFIX,
@@ -52,6 +53,7 @@ from .patches import (
     ids,
 )
 from .patches.agents import INHERIT, discover_agents, discover_models
+from .patches.codex import claimed_model_names
 from .ui import (
     MARKS,
     applied_value,
@@ -61,6 +63,7 @@ from .ui import (
     gateway_note,
     heading,
     ok,
+    verdicts,
     warn,
 )
 
@@ -115,7 +118,7 @@ def _list_hint(patch: Patch, cached: cache.Selection) -> str:
     return "  ·  ".join(parts)
 
 
-def _offered_models(source: str, codex_ids: list[str] | None = None) -> list[str]:
+def _offered_models(source: Source, codex_ids: list[str] | None = None) -> list[str]:
     """Every model a subagent can be pinned to in the binary we are about to write.
 
     ``inherit``, the aliases this bundle already ships, and any Codex model this
@@ -129,7 +132,7 @@ def _offered_models(source: str, codex_ids: list[str] | None = None) -> list[str
 
 
 def _parse_models(
-    specs: list[str], source: str, codex_ids: list[str] | None = None
+    specs: list[str], source: Source, codex_ids: list[str] | None = None
 ) -> dict[str, str]:
     """Validate ``AGENT=MODEL`` pairs against what this bundle will offer.
 
@@ -159,7 +162,7 @@ def _parse_models(
     return overrides
 
 
-def _codex_selection(model_ids: list[str]) -> list[CodexModel]:
+def _codex_selection(model_ids: list[str], source: Source) -> list[CodexModel]:
     """The models ``--codex`` named, validated and described, ready to bake.
 
     An id is the whole of what the flag takes -- everything else about a model is
@@ -167,12 +170,20 @@ def _codex_selection(model_ids: list[str]) -> list[CodexModel]:
     alone cannot vouch for get settled: that it is a shape the bundle can safely
     carry, and that your plan actually offers it.
 
+    "Safely carry" is asked of the bundle itself (`claimed_model_names`), not a
+    fixed list: an id the binary's own tables already claim would collide at bake
+    time -- a duplicate provider id bricks the registry, a name a resolver owns
+    hijacks that model -- and 13 such provider ids on 2.1.233 are valid slugs the
+    ``claude-`` prefix guard never sees. Reading them off the bundle keeps the
+    refusal current as Claude's model list grows.
+
     The plan is asked *best-effort*. Both answers are worth having: the real
     context window (baking a wrong one makes Claude Code auto-compact early) and a
     typo caught now rather than as a mid-session 404. But ``apply`` never *needs*
     the network -- offline or signed out, nothing can be checked and nothing is
     claimed, so the ids stand as typed and bake with their fallbacks.
     """
+    claimed = claimed_model_names(source)
     for model_id in model_ids:
         if not is_valid_id(model_id):
             err(f"--codex expects a model id, got {model_id!r}")
@@ -184,6 +195,16 @@ def _codex_selection(model_ids: list[str]) -> list[CodexModel]:
                 "it would divert that model's own requests to the gateway"
             )
             raise SystemExit(2)
+        if model_id in claimed:
+            err(
+                f"{model_id!r} is already a model id in your binary's own tables; "
+                "registering it would collide with the model already using it"
+            )
+            console.print(
+                "  [dim]checked against the bundle itself, so it stays current as "
+                "Claude's model list grows[/dim]"
+            )
+            raise SystemExit(2)
     chosen, missing = reconcile([CodexModel(i) for i in model_ids], _codex_version())
     if missing:
         err(f"your Codex plan does not offer: {', '.join(missing)}")
@@ -192,7 +213,7 @@ def _codex_selection(model_ids: list[str]) -> list[CodexModel]:
     return chosen
 
 
-def _requested(args, source: str) -> tuple[list[str], Options]:
+def _requested(args, source: Source) -> tuple[list[str], Options]:
     """Build the patch set and options purely from CLI args -- no saved state.
 
     Non-interactive patching is deliberately stateless: what you pass is
@@ -268,7 +289,7 @@ def _requested(args, source: str) -> tuple[list[str], Options]:
                 "  [dim]`patch-cc apply --help` lists the models your plan offers[/dim]"
             )
             raise SystemExit(2)
-        options.codex_models = _codex_selection(codex_ids)
+        options.codex_models = _codex_selection(codex_ids, source)
 
     return selected, options
 
@@ -291,7 +312,7 @@ def _has_selection_args(args) -> bool:
 
 
 def _valid_models(
-    models: dict[str, str], source: str, codex_ids: list[str] | None = None
+    models: dict[str, str], source: Source, codex_ids: list[str] | None = None
 ) -> tuple[dict[str, str], list[str]]:
     """Split cached overrides into those this binary still accepts and the rest.
 
@@ -334,7 +355,7 @@ def _replayed_codex(models: list[CodexModel]) -> list[CodexModel]:
     return [m for m in refreshed if m.id not in gone]
 
 
-def _from_cache(args, source: str) -> tuple[list[str], Options]:
+def _from_cache(args, source: Source) -> tuple[list[str], Options]:
     """Rebuild the last interactive selection for a non-interactive apply.
 
     The single place a persisted choice drives an action rather than pre-filling
@@ -370,6 +391,17 @@ def _from_cache(args, source: str) -> tuple[list[str], Options]:
     selection = cache.load()
     options = selection.options
     selected = list(selection.patches)
+
+    if selection.dropped_patches:
+        # A replay that quietly applies a smaller set than was saved is the one
+        # thing a replay must never be. Patch retirement is real (docs/PLAYBOOK.md
+        # lists three), so a cache from an older tool can name an id this build no
+        # longer has -- said here, once, the way the dropped Codex models and
+        # subagent pins are said below.
+        warn(
+            "cached selection named patch id(s) this build no longer has, skipped: "
+            + ", ".join(selection.dropped_patches)
+        )
 
     # Codex rides the remembered selection like every other choice, so a replay
     # bakes exactly what was saved. Ids left behind by a selection that did *not*
@@ -472,6 +504,14 @@ def cmd_apply(args) -> int:
         report = patcher.patch_installation(install, selected, options, bundle=bundle)
     except patcher.AlreadyPatchedError as exc:
         warn(str(exc))
+        return 1
+    except SyntaxGateError as exc:
+        # The final full-parse gate (or a manifest splice) found rubble and
+        # refused to write. The install and its backup are untouched -- the gate
+        # sits before either is written -- so this is a clean stop, not a
+        # half-patched binary, and it is reported as one rather than as a
+        # traceback out of `main`.
+        err(str(exc))
         return 1
     except BunError as exc:
         err(str(exc))
@@ -602,21 +642,20 @@ def cmd_doctor(args) -> int:
     console.print(f"\n  [dim]agents:  {agents}[/dim]")
     console.print(f"  [dim]models:  {', '.join(result.models)}[/dim]")
 
-    if result.broken:
-        console.print()
-        warn(f"{len(result.broken)} patch(es) no longer match. Anchor counts:")
-        for patch in result.broken:
-            anchors = result.anchors.get(patch.id, {})
-            for anchor, count in anchors.items():
-                colour = "red" if count == 0 else "dim"
-                console.print(f"    [{colour}]{count:3d}[/{colour}]  {anchor}")
-        console.print(
-            "\n  [dim]A 0 next to an anchor is where upstream moved. "
-            "See docs/PLAYBOOK.md to repair.[/dim]"
-        )
-        return 1
-    ok("All patches still match this build.")
-    return 0
+    # One verdict, one exit code (`ui.verdicts` / `DryRun.clean`), so this and
+    # the menu cannot disagree -- including the parse defect, which is not a
+    # per-patch verdict (no matcher caused it, `apply` refuses the binary
+    # outright) but does decide the exit. Green lines get the ✓, cautions the !,
+    # detail is indented under them.
+    console.print()
+    for style, text in verdicts(result):
+        if style == "green":
+            ok(text)
+        elif style == "yellow":
+            warn(text)
+        else:
+            console.print(f"    [{style}]{text}[/{style}]")
+    return 0 if result.clean else 1
 
 
 def cmd_list(args) -> int:
@@ -658,7 +697,7 @@ def cmd_extract(args) -> int:
     from .bun import container
 
     bundle = container.read(args.path)
-    sys.stdout.buffer.write(bundle.source.encode("utf8"))
+    sys.stdout.buffer.write(bundle.source.data)
     sys.stdout.buffer.flush()
     return 0
 
@@ -735,10 +774,19 @@ def cmd_codex_logout(args) -> int:
 
 
 def cmd_codex_serve(args) -> int:
-    from .codex import gateway
+    from .codex import gateway, oauth
 
     baked = _baked_port()
     port = args.port or baked or DEFAULT_PORT
+    # The other half of what a bound socket does not establish. The token is
+    # read per request, so a signed-out gateway starts green and answers every
+    # request with a 502 -- learning it from a failing turn is exactly what the
+    # baked-port warning below exists to prevent, and this is the same question
+    # one step earlier. Read here, beside the port, so `listening` stays a
+    # renderer of facts rather than a decider of them. Neither warning stops the
+    # gateway: it holds no state, so signing in or baking while it runs makes
+    # the next request work with nothing to restart.
+    signed_in = oauth.load() is not None
 
     def listening() -> None:
         """Announced from inside ``serve``, once the socket is really bound."""
@@ -747,6 +795,12 @@ def cmd_codex_serve(args) -> int:
             "  [dim]keep this running; a patched Claude Code routes Codex models "
             "here. ctrl+c to stop.[/dim]"
         )
+        # Named in the order you make them true, the order `codex status` uses.
+        if not signed_in:
+            console.print(
+                "  [yellow]![/yellow] [dim]not signed in — requests will fail "
+                "until `patch-cc codex login`[/dim]"
+            )
         if baked is None:
             console.print(
                 "  [yellow]![/yellow] [dim]no binary routes here yet — bake with "
@@ -811,7 +865,7 @@ common tasks:
 """
 
 
-def _discover_binary() -> tuple[str | None, str | None]:
+def _discover_binary() -> tuple[Source | None, str | None]:
     """The installed binary's JS source and version, or ``(None, version?)``.
 
     Best-effort: ``apply --help`` reads the real binary so its agent/model list

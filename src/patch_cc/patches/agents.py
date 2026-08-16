@@ -2,10 +2,10 @@
 
 Everything the model override offers is discovered from the bundle itself:
 
-* **Agents** come from the built-in definition shape
-  ``agentType:"<name>",whenToUse:...`` carrying ``source:"built-in"``.
-* **Models** come from the Task tool's own input schema -- the
-  ``model:enum([...])`` whose describe-string starts "Optional model override".
+* **Agents** come from the built-in definition shape -- an object carrying
+  ``agentType``, ``whenToUse`` and ``source:"built-in"``.
+* **Models** come from the Task tool's own input schema -- the ``model``
+  property whose describe-string starts "Optional model override".
 
 So a new upstream agent or model shows up here without a code change, and we
 can never offer a name the binary would reject.
@@ -13,114 +13,131 @@ can never offer a name the binary would reject.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
-from .base import (
-    ARRAY_CALL,
-    GROUP_MODELS,
-    GROUP_OUTPUT,
-    IDENT,
-    Options,
-    Outcome,
-    Patch,
-    compile_js,
-    splice,
-)
+from .. import js
+from ..js import Edit, Source
+from .base import GROUP_MODELS, GROUP_OUTPUT, Options, Outcome, Patch, Setting
 
 # ------------------------------------------------------- prompt visibility
 
 _BACKGROUNDED = '"Backgrounded agent"'
-_LIVE_PROMPT_MOUNT = compile_js(
-    rf"({IDENT})&&({IDENT})&&({IDENT})\.createElement\(m,\{{marginBottom:1\}},"
-    rf"\3\.createElement\(({IDENT}),\{{prompt:\2\}}\)\)"
-)
-# The negation is required, not optional: the rewrite emits `&&!prompt`, so on a
-# hypothetical un-negated shape it would invert the guard rather than relax it --
-# hiding the prompt in exactly the state this step exists to fix. A build that
-# ships that shape earns a branch; it must not be swept in by a loose `!?`.
-_EMPTY_STATE = compile_js(
-    rf"if\(({IDENT})\.length===0&&!\(({IDENT})&&({IDENT})\)\)return"
-)
-_TRANSCRIPT_MODE = compile_js(rf"isTranscriptMode:({IDENT})=!1")
+_TRANSCRIPT_MODE = "isTranscriptMode"
+_PROMPT = "prompt"
 
 
-def _subagent_prompt(content: str, _options: Options, outcome: Outcome) -> str:
-    """Show the subagent ``Prompt`` block outside transcript mode."""
+def _prompt_vars(scope: js.Node) -> set[str]:
+    """The variables this component hands to a renderer as its ``prompt``.
+
+    What makes a value *the subagent's prompt* is that the component passes it
+    under that name -- not how it was obtained, which upstream spells as a
+    destructured parameter in one component and a ternary over ``.prompt`` in
+    the other, and not how it is defended on the way there. Every identifier
+    *inside* the value counts, because requiring the value to be a bare
+    identifier reads a single ``??""`` as the prompt no longer existing: the one
+    ``prompt:h`` pair in the progress-messages component feeds two of the four
+    gates, so ``prompt:h??""`` would quietly take that component's Prompt block
+    and its empty state with it, and the patch would stay green at 2/4.
+    """
+    found: set[str] = set()
+    for node in js.every(
+        scope, lambda n: n.type == "property_identifier" and js.text(n) == _PROMPT
+    ):
+        pair = js.named(node)
+        if pair is None:
+            continue
+        value = pair.child_by_field_name("value")
+        if value is not None:
+            found.update(js.text(n) for n in js.every(value, js.of_type("identifier")))
+    return found
+
+
+def _rebound(name: str, site: js.Node, owner: js.Node) -> bool:
+    """Is this name a *different* variable here than the one ``owner`` binds?
+
+    Minified locals are single letters and they repeat constantly, so a name on
+    its own is not a variable -- it is a spelling, and the scope it was read in
+    is the rest of it. A callback inside the component taking its own ``b``
+    read as the component's ``b``, and the conjunction that got rewritten was
+    the callback's own: both halves matched by spelling, the count went up by
+    one, and the patch stayed green.
+
+    So the scopes between the use and the component are asked whether any of
+    them binds it, which is the question a resolver would answer and the only
+    part of one this needs.
+    """
+    scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
+    while scope is not None and scope.start_byte != owner.start_byte:
+        bound = {js.text(js.binding(p)) for p in js.positional(scope)}
+        bound |= {js.text(b) for b in js.parameters(scope).values()}
+        bound |= {
+            js.text(local)
+            for declarator in js.every(
+                js.body(scope), js.of_type("variable_declarator"), scoped=True
+            )
+            for local in js.every(
+                declarator.child_by_field_name("name"), js.of_type("identifier")
+            )
+        }
+        if name in bound:
+            return True
+        scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+    return False
+
+
+def _subagent_prompt(source: Source, _options: Options, outcome: Outcome) -> Source:
+    """Show the subagent ``Prompt`` block outside transcript mode.
+
+    Every gate is the same conjunction -- *in transcript mode, and there is a
+    prompt* -- and dropping the first half is the whole patch. Three matchers
+    used to spell three appearances of it: the block's mount, a second mount in
+    the completed state, and an early return that renders an empty state unless
+    the prompt is showing. They differed only in what surrounded them.
+
+    Both halves are named by upstream: the transcript flag is a parameter
+    property, and the prompt is whatever the component passes as ``prompt``.
+    That pairing is what keeps the rewrite off the neighbouring
+    ``transcript && content && ...`` conjunction, which gates the agent's
+    *output* and is not this patch's business.
+    """
     gate = outcome.step("gate", expect=True)
-    output = content
-    index = 0
+    edits: list[Edit] = []
+    seen: set[int] = set()
 
-    while True:
-        anchor = output.find(_BACKGROUNDED, index)
-        if anchor == -1:
-            break
-        fn_start = output.rfind("function ", 0, anchor)
-        fn_end_candidate = output.find("function ", anchor + len(_BACKGROUNDED))
-        fn_end = len(output) if fn_end_candidate == -1 else fn_end_candidate
-        index = anchor + len(_BACKGROUNDED)
-        if fn_start == -1 or fn_end <= fn_start:
-            continue
-
-        segment = output[fn_start:fn_end]
-        relevant = (
-            'action:"app:toggleTranscript"' in segment
-            and 'fallback:"ctrl+o"' in segment
-            and "isTranscriptMode:" in segment
-            and "{prompt:" in segment
-            and ",theme:" in segment
+    for node in source.find(_TRANSCRIPT_MODE):
+        component = js.climb(
+            node,
+            lambda n: n.type in js.FUNCTIONS and _TRANSCRIPT_MODE in js.parameters(n),
         )
-        if not relevant:
+        if component is None or component.start_byte in seen:
             continue
-
-        transcript = _TRANSCRIPT_MODE.search(segment)
-        if not transcript:
+        seen.add(component.start_byte)
+        transcript = js.text(js.parameters(component)[_TRANSCRIPT_MODE])
+        prompts = _prompt_vars(component)
+        if not prompts:
             continue
-        transcript_var = transcript.group(1)
-        gate_pattern = compile_js(rf"{re.escape(transcript_var)}&&({IDENT})&&")
-
-        def drop_gate(match: re.Match[str], segment: str = segment) -> str:
-            prompt_var = match.group(1)
-            nearby = segment[match.end() : match.end() + 260]
-            if f"{{prompt:{prompt_var},theme:" not in nearby:
-                return match.group(0)
+        for conjunction in js.every(component, js.of_type("binary_expression")):
+            pair = js.conjuncts(conjunction)
+            if pair is None:
+                continue
+            # One half is the flag, the other is the prompt, and the patch keeps
+            # the prompt. Which of the two upstream writes first is the
+            # minifier's business as much as anything else here: asking for the
+            # flag on the left cost a whole Prompt block the day one gate was
+            # spelled the other way round, at 3/4 and green.
+            showing = [side for side in pair if js.text(side) in prompts]
+            if len(showing) != 1 or not any(
+                js.text(side) == transcript for side in pair
+            ):
+                continue
+            kept = showing[0]
+            if any(_rebound(js.text(side), conjunction, component) for side in pair):
+                continue
             gate.candidates += 1
             gate.applied += 1
-            return f"{prompt_var}&&"
+            edits.append(Edit.replace(conjunction, js.text(kept)))
 
-        next_segment = gate_pattern.sub(drop_gate, segment)
-        if next_segment != segment:
-            output = splice(output, fn_start, fn_end, next_segment)
-            index = fn_start + len(next_segment)
-
-    mount = outcome.step("mount")
-
-    def rewrite_mount(match: re.Match[str]) -> str:
-        _transcript, prompt_var, ns, component = match.groups()
-        mount.candidates += 1
-        replacement = (
-            f"{prompt_var}&&{ns}.createElement(m,{{marginBottom:1}},"
-            f"{ns}.createElement({component},{{prompt:{prompt_var}}}))"
-        )
-        if replacement != match.group(0):
-            mount.applied += 1
-        return replacement
-
-    output = _LIVE_PROMPT_MOUNT.sub(rewrite_mount, output)
-
-    # Independently load-bearing: with no rows yet, the untouched guard returns
-    # early and the prompt stays hidden however well the gate rewrite landed.
-    empty = outcome.step("empty-state", expect=True)
-
-    def rewrite_empty(match: re.Match[str]) -> str:
-        rows, _transcript, prompt_var = match.groups()
-        empty.candidates += 1
-        replacement = f"if({rows}.length===0&&!{prompt_var})return"
-        if replacement != match.group(0):
-            empty.applied += 1
-        return replacement
-
-    return _EMPTY_STATE.sub(rewrite_empty, output)
+    return source.apply(edits)
 
 
 # ----------------------------------------------------------- discovery
@@ -129,39 +146,19 @@ def _subagent_prompt(content: str, _options: Options, outcome: Outcome) -> str:
 #: the main loop runs.
 INHERIT = "inherit"
 
-# The optional `model:"..."` is the property *this patch inserts* into a
-# definition that had none. Without it in the anchor our own rewrite breaks the
-# adjacency the anchor is made of, and every agent we overrode vanishes from a
-# re-read of the patched bundle -- the menu offering five agents where the
-# binary has six, and `--model` rejecting the very agent it just pinned. The
-# only bundle that carries this shape is one we wrote, so it stays narrow.
-_AGENT_DEF = compile_js(r'agentType:"([\w-]+)",(?:model:"[^"]*",)?whenToUse:')
-#: What a model literal may contain: word characters, the ``[1m]`` brackets the
-#: binary's own long-context aliases carry, and the dots and dashes of a codex
-#: alias (``gpt-5.6-sol``). One home, because three matchers have to agree on it
-#: -- the definition's ``model:"..."``, the Task schema's enum, and the values
-#: read back out of that enum. They did not: the enum pair stopped at ``\w``, so
-#: the moment ``codex-models`` registered an alias the enum stopped matching and
-#: discovery fell back to three hardcoded names, silently dropping ``fable``
-#: along with every imported model.
-_MODEL_CHARS = r"[\w\[\].-]"
-_MODEL_FIELD = compile_js(rf'model:"({_MODEL_CHARS}+)"')
-#: A definition object is scanned at most this far; every known definition fits
-#: well within it, and the cap keeps a moved anchor from swallowing a neighbour.
-_DEF_WINDOW = 3000
+_AGENT_TYPE = "agentType"
+_WHEN_TO_USE = "whenToUse"
+_SOURCE = "source"
+_BUILT_IN = '"built-in"'
+_MODEL = "model"
 
-#: The Task tool's own ``model`` enum -- the list of aliases a subagent may be
-#: pinned to. Group 1 is the comma-joined body. One home because two patches need
-#: this exact anchor: ``codex-models`` splices imported aliases into that group
-#: and :func:`discover_models` reads them back out (patches/__init__.py explains
-#: why that ordering is load-bearing). Matched separately, the two would drift
-#: apart on the next upstream reshape, and only one of them would be repaired.
-MODEL_ENUM = compile_js(
-    rf'model:{ARRAY_CALL}((?:"{_MODEL_CHARS}+",?)+)\]\)\.optional\(\)'
-    rf'\.describe\([`"]Optional model override'
-)
-#: Used only if the Task-tool schema anchor ever disappears.
-_FALLBACK_MODELS = ("haiku", "sonnet", "opus")
+#: The Task tool's own describe-string. The enum it introduces is the list of
+#: aliases a subagent may be pinned to, and one home for it matters: `enum`
+#: (in `codex-models`) splices imported ids into the very array
+#: :func:`discover_models` reads back out, and patches/__init__.py explains why
+#: that ordering is load-bearing. Matched separately, the two would drift apart
+#: on the next upstream reshape and only one of them would be repaired.
+MODEL_DESCRIPTION = "Optional model override"
 
 
 @dataclass(slots=True, frozen=True)
@@ -169,192 +166,351 @@ class BuiltinAgent:
     """One built-in agent definition as found in a bundle."""
 
     name: str
-    #: Current ``model:"..."`` literal, or ``None`` when the definition has no
-    #: model field (which the runtime treats as inherit).
+    #: Current ``model`` literal, or ``None`` when the definition has none
+    #: (which the runtime treats as inherit).
     model: str | None
-    #: Offset of the definition anchor in the scanned source.
-    start: int
-    #: Offset of the model *value* inside the source, ``-1`` when absent.
-    model_start: int
-    #: Where a ``model:"...",`` property would be inserted.
-    insert_at: int
+    #: The ``model`` value node, when the definition carries one.
+    model_node: js.Node | None
+    #: The ``whenToUse`` property, before which a ``model`` property is
+    #: inserted for a definition that has none. Any property boundary would do
+    #: -- an object literal takes a new property before any existing one -- and
+    #: this one is required to be present for the definition to count at all.
+    anchor: js.Node
+    #: The variable this definition is assigned to, when it is assigned to one.
+    #: The model-bypass helper names its pinned agent that way.
+    holder: str | None
 
     @property
     def effective_model(self) -> str:
         return self.model or INHERIT
 
 
-def discover_agents(source: str) -> list[BuiltinAgent]:
+def _holder(definition: js.Node) -> str | None:
+    """The variable a definition object is assigned to, if any."""
+    parent = definition.parent
+    if parent is None:
+        return None
+    if parent.type == "assignment_expression":
+        left = parent.child_by_field_name("left")
+        return js.text(left) if left is not None and left.type == "identifier" else None
+    if parent.type == "variable_declarator":
+        name = parent.child_by_field_name("name")
+        return js.text(name) if name is not None and name.type == "identifier" else None
+    return None
+
+
+def _resolved_name(source: Source, value: js.Node) -> str | None:
+    """The agent name an ``agentType`` value spells -- through its value node.
+
+    A string literal is its own name. An identifier is a *hoisted constant*
+    (``agentType:Ehr`` with ``Ehr="worker"`` declared elsewhere -- upstream does
+    this to 4 of 11 built-ins on 2.1.233, ``fork``/``claude-code-guide``/
+    ``web-fetch``/``worker``), and it is resolved to the single declarator that
+    binds it to a string. That is the mirror of :func:`_holder`, which walks the
+    other way -- a definition to the variable holding it -- and it is what makes
+    the skip an honest one: a name read through its value is a name we can still
+    *write*, and ``name`` is only used to offer the agent (the edit hangs off
+    ``anchor``/``model_node``), so nothing about the rewrite changes.
+
+    ``None`` is ordinary absence -- a computed or otherwise unreadable type, the
+    same answer the old literal-only gate gave every constant. Two declarators
+    for one identifier is not absence but ambiguity, and :func:`js.only` makes it
+    loud rather than picking one, the same cardinality rule every rewrite here
+    follows.
+    """
+    if value.type == "string":
+        return js.text(value)[1:-1]
+    if value.type != "identifier":
+        return None
+    name = js.text(value)
+    binding = js.only(
+        [
+            declarator
+            for node in source.find(name)
+            if node.type == "identifier"
+            and (declarator := node.parent) is not None
+            and declarator.type == "variable_declarator"
+            and declarator.child_by_field_name("name") == node
+            and (bound := declarator.child_by_field_name("value")) is not None
+            and bound.type == "string"
+        ],
+        f"declarations binding {name!r} to a string",
+    )
+    if binding is None:
+        return None
+    return js.text(binding.child_by_field_name("value"))[1:-1]
+
+
+def discover_agents(source: Source) -> list[BuiltinAgent]:
     """Built-in agent definitions as they exist in *this* bundle.
+
+    A definition is an object carrying all three of the properties that make
+    one, and nothing is said about their order or about how much text sits
+    between them -- which is what the 3,000-character scan window this replaced
+    was guarding against, and what its ``getSystemPrompt:`` stop-word was
+    trying to bound. An object has an end; a window has to guess one.
 
     Definitions marked internal (their ``whenToUse`` says so) are not offered:
     they are orchestration plumbing, not agents a user chooses.
     """
     agents: list[BuiltinAgent] = []
     seen: set[str] = set()
-    for match in _AGENT_DEF.finditer(source):
-        name = match.group(1)
-        window = source[match.start() : match.start() + _DEF_WINDOW]
-        stop = window.find("getSystemPrompt:")
-        span = window if stop == -1 else window[:stop]
-        if 'source:"built-in"' not in span or 'whenToUse:"Internal' in span:
+    for node in source.find(_AGENT_TYPE):
+        pair = js.named(node)
+        if pair is None:
+            continue
+        definition = js.owner(pair)
+        if definition is None:
+            continue
+        carried = js.props(definition)
+        kind, when, origin = (
+            carried.get(_AGENT_TYPE),
+            carried.get(_WHEN_TO_USE),
+            carried.get(_SOURCE),
+        )
+        if when is None or origin is None or js.text(origin) != _BUILT_IN:
+            continue
+        # The type is a string literal on most definitions and a hoisted constant
+        # on the rest; :func:`_resolved_name` reads it through its value either
+        # way, so a name upstream lifted into a variable is still offered rather
+        # than silently dropped. Only a type that resolves to no single string --
+        # genuinely unreadable, and so unwritable -- is skipped.
+        name = _resolved_name(source, kind) if kind is not None else None
+        if name is None:
+            continue
+        if when.type == "string" and js.text(when)[1:-1].startswith("Internal"):
             continue
         if name in seen:
             continue
         seen.add(name)
-        field = _MODEL_FIELD.search(span)
+        model = carried.get(_MODEL)
         agents.append(
             BuiltinAgent(
                 name=name,
-                model=field.group(1) if field else None,
-                start=match.start(),
-                model_start=match.start() + field.start(1) if field else -1,
-                insert_at=match.end() - len("whenToUse:"),
+                model=js.text(model)[1:-1] if model is not None else None,
+                model_node=model,
+                anchor=js.up(when, "pair") or when,
+                holder=_holder(definition),
             )
         )
     return agents
 
 
-def discover_models(source: str) -> list[str]:
-    """Model aliases the binary's own Task tool accepts for subagents."""
-    match = MODEL_ENUM.search(source)
-    if not match:
-        return list(_FALLBACK_MODELS)
-    return re.findall(rf'"({_MODEL_CHARS}+)"', match.group(1))
+def model_enums(source: Source) -> list[js.Node]:
+    """The Task tool's ``model`` enum arrays -- the aliases a subagent accepts.
+
+    Reached from the describe-string through the property it belongs to, so
+    whatever expression this build uses to build the schema is skipped without
+    being described. That callee is pure minifier noise: one unchanged
+    ``effortLevel`` schema read ``E.enum(``, ``A.enum(``, ``b.enum(``,
+    ``v.enum(``, ``w.enum(`` and then ``Ir(`` across eight builds, and every
+    matcher that named any of it dated itself to one of them.
+
+    Skipping that callee unmodelled is exactly what makes the array worth
+    naming by its contents. The value is whatever expression this build reached
+    the factory through, and "the first array in it" is a guess about that
+    expression -- the one kind of claim this module exists to stop making. So
+    the arrays under the value are candidates and membership picks between
+    them: an enum of aliases is an array of nothing but string literals. That
+    is the only membership this site can assert, the names being precisely what
+    it exists to discover, and it is enough to tell the enum from an array of
+    schemas, options or tuples composed alongside it.
+
+    Every enum so described, not the first one: the anchor is a *sentence*, and
+    nothing stops a build from introducing a second tool with it. "Which array
+    did upstream mean" would then have no answer, while the question actually
+    asked here -- every list of aliases a subagent may be pinned to -- has the
+    same one either way, both to read back out and to register a new id in.
+    """
+    found = []
+    for described in source.literals(MODEL_DESCRIPTION):
+        pair = js.up(described, "pair")
+        if pair is None:
+            continue
+        key = pair.child_by_field_name("key")
+        if key is None or js.text(key) != _MODEL:
+            continue
+        found += [
+            enum
+            for enum in js.every(pair.child_by_field_name("value"), js.of_type("array"))
+            if (aliases := js.elements(enum))
+            and all(alias.type == "string" for alias in aliases)
+        ]
+    return found
+
+
+def discover_models(source: Source) -> list[str]:
+    """Model aliases the binary's own Task tool accepts for subagents.
+
+    Empty when the Task-tool schema anchor is gone, and deliberately not backed
+    by a guessed default. A hardcoded fallback (`haiku/sonnet/opus`) read a lost
+    enum as those three: `doctor` printed a plausible list, every pin to one of
+    them landed, and a pin to a name the real bundle accepts was refused -- the
+    same emptiness that `codex-models`' own `enum` step (`expect=True`) reports
+    as broken in the same run. With nothing to offer, the offer is empty:
+    `discover_models` returns `[]`, `doctor` shows `models: inherit` alone, and a
+    requested pin fails its required step rather than landing on a name nothing
+    registered. Absence flows through the path a present-but-different name does.
+    """
+    return list(
+        dict.fromkeys(
+            alias for enum in model_enums(source) for alias in js.strings(enum)
+        )
+    )
 
 
 # --------------------------------------------------------- model overrides
 
-# One helper resolves a built-in agent's default model and, for exactly one
-# agent (Explore today), ignores the definition's model field in favour of its
-# own pin. Overriding that agent means neutralising this bypass so the
-# definition -- which we just rewrote -- is authoritative again.
-#
-# The helper's *head* -- the two-condition guard naming the pinned agent -- is
-# what identifies it, and it outlives its body: 2.1.217 grew a
-# CLAUDE_CODE_DISABLE_EXPLORE_INHERIT_CAP escape hatch in the middle while the
-# head stayed put. Resolving the pinned agent from the head alone is what keeps
-# a reshaped body loud: we still know an override is at stake, so the failed
-# rewrite is reported instead of vanishing with the agent's identity.
-_MODEL_BYPASS_HEAD = compile_js(
-    rf"function {IDENT}\(({IDENT}),{IDENT}\)\{{"
-    rf'if\(\1\.agentType!==({IDENT})\.agentType\|\|\1\.source!=="built-in"\)'
-    rf"(?:\{{return \1\.model\}}|return \1\.model;)"
-)
-
-# The whole helper, replaced wholesale. Upstream's guards between head and the
-# pin-or-inherit return are matched as opaque brace-free statements rather than
-# earning a branch each.
-_MODEL_BYPASS = compile_js(
-    rf"function ({IDENT})\(({IDENT}),({IDENT})\)\{{"
-    rf'if\(\2\.agentType!==({IDENT})\.agentType\|\|\2\.source!=="built-in"\)'
-    rf"(?:\{{return \2\.model\}}|return \2\.model;)"
-    rf'[^{{}}]{{0,300}}?return {IDENT}\(\3\)\?{IDENT}:"inherit"\}}'
-)
+_INHERIT_LITERAL = '"inherit"'
 
 
-def bypassed_agents(source: str) -> list[tuple[str, int]]:
-    """Every pinned agent a bypass helper overrides, with the helper's offset.
+@dataclass(slots=True, frozen=True)
+class Bypass:
+    """A helper that ignores one agent's definition in favour of its own pin."""
 
-    Carrying the offset is what keeps identification and rewriting talking about
-    the *same* helper: matching the head here and then searching for a body
-    somewhere else could neutralise an unrelated helper and call it done.
+    agent: str
+    body: js.Node
+    definition: str
+
+
+def _origin_test(literal: js.Node) -> str | None:
+    """Whose origin a ``!=="built-in"`` test asks about -- the definition it reads.
+
+    Both operands are nodes and the comparison is one, so which side the string
+    sits on says nothing about what is being tested.
     """
-    found = []
-    for match in _MODEL_BYPASS_HEAD.finditer(source):
-        def_var = re.escape(match.group(2))
-        assign = compile_js(rf'(?<![\w$]){def_var}=\{{agentType:"([\w-]+)"').search(
-            source
-        )
-        if assign:
-            found.append((assign.group(1), match.start()))
-    return found
+    test = js.up(literal, "binary_expression")
+    operator = test.child_by_field_name("operator") if test is not None else None
+    if test is None or operator is None or js.text(operator) != "!==":
+        return None
+    sides = (test.child_by_field_name("left"), test.child_by_field_name("right"))
+    read = next((side for side in sides if js.reads(side, _SOURCE)), None)
+    return None if read is None or literal not in sides else js.text(js.receiver(read))
 
 
-def _neutralize_bypass(content: str, at: int, step: Outcome) -> str:
-    """Rewrite the bypass helper that starts at ``at`` so it obeys the definition.
+def _pinned_agent(condition: js.Node | None, subject: str) -> str | None:
+    """The *other* definition the guard names -- the agent this helper pins.
 
-    The candidate is counted before the body is matched: the head already
-    proved a helper is here, so a body that fails to match is a drift to report
-    (``matched 1 but rewrote none``), not the absence the count would otherwise
-    claim.
+    The guard compares the definition it was handed (``subject``) against a
+    second one, and that second one is the pin. Which is why it is found by
+    *not* being the subject: both are read as ``<local>.agentType``, and the
+    locals are the minifier's.
+
+    A guard naming two others pins two agents, which this cannot express and so
+    refuses rather than picks from.
     """
-    step.candidates += 1
-    match = _MODEL_BYPASS.match(content, at)
-    if not match:
-        step.note(
-            "bypass helper found but its body drifted; the pinned agent would "
-            "ignore its override"
-        )
-        return content
-    step.applied += 1
-    name, obj, model = match.group(1, 2, 3)
-    return splice(
-        content,
-        match.start(),
-        match.end(),
-        f"function {name}({obj},{model}){{return {obj}.model}}",
+    return js.only(
+        sorted(
+            {
+                js.text(js.receiver(read))
+                for read in js.every(condition, lambda n: js.reads(n, _AGENT_TYPE))
+                if js.text(js.receiver(read)) != subject
+            }
+        ),
+        "agents this bypass guard pins",
     )
 
 
-def _subagent_models(content: str, options: Options, outcome: Outcome) -> str:
+def bypassed_agents(source: Source, agents: list[BuiltinAgent]) -> list[Bypass]:
+    """Every pinned agent a bypass helper overrides, with the body to replace.
+
+    One helper resolves a built-in agent's default model and, for exactly one
+    agent (Explore today), ignores the definition's model field in favour of
+    its own pin. Overriding that agent means neutralising this helper so the
+    definition -- which we just rewrote -- is authoritative again.
+
+    Its *guard* is what identifies it and names the pinned agent, and it
+    outlives its body: 2.1.217 grew a
+    ``CLAUDE_CODE_DISABLE_EXPLORE_INHERIT_CAP`` escape hatch in the middle
+    while the guard stayed put, and the matcher that had spelled the body
+    silently cost every Explore override until it learned to skip intervening
+    statements. The body is a node now, so there is nothing left to skip.
+
+    The guard is read as the comparison it is. Spelled as the phrase
+    ``.source!=="built-in"`` it also asserted which side upstream writes the
+    string on, and ``"built-in"!==e.source`` -- one reordering, the same
+    test -- read as no helper being there at all.
+
+    Which agent a local stands for is likewise a question with one right
+    answer or none: two definitions held under one minified name are two
+    answers, and taking the first mapped the bypass to the wrong agent, left
+    the real override inert, and fired no note because a bypass *was* found.
+    """
+    holders: dict[str, list[BuiltinAgent]] = {}
+    for agent in agents:
+        if agent.holder:
+            holders.setdefault(agent.holder, []).append(agent)
+
+    found: list[Bypass] = []
+    for literal in source.find(_BUILT_IN):
+        subject = _origin_test(literal)
+        helper = js.climb(literal, lambda n: n.type in js.FUNCTIONS)
+        block = js.body(helper)
+        guard = js.up(literal, "if_statement")
+        if subject is None or block is None or guard is None or guard.parent != block:
+            continue
+        pinned = _pinned_agent(guard.child_by_field_name("condition"), subject)
+        if pinned is None:
+            continue
+        held = js.only(holders.get(pinned, []), f"definitions held by {pinned}")
+        if held is None:
+            continue
+        found.append(Bypass(agent=held.name, body=block, definition=subject))
+    return found
+
+
+def _subagent_models(source: Source, options: Options, outcome: Outcome) -> Source:
     """Write the chosen model into each overridden built-in definition.
 
-    Definitions with a ``model:"..."`` literal get it rewritten; definitions
-    without one get it inserted. Both target offsets from a fresh discovery
-    pass, so this never guesses about the bytes between anchor and value.
+    Definitions with a ``model`` literal get it rewritten; definitions without
+    one get it inserted before a property they are required to carry, so
+    nothing here has to find where the object *ends*.
     """
     if not options.subagent_models:
         outcome.note("no subagent model overrides configured")
-        return content
+        return source
 
-    output = content
     # The bundle in hand is the only authority on what a subagent may be pinned
     # to -- including imported Codex aliases, which codex-models has already
     # written into this very enum by the time we run (see patches/__init__.py).
     # Asking the bundle rather than the options is what ties a pin to its
-    # registration: a codex-models the fixpoint dropped leaves no alias here, so
-    # the pin fails with it instead of landing on a model nothing registered.
-    offered = {INHERIT, *discover_models(output)}
+    # registration: a codex-models the fixpoint dropped leaves no alias here,
+    # so the pin fails with it instead of landing on a model nothing registered.
+    offered = {INHERIT, *discover_models(source)}
+    agents = discover_agents(source)
+    found = {agent.name: agent for agent in agents}
+    edits: list[Edit] = []
 
-    for agent, target in sorted(options.subagent_models.items()):
+    for name, target in sorted(options.subagent_models.items()):
         # Required: every override reaching a patch has already been validated
-        # against this bundle by its surface (CLI, --from-cache, or the menu), so
-        # one that cannot be written is not a shape this build lacks -- it is the
-        # asked-for change failing. Left optional, the patch stayed green, the
-        # binary shipped without the override, and the manifest claimed it anyway.
-        step = outcome.step(agent, expect=True)
+        # against this bundle by its surface (CLI, --from-cache, or the menu),
+        # so one that cannot be written is not a shape this build lacks -- it is
+        # the asked-for change failing. Left optional, the patch stayed green,
+        # the binary shipped without the override, and the manifest claimed it.
+        step = outcome.step(name, expect=True)
         if target not in offered:
             step.note(f"model {target!r} not offered by this bundle; skipped")
             continue
-        info = next((a for a in discover_agents(output) if a.name == agent), None)
-        if info is None:
-            step.note(f"no built-in agent {agent!r} in this bundle; skipped")
+        agent = found.get(name)
+        if agent is None:
+            step.note(f"no built-in agent {name!r} in this bundle; skipped")
             continue
 
         step.candidates += 1
-        if info.effective_model == target:
-            # Already the desired model. Credited as landed because the step is
-            # judged on what it achieved, not on whether bytes moved -- the
-            # definition carries the chosen model either way (docs/PLAYBOOK.md).
-            step.applied += 1
-            continue
-        if info.model is None:
-            output = splice(
-                output, info.insert_at, info.insert_at, f'model:"{target}",'
-            )
-        else:
-            output = splice(
-                output, info.model_start, info.model_start + len(info.model), target
-            )
         step.applied += 1
+        if agent.effective_model == target:
+            # Already the desired model. Credited as landed because the step is
+            # judged on what it achieved, not on whether bytes moved.
+            continue
+        if agent.model_node is None:
+            edits.append(Edit.before(agent.anchor, f'{_MODEL}:"{target}",'))
+        else:
+            edits.append(Edit.replace(agent.model_node, f'"{target}"'))
 
-    # Re-resolved after the definition rewrites above, so the offsets are live.
-    # Later helpers first: neutralising one changes the length of the source.
-    pinned_agents = bypassed_agents(output)
-    if not pinned_agents:
+    bypasses = bypassed_agents(source, agents)
+    if not bypasses:
         # No helper found means either upstream stopped pinning an agent or the
-        # head drifted -- and we cannot tell which, because the head is what
+        # guard drifted -- and we cannot tell which, because the guard is what
         # names the agent. A drifted *body* is loud (the step below fails); this
         # is the same failure one level up, where there is no step to fail, so
         # the note is the only thing standing between a dead override and a
@@ -363,12 +519,39 @@ def _subagent_models(content: str, options: Options, outcome: Outcome) -> str:
             "no model-bypass helper found; if this build still pins an agent, "
             "its override is inert"
         )
-    for pinned, at in reversed(pinned_agents):
-        if pinned in options.subagent_models:
-            step = outcome.step(f"bypass:{pinned}", expect=True)
-            output = _neutralize_bypass(output, at, step)
+    for bypass in bypasses:
+        if bypass.agent not in options.subagent_models:
+            continue
+        step = outcome.step(f"bypass:{bypass.agent}", expect=True)
+        step.candidates += 1
+        step.applied += 1
+        edits.append(
+            Edit.replace(bypass.body, f"{{return {bypass.definition}.{_MODEL}}}")
+        )
 
-    return output
+    return source.apply(edits)
+
+
+def _pins_from(value: object) -> dict[str, str]:
+    """A subagent-pin map, keeping only the ``str -> str`` pairs a store held."""
+    if not isinstance(value, dict):
+        return {}
+    return {a: m for a, m in value.items() if isinstance(a, str) and isinstance(m, str)}
+
+
+#: The subagent-model overrides live under ``models`` in the manifest and
+#: ``subagent_models`` on the cache and ``Options`` -- the divergent spelling
+#: this declaration keeps in one place.
+_SUBAGENT_SETTING = Setting(
+    manifest_key="models",
+    recorded=lambda o: bool(o.subagent_models),
+    to_manifest=lambda o: o.subagent_models,
+    from_manifest=lambda o, v: setattr(o, "subagent_models", _pins_from(v)),
+    to_cache=lambda o: {"subagent_models": o.subagent_models},
+    from_cache=lambda o, c: setattr(
+        o, "subagent_models", _pins_from(c.get("subagent_models"))
+    ),
+)
 
 
 PATCHES = [
@@ -378,7 +561,7 @@ PATCHES = [
         summary="Show a subagent's Prompt block during normal use, not only in transcript mode.",
         group=GROUP_OUTPUT,
         fn=_subagent_prompt,
-        anchors=('"Backgrounded agent"', 'action:"app:toggleTranscript"'),
+        anchors=(_BACKGROUNDED, f"{_TRANSCRIPT_MODE}:", f"{_PROMPT}:"),
     ),
     Patch(
         id="subagent-models",
@@ -388,6 +571,7 @@ PATCHES = [
         fn=_subagent_models,
         default=False,
         option="--model",
-        anchors=('agentType:"', "Optional model override"),
+        anchors=(f"{_AGENT_TYPE}:", MODEL_DESCRIPTION, _INHERIT_LITERAL),
+        setting=_SUBAGENT_SETTING,
     ),
 ]

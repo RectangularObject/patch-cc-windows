@@ -1,33 +1,27 @@
 """Patch framework: how a single rewrite of the bundle is described and run.
 
-Matcher rules, learned the hard way upstream (see docs/PLAYBOOK.md):
+One rule locates everything here (docs/PLAYBOOK.md):
 
-* Never anchor on minified locals (``A_``, ``mET``, ``wg6``); they are
-  regenerated on every upstream build.
-* Anchor on string literals, ``case`` labels, prop names, or control-flow shape.
-* When upstream ships several shapes, add a second narrow branch rather than
-  widening one regex until it over-matches.
+    Find by the name upstream's authors wrote. Edit the grammar node.
+    Never describe the syntax in between.
 
-Porting rules, for anyone translating more of upstream's JS:
-
-* JS ``.replace(re, fn)`` without ``/g`` replaces **once** -- that is
-  ``re.sub(..., count=1)``. Python's default replaces every occurrence.
-* JS ``.replace("a", "b")`` on plain strings also replaces once --
-  ``str.replace(a, b, 1)``.
-* Compile with :data:`re.ASCII` so ``\\w`` stays ASCII as it is in JS.
-* Always pass a *function* to :func:`re.sub`; a string template would treat
-  backslashes in the replacement as escapes.
+The names -- property names, ``case`` labels, string literals, the API's own
+vocabulary -- are what a build keeps. The grammar is what gives an edit its
+boundaries. Everything else in a minified bundle (local identifiers, statement
+order, comma-fusion versus separate statements, braces around a single
+statement, whether a helper was extracted) is regenerated on every build, and
+:mod:`patch_cc.js` makes it invisible rather than obligatory.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..codex import DEFAULT_PORT
+from ..js import Source
 
 if TYPE_CHECKING:
     from ..codex.models import CodexModel
@@ -105,6 +99,9 @@ class Outcome:
     * ``candidates == 0`` -- the anchor is gone. A real regression.
     * ``candidates > 0, applied == 0`` -- shape found, rewrite was a no-op.
       Usually means already patched, not broken.
+
+    Both are read for the verdict (:attr:`landed`), because a report that keeps
+    two numbers and judges on one has the second for decoration.
     """
 
     candidates: int = 0
@@ -114,15 +111,26 @@ class Outcome:
     steps: dict[str, Outcome] = field(default_factory=dict)
     #: What this sub-step's absence means (set via :meth:`step`). ``False`` --
     #: a shape some builds simply lack; ``True`` -- the patch is broken without
-    #: it; a string -- name of a group of which at least one member must land.
-    expect: bool | str = False
+    #: it.
+    expect: bool = False
     #: Set when the patch raised. A patch that threw half-way applied whatever
     #: it had already done, so ``applied`` alone would read as success.
     error: str | None = None
 
     @property
     def landed(self) -> bool:
-        return self.applied > 0
+        """Did this find what it was looking for *and* change something?
+
+        Both counts, one verdict, because either alone is satisfiable by a
+        rewrite that achieved nothing. ``applied`` is what a matcher reports
+        about itself; ``candidates`` is what the *durable* witness reports --
+        the header name behind the read, the interpolation behind the
+        conditional -- and a patch that pays for one is paying to be told when
+        the witness goes. Judging on ``applied`` alone was how
+        `thinking-summaries` stayed green with its header renamed: every read
+        rewritten, and nothing left that those reads fed.
+        """
+        return self.candidates > 0 and self.applied > 0
 
     @property
     def health(self) -> str:
@@ -130,10 +138,21 @@ class Outcome:
 
         Every surface (apply report, doctor, menu) renders this same judgement,
         so none of them can disagree about whether a patch is fine.
+
+        ``partial`` is *some* of the work, not all of it: a sub-step found its
+        shape and failed to rewrite it (:meth:`missed_steps`), or the patch's own
+        rewrites covered fewer sites than it found (``applied < candidates``).
+        The two-number table had no row for that middle state, so a patch with
+        two welcome lines and one of them reshaped read ``cand=2 applied=1`` and
+        called itself ``ok`` -- one line unpatched under a green tick. A rewrite
+        that *undercounts* its witness (``applied > candidates``, the header
+        behind more reads than headers) is not drift and stays ``ok``.
         """
         if not self.landed or self.failures():
             return "broken"
-        return "partial" if self.missed_steps() else "ok"
+        if self.missed_steps() or self.applied < self.candidates:
+            return "partial"
+        return "ok"
 
     def failures(self) -> list[str]:
         """Every reason this patch is broken, as sentences.
@@ -148,7 +167,7 @@ class Outcome:
     def note(self, message: str) -> None:
         self.notes.append(message)
 
-    def step(self, name: str, expect: bool | str = False) -> Outcome:
+    def step(self, name: str, expect: bool = False) -> Outcome:
         """Get (or create) a named sub-outcome.
 
         A single scalar count cannot distinguish "all twelve rewrites landed"
@@ -158,8 +177,7 @@ class Outcome:
         missed".
         """
         sub = self.steps.setdefault(name, Outcome())
-        if expect and not sub.expect:
-            sub.expect = expect
+        sub.expect = sub.expect or expect
         return sub
 
     def finalize(self) -> Outcome:
@@ -170,18 +188,19 @@ class Outcome:
         return self
 
     def missed_steps(self) -> list[str]:
-        """Sub-steps whose shape was *found* but which failed to rewrite.
+        """Sub-steps whose shape was *found* but which some site failed to rewrite.
 
         A step that matched nothing (``candidates == 0``) is usually a shape
         that simply is not on this build -- most patches carry several
         mutually-exclusive version variants -- so it is reported separately by
-        :meth:`absent_steps`, not here. A step that found candidates yet applied
-        none is the genuine concern.
+        :meth:`absent_steps`, not here. A step that found more candidates than it
+        rewrote is the genuine concern: that covers a step that rewrote *none*
+        (``applied == 0``) and one that rewrote *some* (``0 < applied <
+        candidates``, partial drift) alike, where reading only ``landed``
+        (``applied > 0``) called the partial case fully applied.
         """
         return [
-            name
-            for name, sub in self.steps.items()
-            if sub.candidates > 0 and not sub.landed
+            name for name, sub in self.steps.items() if sub.candidates > sub.applied
         ]
 
     def absent_steps(self) -> list[str]:
@@ -193,43 +212,98 @@ class Outcome:
         return [
             name
             for name, sub in self.steps.items()
-            if sub.candidates == 0 and sub.expect is not True
+            if sub.candidates == 0 and not sub.expect
         ]
 
     def unmet(self) -> list[str]:
         """Expectations this run failed to meet -- each one a regression.
 
-        Absence alone cannot be judged step by step: a missing reducer variant
-        is routine while a missing group-routing rewrite silently kills the
-        whole patch. The ``expect`` marks make that judgement explicit -- a
-        required step must land, and each variant group must land at least one
-        member -- so "green but functionally dead" cannot happen.
-
-        Groups ask for *at least* one rather than exactly one: variants are
-        alternates in practice, but a transitional build carrying two reducers
-        would have both correctly patched, and that is no reason to cry wolf.
+        Absence alone cannot be judged step by step: a reducer arm this build
+        folded away is routine while a missing group-routing rewrite silently
+        kills the whole patch. The ``expect`` marks make that judgement
+        explicit -- a required step must land -- so "green but functionally
+        dead" cannot happen.
         """
         failures = []
-        groups: dict[str, list[str]] = {}
         for name, sub in self.steps.items():
-            if sub.expect is True:
-                if not sub.landed:
-                    detail = (
-                        "found nothing"
-                        if sub.candidates == 0
-                        else f"matched {sub.candidates} but rewrote none"
-                    )
-                    failures.append(f"required step {name} {detail}")
-            elif isinstance(sub.expect, str):
-                groups.setdefault(sub.expect, []).append(name)
-
-        for label, names in groups.items():
-            if not any(self.steps[name].landed for name in names):
-                failures.append(f"no {label} variant landed (tried {', '.join(names)})")
+            if sub.expect and not sub.landed:
+                detail = (
+                    "found nothing"
+                    if sub.candidates == 0
+                    else f"matched {sub.candidates} but rewrote none"
+                )
+                failures.append(f"required step {name} {detail}")
         return failures
 
 
-PatchFn = Callable[[str, Options, Outcome], str]
+PatchFn = Callable[[Source, Options, Outcome], Source]
+
+
+@dataclass(frozen=True, slots=True)
+class Setting:
+    """Where a configurable patch's chosen value lives *outside* the binary.
+
+    A configurable patch carries a fact that has to survive in two stores with
+    different jobs: the **manifest** records what is *in the binary* (read back
+    by ``status`` and to pre-select the menu), the **cache** records what was
+    *asked for* (replayed by ``apply --from-cache`` and the menu's pre-fill).
+    Those are usually the same value, but under keys that -- for history -- can
+    differ (`org` in the manifest, `org_label` in the cache and on `Options`),
+    and for Codex they differ in *shape* (the manifest nests a port; the cache
+    keeps two flat keys).
+
+    Adding one such patch used to mean spelling that in eight files -- the two
+    stores, both directions each, plus the field lists -- and the vocabularies
+    had already drifted apart, with nothing failing loudly when a home was
+    missed. So the patch declares it here, once, and the two stores read it.
+    Rendering (the report line, the list hint, the menu row) is left to each
+    surface: they differ on purpose -- one shows ``a=b, c=d``, another ``2
+    overrides`` -- and are display, where a slip is seen rather than silently
+    stored.
+
+    Every hook takes/updates an :class:`Options`, so the manifest and the cache
+    round-trip through the same field the patch already reads at bake time.
+    """
+
+    #: The key this value takes in the manifest JSON (`brand`, `suffix`, `org`,
+    #: `models`, `codex`).
+    manifest_key: str
+    #: Is there a value worth recording? (`brand` differs from the default, the
+    #: override dict is non-empty, ...) -- gates both stores.
+    recorded: Callable[[Options], bool]
+    #: The value to write under ``manifest_key``.
+    to_manifest: Callable[[Options], object]
+    #: Apply a manifest value back onto an ``Options`` (menu pre-select).
+    from_manifest: Callable[[Options, object], None]
+    #: The flat key(s) this value takes in the cache, and their values.
+    to_cache: Callable[[Options], dict[str, object]]
+    #: Apply the cache dict's key(s) back onto an ``Options`` (replay/pre-fill).
+    from_cache: Callable[[Options, dict[str, object]], None]
+
+
+def string_setting(
+    manifest_key: str, cache_key: str, field: str, default: str, *, always: bool = False
+) -> Setting:
+    """A :class:`Setting` for a plain string value under (possibly different) keys.
+
+    Covers the three chrome settings, which differ only in their keys and
+    default: ``brand`` (manifest and cache ``brand``), ``version_suffix``
+    (``suffix``), and ``org_label`` (manifest ``org``, cache ``org_label``).
+    ``always`` records even the empty value -- an emptied ``org-label`` *means*
+    "hide the segment", so unlike a blank brand it is a real recorded choice.
+    """
+
+    def parse(value: object) -> str:
+        return value if isinstance(value, str) and (value or always) else default
+
+    return Setting(
+        manifest_key=manifest_key,
+        recorded=lambda o: always or getattr(o, field) != default,
+        to_manifest=lambda o: getattr(o, field),
+        from_manifest=lambda o, v: setattr(o, field, parse(v)),
+        to_cache=lambda o: {cache_key: getattr(o, field)},
+        from_cache=lambda o, c: setattr(o, field, parse(c.get(cache_key))),
+    )
 
 
 @dataclass(slots=True)
@@ -247,59 +321,33 @@ class Patch:
     option: str | None = None
     #: Anchors to report on when this patch stops matching.
     anchors: tuple[str, ...] = ()
+    #: How this patch's configurable value is stored, for the patches that carry
+    #: one; ``None`` for a plain toggle. The one home for its manifest and cache
+    #: keys, so the two stores cannot drift and adding a configurable patch is
+    #: one declaration rather than eight edits.
+    setting: Setting | None = None
 
-    def run(self, content: str, options: Options) -> tuple[str, Outcome]:
+    def run(self, source: Source, options: Options) -> tuple[Source, Outcome]:
         """Run this patch, surviving its own failure.
 
-        A raising patch keeps the *input* content -- its partial rewrites are
-        discarded with the return value -- but the counts it had already
-        recorded live on in ``outcome``, so the error is recorded explicitly
-        rather than left to be inferred from a number that says success.
+        A raising patch keeps the *input* source -- a `Source` is never mutated,
+        so partial rewrites are discarded with the return value -- but the
+        counts it had already recorded live on in ``outcome``, so the error is
+        recorded explicitly rather than left to be inferred from a number that
+        says success.
+
+        A rewrite that leaves the bundle unparseable raises out of
+        :meth:`Source.apply` and lands here, which is the whole reason the gate
+        sits at the edit rather than at the end of the run: the patch that
+        produced rubble is named, dropped from the set, and the rest still
+        apply.
         """
         outcome = Outcome()
         try:
-            content = self.fn(content, options, outcome)
+            source = self.fn(source, options, outcome)
         except Exception as exc:  # noqa: BLE001 - one bad patch must not abort the run
             outcome.error = f"raised {type(exc).__name__}: {exc}"
-        return content, outcome.finalize()
-
-
-def compile_js(pattern: str, flags: int = 0) -> re.Pattern[str]:
-    """Compile a matcher with JS-compatible ``\\w`` semantics."""
-    return re.compile(pattern, flags | re.ASCII)
-
-
-# Matches a minified identifier, the JS `[A-Za-z_$][\w$]*` idiom.
-IDENT = r"[A-Za-z_$][\w$]*"
-
-#: From a schema's property name to the *opening* of the array literal it is
-#: built from -- the ``([`` included, so a site composes this as
-#: ``prop:{ARRAY_CALL}`` and never spells the call open itself.
-#:
-#: Whatever expression the build reaches the factory through is skipped
-#: unmodelled, because the callee is minifier noise that churns every few
-#: releases (``E.enum(`` ... ``w.enum(`` ... ``Ir(`` for one unchanged schema).
-#: Lazy but not unbounded: ``[^;{}]`` cannot cross a statement or block edge,
-#: and the spans it actually spends are 47-51 and 88-92 characters on every
-#: build we hold. What the surviving anchors must carry instead -- which is a
-#: debt this raises, per site: docs/PLAYBOOK.md.
-ARRAY_CALL = r"[^;{}]*?\(\["
-
-
-def switch_case_end(content: str, start: int) -> int:
-    """End offset of a ``switch`` arm beginning at ``start``.
-
-    Upstream's arms end at the next ``case"`` or ``default:``, whichever comes
-    first. Mirrors the scan every case-based patch does.
-    """
-    nxt_case = content.find('case"', start)
-    nxt_default = content.find("default:", start)
-    ends = [i for i in (nxt_case, nxt_default) if i != -1]
-    return min(ends) if ends else len(content)
-
-
-def splice(content: str, start: int, end: int, replacement: str) -> str:
-    return content[:start] + replacement + content[end:]
+        return source, outcome.finalize()
 
 
 def js_string(value: str) -> str:

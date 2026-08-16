@@ -55,7 +55,7 @@ from .patches import (
     derived_brand,
 )
 from .patches.agents import INHERIT, BuiltinAgent, discover_agents, discover_models
-from .ui import MARKS, applied_value, console, err, findings, gateway_note
+from .ui import MARKS, applied_value, console, err, findings, gateway_note, verdicts
 
 if TYPE_CHECKING:
     from .doctor import DryRun, Status
@@ -195,35 +195,20 @@ class MenuModel:
         """Manifest > cached last selection > defaults."""
         manifest = self.status.manifest
         if manifest:
-            codex = manifest.get("codex")
-            codex = codex if isinstance(codex, dict) else {}
-            port = codex.get("port")
-            org = manifest.get("org")
             seed = cache.Selection()
             seed.patches = [
                 p for p in manifest.get("patches", []) if isinstance(p, str)
             ] or seed.patches
-            seed.options = Options(
-                brand=manifest.get("brand") or DEFAULT_BRAND,
-                version_suffix=manifest.get("suffix") or DEFAULT_SUFFIX,
-                # `or ""` would also be right, but only by luck: "" (hidden) is
-                # a meaningful manifest value, unlike an absent brand/suffix.
-                org_label=org if isinstance(org, str) else "",
-                subagent_models={
-                    a: m
-                    for a, m in (manifest.get("models") or {}).items()
-                    if isinstance(a, str) and isinstance(m, str)
-                },
-                # Ids, which is all the manifest records: what a model is called
-                # and how wide its context is belong to your plan, and are asked
-                # for again at the moment of baking (`_apply`).
-                codex_models=[
-                    CodexModel(i)
-                    for i in codex.get("models") or []
-                    if isinstance(i, str) and i
-                ],
-                codex_port=port if is_valid_port(port) else DEFAULT_PORT,
-            )
+            # Each configurable patch reads its own value back out of the manifest
+            # it wrote (`Patch.setting`), so the binary pre-selects the menu
+            # through the one home the manifest was written through -- a key the
+            # binary does not carry simply leaves that setting at its default.
+            options = Options()
+            for patch in ALL_PATCHES:
+                setting = patch.setting
+                if setting is not None and setting.manifest_key in manifest:
+                    setting.from_manifest(options, manifest[setting.manifest_key])
+            seed.options = options
             return seed
         return cache.load()
 
@@ -1123,6 +1108,17 @@ class MenuApp:
     def _start_doctor(self) -> None:
         from . import doctor
 
+        # Matcher health needs a *clean* bundle. When the installed binary is
+        # patched and no backup exists, `pristine` is that patched bundle -- our
+        # own edits removed the anchors the matchers look for, so every one would
+        # read broken on a healthy build, under a message promising a clean one.
+        # The CLI refuses this (cli._doctor_target); so does the menu.
+        if patcher.is_patched(self.model.pristine.source):
+            self.flash = (
+                "installed binary is patched and no clean backup exists — "
+                "restore first to check matcher health"
+            )
+            return
         self._start_worker(
             "doctor",
             "Checking every patch against a clean bundle …",
@@ -1182,7 +1178,10 @@ class MenuApp:
             self.view = "report"
         elif kind == "doctor":
             self.doctor_result = payload
-            self.exit_code = 1 if payload.broken else 0
+            # `clean`, not `broken`: a partially-drifted patch or a bundle that
+            # will not parse is not green, and reading `broken` alone here is how
+            # the menu once exited 0 where the CLI exited 1 on the same build.
+            self.exit_code = 0 if payload.clean else 1
             self.view = "doctor"
         elif kind == "restore":
             if error is not None:
@@ -1537,6 +1536,12 @@ class MenuApp:
             Text(f"  agents  {', '.join(a.name for a in result.agents)}", style="dim")
         )
         lines.append(Text(f"  models  {', '.join(result.models)}", style="dim"))
+        # The same verdict the CLI reaches -- the parse defect, the drift note,
+        # the all-clear -- drawn from the one home so the two surfaces agree.
+        summary = verdicts(result)
+        if summary:
+            lines.append(Text(""))
+            lines += [Text(f"  {text}", style=style) for style, text in summary]
         return lines, None
 
 

@@ -1,63 +1,50 @@
 """Live (streaming) thinking.
 
-This is the single most fragile patch in the set: upstream has reshaped the
-stream reducer at least three times, and most of their commit traffic lands
-here. Two structural choices follow from that:
+This is the patch upstream disturbs most: the stream reducer has been reshaped
+at least three times and most of their commit traffic lands in it. Two
+structural choices follow.
 
-1. It is built from ~20 **named steps**, each recording its own outcome. A
-   scalar hit count cannot tell "everything landed" from "half of it silently
-   drifted", which is precisely how this patch hides its own regressions.
-2. Steps share discovered identifiers through :class:`Discovery` rather than
-   re-deriving them, and every step tolerates its own failure so one drifted
-   shape does not take the rest down with it.
+1. It is built from **named steps**, each recording its own outcome. A scalar
+   hit count cannot tell "everything landed" from "half of it silently
+   drifted", which is precisely how this patch used to hide its own regressions.
+2. Every rewrite is either an *insertion at a dispatch point* or a replacement
+   of one grammar node. The reducer's arm bodies -- upstream's busiest surface,
+   where 2.1.226 threaded a progress flag through five arms in a single release
+   -- are never matched at all. The dispatch strings (``"thinking_delta"``,
+   ``"message_stop"``) are the API's own vocabulary and do not churn.
 
 Tolerating failure is not the same as ignoring it: the steps the feature cannot
-live without are marked *required*, and the two reducer shapes form a group of
-which at least one must land. Everything else -- the legacy cleanups upstream has
-since dropped -- stays optional, so `doctor` distinguishes "this build lacks that
-shape" from "live thinking is dead".
+live without are marked *required*, so `doctor` distinguishes "this build lacks
+that shape" from "live thinking is dead".
 """
 
 from __future__ import annotations
 
-import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
-from .base import GROUP_OUTPUT, IDENT, Options, Outcome, Patch, compile_js, splice
-
-#: The mutually-exclusive reducer variants. On any one build one of them lands;
-#: none landing means upstream shipped a new head shape and live thinking is dead.
-REDUCER = "reducer"
+from .. import js
+from ..js import Edit, Source
+from .base import GROUP_OUTPUT, Options, Outcome, Patch
 
 #: The two rewrites that *are* live thinking: one creates the virtual message
 #: when a thinking block opens, the other appends each delta to it. Recognising
-#: a reducer proves nothing on its own -- a variant whose incidental rewrites
+#: a reducer proves nothing on its own -- a build whose incidental rewrites
 #: (threading the setter, clearing state on message_stop) landed while these two
-#: drifted reports plenty of hits and streams nothing. Each is checked by the
-#: marker its own builder emits, so the test is "did the state update reach the
-#: bundle", not "did some literal match".
+#: drifted reports plenty of hits and streams nothing. Each is credited only
+#: when its marker is found in the bundle the run produced, so the test is "did
+#: the state update reach the bundle", not "did some matcher match".
 _CORE_UPDATES = (
     ("block-start", "__cc_streamingThinkingMessage="),
     ("thinking-delta", "__cc_nextStreamingThinkingDelta"),
 )
 
 
-def _record_core_updates(segment: str, outcome: Outcome) -> None:
-    """Credit the core state updates found in a rewritten reducer body."""
-    for name, marker in _CORE_UPDATES:
-        if marker in segment:
-            step = outcome.step(name, expect=True)
-            step.candidates += 1
-            step.applied += 1
-
-
 @dataclass(slots=True)
 class Discovery:
     """Identifiers found in one step and consumed by later ones."""
 
-    streaming_var: str | None = None
     create_message_helper: str | None = None
-    transcript_var: str | None = None
 
 
 # --------------------------------------------------------------- JS builders
@@ -122,701 +109,900 @@ def _delta(event: str, setter: str, helper: str) -> str:
     )
 
 
-# ------------------------------------------------------------------- step 1
+# ------------------------------------------------------------ prop threading
 
-_MEMO_CACHE = compile_js(
-    rf"if\(({IDENT})\[(\d+)\]!==({IDENT})\|\|\1\[(\d+)\]!==({IDENT})\|\|\1\[(\d+)\]!==({IDENT})\)"
-    rf"([\s\S]{{0,700}}?thinking:\5\.thinking[\s\S]{{0,700}}?)"
-    rf"\1\[\2\]=\3,\1\[\4\]=\5,\1\[\6\]=\7,(\1\[\d+\]={IDENT};)"
-)
+#: What a conversation render is *made of*, whatever this build calls the
+#: component or lists the props in. Membership, never order: upstream reorders
+#: props freely and inserts new ones between them, and neither is a fact about a
+#: set. Two regexes once differed only in the order two call sites listed the
+#: same props, and 2.1.229 killed both at once by inserting
+#: `onRateLimitAutoQueueContinue:` between two of them.
+_CONVERSATION = ("conversationId", "messages")
+
+_AGENT_DEFINITIONS = "agentDefinitions"
+_STREAMING = "streamingThinking"
+_SETTER = "onStreamingThinking"
+_TRANSCRIPT_SIGNATURE = ("messages", "streamingToolUses", "showAllInTranscript")
+_INJECTED = "__cc_streamingThinking"
 
 
-def _step_memo_cache(content: str, outcome: Outcome) -> str:
-    """Key the memo cache on `thinking?.thinking`, not the wrapper object.
+def _outermost(scope: js.Node) -> bool:
+    """Is this the module wrapper -- the one scope not worth searching?
 
-    Without this the comparator sees the same object identity across deltas and
-    never re-renders while text is still streaming in.
+    The bundle is one enormous top-level function. Everything below it is a
+    real lexical scope worth asking a question of; it is not, and walking its
+    twelve million nodes to find out is the difference between a search that
+    takes microseconds and one that does not finish.
     """
-    step = outcome.step("memo-cache")
-
-    def rewrite(match: re.Match[str]) -> str:
-        cache, i1, v1, i2, v2, i3, v3, middle, tail = match.groups()
-        step.candidates += 1
-        if f"{v2}?.thinking" in match.group(0):
-            return match.group(0)
-        step.applied += 1
-        return (
-            f"if({cache}[{i1}]!=={v1}||{cache}[{i2}]!=={v2}?.thinking||{cache}[{i3}]!=={v3})"
-            f"{middle}{cache}[{i1}]={v1},{cache}[{i2}]={v2}?.thinking,{cache}[{i3}]={v3},{tail}"
-        )
-
-    return _MEMO_CACHE.sub(rewrite, content)
+    return js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS) is None
 
 
-# ------------------------------------------------------------------- step 2
+def _conversation_renders(source: Source) -> list[js.Node]:
+    """Every props bag that is a conversation render, as the object it is.
 
-#: How far back the state back-scan looks for the setter's ``useState(null)``.
-#: Deliberately *not* widened past the worst observed reach (35k on 2.1.217) by
-#: much: minified setter names repeat across scopes, so a wider window trades a
-#: loud discovery failure -- `prop-threading` is required, so it stops the patch
-#: -- for the chance of silently binding an unrelated same-named state. The step
-#: notes the distance actually reached, which is the early warning instead.
-_DISCOVER_WINDOW = 50_000
+    ``agentDefinitions`` is both a witness and the insertion point -- a new
+    property immediately before an existing one is valid in any object literal
+    -- so nothing here computes where the bag *ends*. That question used to be
+    the whole difficulty: delimiting an object literal in minified JS means
+    telling a regex literal from division, and a hand-rolled scanner that
+    guesses returns a `}` that is merely wrong.
 
-_HIDE_PAST = compile_js(rf"hidePastThinking:!0,streamingThinking:({IDENT})")
-_ON_STREAMING = compile_js(rf"onStreamingThinking:({IDENT})")
-_CREATE_ELEMENT_CALL = compile_js(rf"createElement\(({IDENT}),\{{([^{{}}]*?)\}}\)")
-_PROMPT_RENDERER = compile_js(
-    rf"createElement\(({IDENT}),\{{([\s\S]{{0,2000}}?placeholderElement:[\s\S]{{0,2000}}?"
-    rf"agentDefinitions:[^}}]*?onOpenRateLimitOptions:[^}}]*?isLoading:)([^,}}]+)"
-    rf"(,streamingText:[^}}]*?(?:showThinkingHint:[^}}]*?)?isBriefOnly:[^}}]*?)\}}\)"
-)
-_JSX_MAIN_PROPS = compile_js(
-    r"(screen:[^,}]+,streamingToolUses:[^,}]+,)"
-    r"(showAllInTranscript:[^,}]+,agentDefinitions:[^,}]+,onOpenRateLimitOptions:[^,}]+,isLoading:[^,}]+)"
-)
-_JSX_TRANSCRIPT_PROPS = compile_js(
-    r"(screen:[^,}]+,agentDefinitions:[^,}]+,streamingToolUses:[^,}]+,)"
-    r"(showAllInTranscript:[^,}]+,onOpenRateLimitOptions:[^,}]+,isLoading:[^,}]+)"
-)
-
-
-def _discover_streaming_var(content: str, found: Discovery, outcome: Outcome) -> None:
-    """Find the state variable holding live thinking.
-
-    2.1.216 no longer ships `hidePastThinking`, so the primary anchor is already
-    dead and we rely on the `onStreamingThinking` -> `useState(null)` back-scan.
-    Losing that fallback too would leave this patch with nothing, so the scan
-    records how far back it had to reach: that distance against
-    :data:`_DISCOVER_WINDOW` is the warning that the next hoist will break it.
+    Being an ``object`` and not an ``object_pattern`` is what separates a prop
+    being *passed* from one being *received*; inserting into the latter would
+    rebind a local. The regex spelled that as a call-opening it had to match.
     """
-    primary = _HIDE_PAST.search(content)
-    if primary:
-        found.streaming_var = primary.group(1)
-        return
-
-    step = outcome.step("discover")
-    step.note("hidePastThinking anchor gone; using useState back-scan")
-    for match in _ON_STREAMING.finditer(content):
-        setter = match.group(1)
-        start = max(0, match.start() - _DISCOVER_WINDOW)
-        window = content[start : match.start()]
-        state = compile_js(
-            rf"\[({IDENT}),{re.escape(setter)}\]={IDENT}\.useState\(null\)"
-        )
-        candidates = list(state.finditer(window))
-        if candidates:
-            found.streaming_var = candidates[-1].group(1)
-            reach = len(window) - candidates[-1].start()
-            step.note(f"resolved {reach:,} chars back of {_DISCOVER_WINDOW:,}")
-            if len(candidates) > 1:
-                # Nearest wins, which is a guess the moment there is more than
-                # one. Both shipped builds have exactly one state destructured
-                # to this setter in the *whole* bundle; a second would mean the
-                # pairing by setter name has stopped being an identification.
-                step.note(
-                    f"{len(candidates)} states share this setter; took the nearest"
-                )
-            return
+    found = []
+    for node in source.find(_AGENT_DEFINITIONS):
+        pair = js.named(node)
+        if pair is None:
+            continue
+        bag = js.owner(pair)
+        if bag is None or bag.type != "object":
+            continue
+        if js.carries(bag, *_CONVERSATION):
+            found.append(bag)
+    return found
 
 
-def _step_prop_threading(content: str, found: Discovery, outcome: Outcome) -> str:
+def _bound_in_scope(site: js.Node, prop: str) -> str | None:
+    """The local a scope binds this prop to, resolved from the site outwards.
+
+    Which is how a name spliced into a site is a name that site can see, rather
+    than the last one some other scope happened to bind under the same prop:
+    the transcript renderer's own signature is what its own memo reads, and a
+    second renderer carrying the same four props donated its local to the first
+    one's memo when this was one variable discovered once and used everywhere.
+    """
+    scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
+    while scope is not None:
+        bound = js.parameters(scope).get(prop)
+        if bound is not None:
+            return js.text(bound)
+        scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+    return None
+
+
+def _state_in_scope(site: js.Node) -> str | None:
+    """The live-thinking state variable visible at this render, if any.
+
+    Resolved from the site outwards, so what is threaded is a variable actually
+    in scope where it is threaded -- the one thing the old matcher named as
+    owed and could not discharge without a parse. It mattered: on 2.1.232 the
+    two conversation renders sit in *different* top-level components, only one
+    of which declares the state, and threading a single bundle-wide answer into
+    both put an out-of-scope identifier into a shipped binary. It parses, so no
+    gate could see it; it throws when that component renders.
+
+    The state is identified by its setter: the scope that holds live thinking
+    is the scope that hands ``onStreamingThinking`` to the reducer.
+
+    Outwards is only half of lexical, and the half a subtree walk gets wrong:
+    the declaration has to be one this render can *see* (:func:`js.visible`),
+    which a nested function's is not and a block's own is not either. Threading
+    one anyway produced a binary that parsed and threw -- the same failure as
+    the bundle-wide answer this replaced, one door along -- and took the note
+    that says a render was skipped with it. The setter is the other question and
+    keeps the whole subtree: a scope may hand its setter to the reducer from
+    inside a callback, and that says nothing about where the state lives.
+
+    What the state is initialised to is not asked. ``useState(null)`` was the
+    spelling on every build in the corpus and ``useState(void 0)`` is the same
+    state, while the line below is the identity that matters: the pair whose
+    second name is the setter this scope hands the reducer *is* the live
+    thinking state, whatever produced it.
+    """
+    scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
+    while scope is not None and not _outermost(scope):
+        setters = {
+            js.text(js.binding(value))
+            for node in js.every(
+                scope,
+                lambda n: n.type == "property_identifier" and js.text(n) == _SETTER,
+            )
+            if (pair := js.named(node)) is not None
+            and (value := pair.child_by_field_name("value")) is not None
+        }
+        for declarator in js.every(scope, js.of_type("variable_declarator")):
+            name = declarator.child_by_field_name("name")
+            if name is None or name.type != "array_pattern":
+                continue
+            if not js.visible(declarator, site):
+                continue
+            bound = [js.text(child) for child in name.named_children]
+            if len(bound) == 2 and bound[1] in setters:
+                return bound[0]
+        scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+    return None
+
+
+def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
     """Pass the live-thinking state into the renderers that need it."""
     step = outcome.step("prop-threading", expect=True)
-    if found.streaming_var is None:
-        step.note("no streaming state variable found; skipped")
-        return content
-    var = found.streaming_var
+    edits = []
+    renders = _conversation_renders(source)
+    # Printed every run, green ones included: an early warning held back until
+    # something breaks arrives too late to be one.
+    step.note(f"{len(renders)} conversation render(s)")
 
-    def rewrite_create_element(match: re.Match[str]) -> str:
-        component, props = match.group(1), match.group(2)
-        required = (
-            "streamingToolUses:",
-            "toolJSX:",
-            "agentDefinitions:",
-            "onOpenRateLimitOptions:",
-            "conversationId:",
-            "isLoading:",
+    for bag in renders:
+        state = _state_in_scope(bag)
+        if state is None:
+            step.note("a conversation render has no live-thinking state in scope")
+            continue
+        step.candidates += 1
+        step.applied += 1
+        edits.append(
+            Edit.before(
+                js.entry(js.props(bag)[_AGENT_DEFINITIONS]), f"{_STREAMING}:{state},"
+            )
         )
-        forbidden = ("streamingThinking:", "hidePastThinking:")
-        if any(tok not in props for tok in required) or any(
-            t in props for t in forbidden
+    return source.apply(edits)
+
+
+# -------------------------------------------------------------- display mode
+
+#: The env var *name* is the witness; whatever expression reads it is
+#: upstream's to spell, and is never described here. Spelling such a path is
+#: what killed `org-label` on 2.1.228, and this is the same variable one
+#: migration behind.
+_DISABLE_THINKING = "CLAUDE_CODE_DISABLE_THINKING"
+_DISPLAY = "display"
+_SUMMARIZED = '"summarized"'
+
+
+def _defaulting(read: js.Node) -> js.Node:
+    """The value a `display` read stands for -- itself, or the ``??`` around it.
+
+    Two spellings of one value: a bare read, or a read upstream has already
+    given a fallback of its own. The coalesce is a node the grammar names,
+    where splitting the text on ``??`` was a claim about an operator free to
+    appear anywhere else in the expression -- and the same split then rebuilt
+    the replacement, so one stray ``??`` in front would have been silently
+    dropped from what we wrote back.
+    """
+    parent = read.parent
+    if parent is not None and parent.type == "binary_expression":
+        operator = parent.child_by_field_name("operator")
+        if (
+            operator is not None
+            and js.text(operator) == "??"
+            and parent.child_by_field_name("left") == read
         ):
-            return match.group(0)
-        step.candidates += 1
-        step.applied += 1
-        return f"createElement({component},{{{props},streamingThinking:{var}}})"
-
-    output = _CREATE_ELEMENT_CALL.sub(rewrite_create_element, content)
-
-    def rewrite_prompt(match: re.Match[str]) -> str:
-        if "streamingThinking:" in match.group(0):
-            return match.group(0)
-        component, before, is_loading, after = match.groups()
-        step.candidates += 1
-        step.applied += 1
-        return (
-            f"createElement({component},{{{before}{is_loading},"
-            f"streamingThinking:{var}{after}}})"
-        )
-
-    output = _PROMPT_RENDERER.sub(rewrite_prompt, output)
-
-    def inject(match: re.Match[str]) -> str:
-        if "streamingThinking:" in match.group(0):
-            return match.group(0)
-        step.candidates += 1
-        step.applied += 1
-        return f"{match.group(1)}streamingThinking:{var},{match.group(2)}"
-
-    output = _JSX_MAIN_PROPS.sub(inject, output)
-    return _JSX_TRANSCRIPT_PROPS.sub(inject, output)
+            return parent
+    return read
 
 
-# ------------------------------------------------------------------- step 3
+def _chooses(node: js.Node) -> bool:
+    """Is this the ``display`` read the request's thinking value is chosen from?
 
-_THINKING_DISPLAY = compile_js(
-    rf"({IDENT})=({IDENT})\.type!==\"disabled\"&&!({IDENT})"
-    rf"\(process\.env\.CLAUDE_CODE_DISABLE_THINKING\),({IDENT})=\1"
-    rf"(?:&&{IDENT}\(\)&&{IDENT}\({IDENT}\))?\?\2\.display(?:\?\?void 0)?:void 0,({IDENT})=void 0;"
-)
+    The read is the identity and :func:`_defaulting` is what the arm is, so the
+    property is a field of a member read rather than the tail of a spelling --
+    ``.display`` at the end of some text says nothing about what precedes it,
+    which is the half upstream regenerates every build.
+    """
+    if not js.reads(node, _DISPLAY):
+        return False
+    value = _defaulting(node)
+    chosen = value.parent
+    return (
+        chosen is not None
+        and chosen.type == "ternary_expression"
+        and chosen.child_by_field_name("consequence") == value
+        and (alternative := chosen.child_by_field_name("alternative")) is not None
+        and js.text(alternative) == "void 0"
+    )
 
-# 2.1.216 hoists the env check into its own variable and gates the display
-# value behind extra feature/model helpers. The helper chain is kept verbatim;
-# only the display expression gains the `??"summarized"` default.
-_THINKING_DISPLAY_2 = compile_js(
-    rf"({IDENT})=({IDENT})\(process\.env\.CLAUDE_CODE_DISABLE_THINKING\),"
-    rf"({IDENT})=({IDENT})\.type!==\"disabled\"&&!\1,"
-    rf"({IDENT})=\3((?:&&{IDENT}\((?:{IDENT})?\))*)\?\4\.display:void 0,"
-)
 
-
-def _step_display_mode(content: str, outcome: Outcome) -> str:
+def _step_display_mode(source: Source, outcome: Outcome) -> Source:
     """Default the thinking request to `summarized`.
 
     Without a display mode in the request the API streams signature-only (or
     late) thinking, so the live row starves -- worst on short thinks. Upstream
-    only requests summaries when the `showThinkingSummaries` setting is on;
+    only asks for summaries when the `showThinkingSummaries` setting is on;
     default it on instead.
+
+    Two shapes used to be spelled out here -- an inline env check, and the
+    2.1.216 form that hoists it into its own variable and gates the display
+    behind extra feature-helper calls. They are one edit: the display value
+    gains a default. Whatever guards reach it, and in whatever order the
+    declaration lists them, is untouched because it is never matched.
     """
     step = outcome.step("display-mode", expect=True)
+    edits = []
+    seen: set[int] = set()
 
-    def rewrite(match: re.Match[str]) -> str:
-        enabled, config, env_helper, display, request = match.groups()
-        step.candidates += 1
-        if 'display??"summarized"' in match.group(0):
-            return match.group(0)
-        step.applied += 1
-        return (
-            f'{enabled}={config}.type!=="disabled"&&!{env_helper}'
-            f"(process.env.CLAUDE_CODE_DISABLE_THINKING),"
-            f'{display}={enabled}?{config}.display??"summarized":void 0,{request}=void 0;'
-        )
-
-    output = _THINKING_DISPLAY.sub(rewrite, content)
-
-    def rewrite_hoisted(match: re.Match[str]) -> str:
-        env_var, env_helper, enabled, config, display, guards = match.groups()
-        step.candidates += 1
-        step.applied += 1
-        return (
-            f"{env_var}={env_helper}(process.env.CLAUDE_CODE_DISABLE_THINKING),"
-            f'{enabled}={config}.type!=="disabled"&&!{env_var},'
-            f'{display}={enabled}{guards}?{config}.display??"summarized":void 0,'
-        )
-
-    return _THINKING_DISPLAY_2.sub(rewrite_hoisted, output, count=1)
-
-
-# ------------------------------------------------------------------- step 4
-
-# The braces around the guarded call are optional *as a pair*: a bare `\}?` tail
-# would happily eat the enclosing block's closing brace on the unbraced shape and
-# the rewrite -- which emits its own -- would not put it back. Hence the
-# conditional: consume the closing brace only if the opening one was there.
-_ASSISTANT_THINKING = compile_js(
-    rf"let ({IDENT})=({IDENT})\.message\.content\.find\(\(({IDENT})\)=>"
-    rf'\3\.type==="thinking"\);if\(\1&&\1\.type==="thinking"\)(\{{)?({IDENT})'
-    rf"\?\.\(\(\)=>\(\{{thinking:\1\.thinking,isStreaming:!1,"
-    rf"streamingEndedAt:Date\.now\(\)\}}\)\)(?(4)\}})"
-)
-
-
-def _step_final_summary(content: str, outcome: Outcome) -> str:
-    """Include redacted thinking in the final assistant-message summary."""
-    step = outcome.step("final-summary")
-
-    def rewrite(match: re.Match[str]) -> str:
-        block, message, item, _brace, setter = match.groups()
-        step.candidates += 1
-        step.applied += 1
-        return (
-            f"let {block}={message}.message.content.find(({item})=>"
-            f'{item}.type==="thinking"||{item}.type==="redacted_thinking");'
-            f'if({block}&&({block}.type==="thinking"||{block}.type==="redacted_thinking"))'
-            f'{setter}?.(()=>({{thinking:{block}.type==="thinking"'
-            f'?{block}.thinking:{block}.data??"",isStreaming:!1,'
-            f"streamingEndedAt:Date.now()}}))"
-        )
-
-    return _ASSISTANT_THINKING.sub(rewrite, content)
-
-
-# ------------------------------------------------------------------- step 5
-
-_MEMO_ASSIGN = compile_js(rf"({IDENT})=({IDENT})\.memo\(({IDENT}),({IDENT})\)")
-
-
-def _step_memo_removal(content: str, outcome: Outcome) -> str:
-    """Unwrap the message-row memo whose comparator suppresses live updates."""
-    step = outcome.step("memo-removal")
-    output = content
-    pos = 0
-    while True:
-        match = _MEMO_ASSIGN.search(output, pos)
-        if not match:
-            break
-        lhs, _ns, render_fn, comparator = match.groups()
-        pos = match.end()
-
-        start = output.find(f"function {comparator}(")
-        if start == -1:
+    for node in source.find(_DISABLE_THINKING):
+        declaration = js.up(node, "lexical_declaration", "variable_declaration")
+        if declaration is None or declaration.start_byte in seen:
             continue
-        body = output[start : start + 2200]
-        if not all(
-            tok in body
-            for tok in (
-                ".screen!==",
-                ".columns!==",
-                ".lastThinkingBlockId",
-                ".streamingToolUseIDs",
-            )
-        ):
+        # The value itself, not the ternary that chooses it: what is edited is
+        # what identified it, so there is no second reach for the same child.
+        display = js.first(declaration, _chooses)
+        if display is None:
             continue
-
-        step.candidates += 1
-        replacement = f"{lhs}={render_fn}"
-        if replacement != match.group(0):
-            output = splice(output, match.start(), match.end(), replacement)
-            step.applied += 1
-            pos = match.start() + len(replacement)
-    return output
-
-
-# ------------------------------------------------------------------- step 6
-
-_LINGER_LABEL = compile_js(
-    rf"({IDENT}):\{{if\(!({IDENT})\)\{{({IDENT})=!1;break \1\}}"
-    rf"if\(\2\.isStreaming\)\{{\3=!0;break \1\}}"
-    rf"if\(\2\.streamingEndedAt\)\{{\3=Date\.now\(\)-\2\.streamingEndedAt<30000;break \1\}}"
-    rf"\3=!1\}}let ({IDENT})=\3"
-)
-_LINGER_MEMO = compile_js(
-    rf"({IDENT})=({IDENT})\.useMemo\(\(\)=>\{{if\(!({IDENT})\)return!1;"
-    rf"if\(\3\.isStreaming\)return!0;"
-    rf"if\(\3\.streamingEndedAt\)return Date\.now\(\)-\3\.streamingEndedAt<30000;"
-    rf"return!1\}},\[\3\]\)"
-)
-
-
-def _step_linger(content: str, outcome: Outcome) -> str:
-    """Drop the 30-second post-stream linger; show only while streaming."""
-    step = outcome.step("linger")
-
-    def rewrite_label(match: re.Match[str]) -> str:
+        seen.add(declaration.start_byte)
+        value = _defaulting(display)
         step.candidates += 1
         step.applied += 1
-        return (
-            f"let {match.group(4)}=!!({match.group(2)}&&{match.group(2)}.isStreaming)"
-        )
-
-    def rewrite_memo(match: re.Match[str]) -> str:
-        visible, ns, stream = match.groups()
-        step.candidates += 1
-        step.applied += 1
-        return (
-            f"{visible}={ns}.useMemo(()=>!!({stream}&&{stream}.isStreaming),[{stream}])"
-        )
-
-    output = _LINGER_LABEL.sub(rewrite_label, content)
-    return _LINGER_MEMO.sub(rewrite_memo, output)
+        # Built from the read, so the default we write is a default *of that
+        # read* whichever of the two shapes this build ships. An upstream that
+        # already asks for summaries is the goal achieved, not a rewrite owed.
+        summarized = f"{js.text(display)}??{_SUMMARIZED}"
+        if js.text(value) == summarized:
+            continue
+        edits.append(Edit.replace(value, summarized))
+    return source.apply(edits)
 
 
-# ------------------------------------------------------------------- step 7
+# ------------------------------------------------------------- final summary
 
-_TOOLUSE_HELPERS = compile_js(
-    rf"let {IDENT}=({IDENT})\(\{{content:\[{IDENT}\.contentBlock\]\}}\);"
-    rf"return {IDENT}\.uuid=({IDENT})\({IDENT}\.contentBlock\.id,0\),({IDENT})\(\[{IDENT}\]\)"
-)
-_RENDERER_HAS_VAR = compile_js(
-    rf"\(\{{messages:[^}}]*?streamingToolUses:{IDENT},streamingThinking:({IDENT}),showAllInTranscript:"
-)
-_RENDERER_SIGNATURE = compile_js(
-    rf"(\(\{{messages:[^}}]*?streamingToolUses:{IDENT},)(showAllInTranscript:)"
-)
-_TRANSCRIPT_VAR = compile_js(
-    rf"streamingToolUses:{IDENT},[^}}]*streamingThinking:({IDENT}),streamingText:"
-)
+_THINKING = '"thinking"'
+_REDACTED = '"redacted_thinking"'
+_TYPE = "type"
+_SUMMARY_PROPS = ("thinking", "isStreaming", "streamingEndedAt")
 
 
-def _step_transcript_signature(content: str, found: Discovery, outcome: Outcome) -> str:
-    """Make sure the transcript renderer actually receives the live state."""
-    step = outcome.step("transcript-signature", expect=True)
+def _typed(test: js.Node) -> js.Node | None:
+    """The ``.type`` read a comparison asks about, whichever side it sits on.
 
-    helpers = _TOOLUSE_HELPERS.search(content)
-    if helpers:
-        found.create_message_helper = helpers.group(1)
-
-    existing = _RENDERER_HAS_VAR.search(content)
-    if existing:
-        found.transcript_var = existing.group(1)
-        step.candidates += 1
-        step.applied += 1  # nothing to do; upstream already threads it
-        return content
-
-    output = content
-    if found.streaming_var is not None:
-
-        def inject(match: re.Match[str]) -> str:
-            if "streamingThinking:" in match.group(0):
-                return match.group(0)
-            step.candidates += 1
-            step.applied += 1
-            found.transcript_var = "__cc_streamingThinking"
-            return f"{match.group(1)}streamingThinking:__cc_streamingThinking,{match.group(2)}"
-
-        output = _RENDERER_SIGNATURE.sub(inject, output, count=1)
-
-    if found.transcript_var is None:
-        fallback = _TRANSCRIPT_VAR.search(output)
-        if fallback:
-            found.transcript_var = fallback.group(1)
-    return output
-
-
-# ------------------------------------------------------------------- step 8
-
-_INLINE_EXTRAS = compile_js(
-    rf"({IDENT})=({IDENT})\.useMemo\(\(\)=>({IDENT})\.flatMap\(\(({IDENT})\)=>\{{"
-    rf"let ({IDENT})=({IDENT})\(\{{content:\[\4\.contentBlock\]\}}\);"
-    rf"return \5\.uuid=({IDENT})\(\4\.contentBlock\.id,0\),({IDENT})\(\[\5\]\)\}}\),\[\3\]\)"
-)
-
-
-def _step_inline_extras(content: str, found: Discovery, outcome: Outcome) -> str:
-    """Render live thinking inline, ordered with streaming tool-use blocks."""
-    step = outcome.step("inline-extras", expect=True)
-    if not found.transcript_var:
-        step.note("no transcript streaming variable; skipped")
-        return content
-    var = found.transcript_var
-
-    def rewrite(match: re.Match[str]) -> str:
-        extras, ns, tool_uses, entry, message, helper, uuid_helper, normalize = (
-            match.groups()
-        )
-        step.candidates += 1
-        step.applied += 1
-        found.create_message_helper = helper
-        return (
-            f"{extras}={ns}.useMemo(()=>{{"
-            f"let __cc_streamingToolUseExtras={tool_uses}.map(({entry})=>{{"
-            f"let {message}={helper}({{content:[{entry}.contentBlock]}});"
-            f"return {message}.uuid={uuid_helper}({entry}.contentBlock.id,0),"
-            f"{{index:{entry}.index??9007199254740991,"
-            f"messages:{normalize}([{message}])}}}}),"
-            f"__cc_streamingThinkingExtras=({var}?.messages??[])"
-            f".map((__cc_entry,__cc_index)=>({{"
-            f"index:__cc_entry.index??9007199254740991+__cc_index,"
-            f"messages:{normalize}([__cc_entry.message??__cc_entry])}}));"
-            f"return[...__cc_streamingToolUseExtras,...__cc_streamingThinkingExtras]"
-            f".sort((__cc_a,__cc_b)=>__cc_a.index===__cc_b.index?0:__cc_a.index-__cc_b.index)"
-            f".flatMap((__cc_entry)=>__cc_entry.messages)}},[{tool_uses},{var}])"
-        )
-
-    return _INLINE_EXTRAS.sub(rewrite, content)
-
-
-# ------------------------------------------------------------------- step 9
-
-_LIVE_ROW = compile_js(
-    rf"({IDENT})&{{2}}({IDENT})&{{2}}!({IDENT})&{{2}}({IDENT})\.createElement\(({IDENT}),"
-    rf"\{{marginTop:1\}},\4\.createElement\(({IDENT}),\{{param:\{{type:\"thinking\","
-    rf"thinking:\2\.thinking\}},addMargin:!1,isTranscriptMode:!0,verbose:({IDENT}),"
-    rf"hideInTranscript:!1\}}\)\)"
-)
-
-
-def _step_bottom_row(content: str, outcome: Outcome) -> str:
-    """Remove the separate bottom-pinned live row now that it renders inline."""
-    step = outcome.step("bottom-row")
-
-    def rewrite(_match: re.Match[str]) -> str:
-        step.candidates += 1
-        step.applied += 1
-        return "null"
-
-    return _LIVE_ROW.sub(rewrite, content)
-
-
-# ------------------------------------------------------ steps 10-11: reducer
-
-# The reducer rewrites are *insertions at dispatch points*, never edits of what
-# an arm already does. Each state update is spliced in where the reducer
-# dispatches on an event-type string -- after a run of ``case`` labels, or into
-# an ``if`` condition -- and the arm's own body is left byte-untouched. The body
-# is upstream's busiest surface (2.1.226 threaded a progress flag through five
-# arms in one release) and modelling any of it means enumerating spellings that
-# churn per build; the dispatch strings are the API's own vocabulary and do not.
-
-_LEGACY_ANCHOR = 'type!=="stream_event"&&'
-_FN_SIG = compile_js(rf"^function {IDENT}\(([^)]*)\)\{{")
-
-#: The options-bag reducer head, 2.1.138 to date. Bounded at the grammar's
-#: declarator edge: in this one-line minified bundle only ``;`` (statement end)
-#: or ``,`` (next declarator) can follow ``}=<param>``, and which one is
-#: minifier noise -- 2.1.226 broke the old matcher purely by appending
-#: ``,d=...`` to the ``let``.
-_OPTIONS_HANDLER = compile_js(
-    rf"function {IDENT}\(({IDENT}),({IDENT})(?:,{IDENT})*\)"
-    rf"\{{let\{{([^{{}}]*)\}}=\2(?=[;,])"
-)
-
-
-def _prop_var(props: str, name: str, *, shorthand: bool = False) -> str | None:
-    alias = compile_js(rf"(?:^|,){re.escape(name)}:({IDENT})").search(props)
-    if alias:
-        return alias.group(1)
-    if shorthand and compile_js(rf"(?:^|,){re.escape(name)}(?:,|$)").search(props):
-        return name
+    Both operands are nodes and the comparison is one, so which side upstream
+    writes the label on says nothing about what is being tested -- the same
+    rule `subagent-models` states for its bypass guard.
+    """
+    for side in (test.child_by_field_name("left"), test.child_by_field_name("right")):
+        if js.reads(side, _TYPE):
+            return side
     return None
 
 
-def _handler_is_stream_reducer(segment: str) -> bool:
-    return all(
-        tok in segment
-        for tok in (
-            'type==="stream_request_start"',
-            'case"thinking_delta"',
-            "content_block_start",
+def _is_thinking_test(node: js.Node) -> bool:
+    """Is this the ``<block>.type==="thinking"`` comparison?
+
+    Asked as text it was a claim about how the arrow *around* it closes
+    (``.type==="thinking")``, closing paren included) -- the same mistake
+    :func:`_wraps_block` records paying for one shape along, and one an added
+    conjunct or a trailing argument would have been enough to break. The
+    operator, the read and the label are each nodes; the code between them is
+    upstream's.
+    """
+    if node.type != "binary_expression":
+        return False
+    operator = node.child_by_field_name("operator")
+    if operator is None or js.text(operator) != "===":
+        return False
+    sides = (node.child_by_field_name("left"), node.child_by_field_name("right"))
+    return _typed(node) is not None and any(
+        side is not None and js.text(side) == _THINKING for side in sides
+    )
+
+
+def _widen(test: js.Node) -> str:
+    """A thinking-block test, widened to accept redacted blocks.
+
+    The second half is built from the *read* the first half compares, copied as
+    the node it is. Splitting the test's text on its operator took whatever sat
+    to the left of the last ``===``, which is the read only while upstream
+    writes the label second: on ``"thinking"===b.type`` it produced
+    ``"thinking"==="redacted_thinking"``, a widening that is always false.
+    """
+    return f"({js.text(test)}||{js.text(_typed(test))}==={_REDACTED})"
+
+
+def _selects_thinking(scope: js.Node | None, block: str) -> js.Node | None:
+    """The thinking test inside the `.find` that produced ``block``.
+
+    One search where there were two: the declarator used to be identified by
+    carrying this very test and then reached into again for it. What identifies
+    a node and what gets edited are the same node, so there is no second reach
+    to land somewhere else.
+    """
+    for declared in js.every(
+        scope,
+        lambda n: (
+            n.type == "variable_declarator"
+            and (name := n.child_by_field_name("name")) is not None
+            and js.text(name) == block
+        ),
+    ):
+        test = js.first(declared.child_by_field_name("value"), _is_thinking_test)
+        if test is not None:
+            return test
+    return None
+
+
+def _tests_thinking(scope: js.Node | None, block: str) -> js.Node | None:
+    """The test that rejects a redacted block, asked of the block in hand."""
+    return js.first(
+        scope,
+        lambda n: _is_thinking_test(n) and js.text(js.receiver(_typed(n))) == block,
+    )
+
+
+def _step_final_summary(source: Source, outcome: Outcome) -> Source:
+    """Include redacted thinking in the final assistant-message summary."""
+    step = outcome.step("final-summary")
+    edits = []
+
+    for node in source.find(_SUMMARY_PROPS[2]):
+        summary = js.owner(node)
+        if summary is None or not js.carries(summary, *_SUMMARY_PROPS):
+            continue
+        carried = js.props(summary)
+        if js.text(carried["isStreaming"]) != "!1":
+            continue
+        # What the summary reads the text off, as the receiver of that read --
+        # not the property sliced off the end of its own spelling.
+        thinking = carried[_SUMMARY_PROPS[0]]
+        if not js.reads(thinking, _SUMMARY_PROPS[0]):
+            continue
+        block = js.text(js.receiver(thinking))
+        guard = js.up(summary, "if_statement")
+        if guard is None:
+            continue
+        condition = guard.child_by_field_name("condition")
+        scope = js.climb(guard, lambda n: n.type in js.FUNCTIONS)
+        if condition is None or scope is None:
+            continue
+        # The two tests that reject a redacted block: the one inside the `.find`
+        # that produced it, and the one this summary is guarded by. Each is a
+        # node; none of the code between them is.
+        predicate = _selects_thinking(scope, block)
+        test = _tests_thinking(condition, block)
+        if predicate is None or test is None:
+            continue
+        step.candidates += 1
+        step.applied += 1
+        edits += [
+            Edit.replace(predicate, _widen(predicate)),
+            Edit.replace(test, _widen(test)),
+            Edit.replace(
+                thinking,
+                f'{block}.type==={_THINKING}?{block}.thinking:{block}.data??""',
+            ),
+        ]
+    return source.apply(edits)
+
+
+# -------------------------------------------------------- transcript signature
+
+
+def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
+    """Make sure the transcript renderer actually receives the live state."""
+    step = outcome.step("transcript-signature", expect=True)
+    edits = []
+
+    for node in source.find(_TRANSCRIPT_SIGNATURE[2]):
+        pattern = js.owner(node)
+        # A destructured parameter list, not a props bag being passed: this is
+        # the renderer's own signature, and the same property names appear on
+        # both sides of every call.
+        if pattern is None or pattern.type != "object_pattern":
+            continue
+        if not js.carries(pattern, *_TRANSCRIPT_SIGNATURE):
+            continue
+        carried = js.props(pattern)
+        step.candidates += 1
+        step.applied += 1
+        if _STREAMING in carried:
+            # Upstream already threads it; nothing owed. What it bound the prop
+            # to is that renderer's own business and is read back there.
+            continue
+        edits.append(
+            Edit.before(
+                js.entry(carried[_TRANSCRIPT_SIGNATURE[2]]),
+                f"{_STREAMING}:{_INJECTED},",
+            )
+        )
+    return source.apply(edits)
+
+
+# ------------------------------------------------------------- inline extras
+
+_CONTENT_BLOCK = "contentBlock"
+_CONTENT = "content"
+_UUID = "uuid"
+_USE_MEMO = "useMemo"
+_FLAT_MAP = "flatMap"
+
+
+def _handed_only(call: js.Node, name: str) -> bool:
+    """Is this call handed exactly ``[<name>]`` -- a one-element array of it?"""
+    args = js.arguments(call)
+    if len(args) != 1 or args[0].type != "array":
+        return False
+    elements = js.elements(args[0])
+    return (
+        len(elements) == 1
+        and elements[0].type == "identifier"
+        and js.text(elements[0]) == name
+    )
+
+
+def _wraps_block(call: js.Node | None) -> bool:
+    """Is this a call wrapping one streaming content block as a message?
+
+    The bag it is handed is the identity -- ``{content:[<entry>.contentBlock]}``
+    -- asked as the object and the read it is. Asked as the text
+    ``.contentBlock]}`` it was a claim about how the array *closes*, so one
+    sibling property beside `content` read as the whole computation being gone
+    and took live thinking with it.
+    """
+    arguments = js.arguments(call)
+    if call is None or len(arguments) != 1 or arguments[0].type != "object":
+        return False
+    content = js.props(arguments[0]).get(_CONTENT)
+    return any(js.reads(element, _CONTENT_BLOCK) for element in js.elements(content))
+
+
+def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
+    """The memo that turns streaming tool-uses into renderable messages.
+
+    Identified by what it computes: a ``useMemo`` over a ``flatMap`` that
+    builds one virtual message per streaming content block. Everything the
+    replacement needs -- the helper that builds a message, the one that stamps
+    its uuid, the one that normalises a list -- is read out of that computation
+    rather than matched by name, because every one of those names is minified.
+
+    Both nodes come back, the memo to replace and the ``flatMap`` that proved
+    it was the right one, so the caller reads what was identified rather than
+    reaching down for it a second time.
+    """
+    found: dict[int, tuple[js.Node, js.Node]] = {}
+    for node in source.find(_CONTENT_BLOCK):
+        memo = js.climb(
+            node,
+            lambda n: (
+                n.type == "call_expression"
+                and js.reads(n.child_by_field_name("function"), _USE_MEMO)
+            ),
+        )
+        arrow = next(iter(js.arguments(memo)), None)
+        if arrow is None or arrow.type != "arrow_function":
+            continue
+        flat = js.body(arrow)
+        if (
+            memo is not None
+            and flat is not None
+            and flat.type == "call_expression"
+            and js.reads(flat.child_by_field_name("function"), _FLAT_MAP)
+            and js.first(flat, _wraps_block) is not None
+        ):
+            found[memo.start_byte] = (memo, flat)
+    return js.only(list(found.values()), "streaming-extras memos")
+
+
+def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> Source:
+    """Render live thinking inline, ordered with streaming tool-use blocks."""
+    step = outcome.step("inline-extras", expect=True)
+    computed = _flatmap_extras(source)
+    if computed is None:
+        step.note("no streaming-extras memo in this build")
+        return source
+
+    memo, flat = computed
+    # The state this memo can actually read: the prop *its own* scope was handed
+    # -- which `transcript-signature` has just made sure of -- rather than a
+    # variable some other renderer bound under the same name.
+    var = _bound_in_scope(memo, _STREAMING)
+    ns = js.text(js.receiver(memo.child_by_field_name("function")))
+    tool_uses = js.text(js.receiver(flat.child_by_field_name("function")))
+    callback = js.arguments(flat)[0]
+    taken = js.positional(callback)
+    if var is None or not taken:
+        step.note("the streaming-extras memo is out of reach of the live state")
+        return source
+    entry = js.text(js.binding(taken[0]))
+    block = js.body(callback)
+
+    # What the callback builds, not what it declares first: an unrelated `let`
+    # ahead of this one answered for it and the step raised on a number where a
+    # call was expected.
+    built = js.only(
+        js.every(
+            block,
+            lambda n: (
+                n.type == "variable_declarator"
+                and _wraps_block(n.child_by_field_name("value"))
+            ),
+            scoped=True,
+        ),
+        "virtual-message builders in this callback",
+    )
+    if built is None:
+        step.note("no virtual message built per streaming block")
+        return source
+    message = js.text(built.child_by_field_name("name"))
+    helper = js.text(
+        (built.child_by_field_name("value") or built).child_by_field_name("function")
+    )
+    stamp = js.first(
+        block,
+        lambda n: (
+            n.type == "assignment_expression"
+            and js.reads(n.child_by_field_name("left"), _UUID)
+            and js.text(js.receiver(n.child_by_field_name("left"))) == message
+        ),
+        scoped=True,
+    )
+    # The call that turns the built message into a renderable list -- named by
+    # what it is handed, since every helper name here is minified.
+    # The call handed exactly `[<message>]` -- asked as the array it is (one
+    # element, the built-message local), not as the text `[X]`, which asserted
+    # the minifier put no space inside the brackets.
+    normalize = js.first(
+        block,
+        lambda n: n.type == "call_expression" and _handed_only(n, message),
+        scoped=True,
+    )
+    if stamp is None or normalize is None:
+        step.note("the built message is not stamped and normalised as it was")
+        return source
+    uuid_helper = js.text(
+        (stamp.child_by_field_name("right") or stamp).child_by_field_name("function")
+    )
+    normalize_fn = js.text(normalize.child_by_field_name("function"))
+
+    found.create_message_helper = helper
+    step.candidates += 1
+    step.applied += 1
+    return source.apply(
+        [
+            Edit.replace(
+                memo,
+                f"{ns}.useMemo(()=>{{"
+                f"let __cc_streamingToolUseExtras={tool_uses}.map(({entry})=>{{"
+                f"let {message}={helper}({{content:[{entry}.{_CONTENT_BLOCK}]}});"
+                f"return {message}.{_UUID}={uuid_helper}({entry}.{_CONTENT_BLOCK}.id,0),"
+                f"{{index:{entry}.index??9007199254740991,"
+                f"messages:{normalize_fn}([{message}])}}}}),"
+                f"__cc_streamingThinkingExtras=({var}?.messages??[])"
+                f".map((__cc_entry,__cc_index)=>({{"
+                f"index:__cc_entry.index??9007199254740991+__cc_index,"
+                f"messages:{normalize_fn}([__cc_entry.message??__cc_entry])}}));"
+                f"return[...__cc_streamingToolUseExtras,...__cc_streamingThinkingExtras]"
+                f".sort((__cc_a,__cc_b)=>__cc_a.index===__cc_b.index?0:__cc_a.index-__cc_b.index)"
+                f".flatMap((__cc_entry)=>__cc_entry.messages)}},[{tool_uses},{var}])",
+            )
+        ]
+    )
+
+
+# ------------------------------------------------------------------ reducer
+
+_REQUEST_START = "stream_request_start"
+_MESSAGE_STOP = "message_stop"
+_CONTENT_BLOCK_START = "content_block_start"
+_THINKING_DELTA = "thinking_delta"
+_SET_STREAM_MODE = "onSetStreamMode"
+
+
+def _reducer(source: Source) -> js.Node | None:
+    """The stream reducer: the function that dispatches on all three events and
+    is handed the stream callbacks to answer them with.
+
+    Identified by the dispatch points it *has*, which is the same question its
+    own arms answer and the one this patch goes on to edit. Asking it of the
+    function's text instead -- ``'case"thinking_delta"' in spelled`` -- was the
+    last place here that described syntax rather than reaching a node, and it
+    described the busiest kind: which of the two spellings routes an event is
+    upstream's to change, and :func:`_dispatch` already declines to care.
+
+    Dispatching is asked of the scope itself, and the callbacks are asked for
+    too, because *containing* three dispatches is not performing them: on
+    2.1.210 the engine loop and `submitMessage` both hold the whole reducer
+    somewhere inside them, and the right one was picked by nothing better than
+    sitting earlier in the bundle. The options bag is what the reducer is *for*
+    -- it is also where the setter gets threaded -- so it belongs to the
+    identity rather than to a second search afterwards.
+    """
+    found = {}
+    for node in source.find(f'"{_REQUEST_START}"'):
+        handler = js.climb(node, lambda n: n.type in js.FUNCTIONS)
+        if (
+            handler is not None
+            and _options_bag(handler) is not None
+            and all(
+                js.first(handler, _routing(label), scoped=True) is not None
+                for label in (_REQUEST_START, _THINKING_DELTA, _CONTENT_BLOCK_START)
+            )
+        ):
+            found[handler.start_byte] = handler
+    return js.only(list(found.values()), "stream reducers")
+
+
+def _options_bag(handler: js.Node) -> js.Node | None:
+    """The reducer's options bag, destructured from one of its parameters.
+
+    Visible to the reducer's whole body, because that is what a binding every
+    arm reads has to be: a pattern inside a nested function -- or inside a
+    block of its own -- takes the same parameter apart under a name the arms
+    cannot see.
+    """
+    block = js.body(handler)
+    if block is None:
+        return None
+    taken = {js.text(js.binding(p)) for p in js.positional(handler)}
+    for declarator in js.every(block, js.of_type("variable_declarator")):
+        name = declarator.child_by_field_name("name")
+        value = declarator.child_by_field_name("value")
+        if name is None or name.type != "object_pattern" or value is None:
+            continue
+        if not js.visible(declarator, block):
+            continue
+        if js.text(value) in taken and _SET_STREAM_MODE in js.props(name):
+            return name
+    return None
+
+
+def _dispatches(node: js.Node, label: str) -> bool:
+    """Is this the test by which the reducer recognises one stream event?
+
+    The dispatch string is the API's own vocabulary and does not churn. The read
+    that reaches it is upstream's to spell -- ``e.type``, ``e.event.type``, and
+    ``e.event?.type`` the day someone adds a defensive ``?`` -- so the literal
+    is what is matched and the path between is never described. Spelling the
+    whole test out cost `message-stop` on exactly that one character: the live
+    block was never marked finished and shimmered on after every turn, with the
+    step reporting *absent* and the patch green.
+
+    The operator is read, because the wrap runs the update on the side that
+    dispatched: against a ``!==`` it would run on every event but this one.
+    """
+    if node.type != "binary_expression":
+        return False
+    operator = node.child_by_field_name("operator")
+    if operator is None or js.text(operator) != "===":
+        return False
+    return any(
+        side is not None and js.text(side) == f'"{label}"'
+        for side in (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
         )
     )
 
 
-def _insert_after_labels(
-    segment: str, labels: tuple[str, ...], expr: str, step: Outcome
-) -> str:
-    """Run ``expr`` first in every arm dispatching on one of these ``case`` labels.
+def _routing(label: str) -> Callable[[js.Node], bool]:
+    """Predicate: this node routes that stream event.
 
-    The insertion lands after the whole consecutive label chain, so a fused
-    ``case"thinking":case"redacted_thinking":`` arm gets one update and split
-    *terminating* arms get one each -- both spellings of the same dispatch.
-    Inserting a statement is valid whatever the arm holds: a following braced
-    arm simply becomes a bare block, whose ``let``s stay scoped inside it.
+    A factory rather than a closure spelled per call site, for the reason
+    :func:`js.returns` is one: the question is asked of three events in one
+    breath and of one event in another.
     """
-    chain = compile_js("(?:" + "|".join(rf'case"{label}":' for label in labels) + ")+")
-    text = expr + ";"
-    for match in reversed(list(chain.finditer(segment))):
-        step.candidates += 1
-        if segment[match.end() : match.end() + len(text)] == text:
-            step.applied += 1  # already carries the update: the goal, achieved
-            continue
-        segment = splice(segment, match.end(), match.end(), text)
-        step.applied += 1
-    return segment
+    return lambda node: _routes(node, label)
 
 
-def _guard_dispatch(segment: str, needle: str, expr: str, step: Outcome) -> str:
-    """Run ``expr`` first wherever the reducer evaluates this dispatch test.
+def _routes(node: js.Node, label: str) -> bool:
+    """Does this node route one stream event, whichever way this build routes it?
 
-    The test expression itself is wrapped -- ``(test&&((expr),!0))`` -- which
-    preserves its value exactly: true stays true through the comma, false never
-    reaches ``expr``. Value-equivalence is what makes the wrap survive any
-    surrounding composition unread -- an ``if`` of its own, a compound
-    condition (short-circuit keeps ``expr`` off the paths that did not
-    dispatch), a ternary, an assignment -- where guarding the *enclosing*
-    condition would run the update for the other side of a bare ``||``.
+    Two spellings of one act: a ``switch`` arm labelled with the event, and the
+    ``===`` test a build writes where it uses an ``if`` instead. Upstream uses
+    both at once -- ``content_block_start`` is an arm and ``stream_request_start``
+    a test, on every build we hold -- so which one carries a given event is not
+    a fact about that event. :func:`_dispatch` inserts at the first and wraps the
+    second; this is that choice asked as a question rather than performed as an
+    edit, so a build that flips a spelling routes through the same code.
     """
-    guard = f"&&(({expr}),!0)"
-    for match in reversed(list(compile_js(re.escape(needle)).finditer(segment))):
-        step.candidates += 1
-        if segment[match.end() : match.end() + len(guard)] == guard:
-            step.applied += 1  # already guarded: the goal, achieved
-            continue
-        segment = splice(segment, match.start(), match.end(), f"({needle}{guard})")
-        step.applied += 1
-    return segment
+    if node.type == "switch_case":
+        value = node.child_by_field_name("value")
+        return value is not None and js.text(value) == f'"{label}"'
+    return _dispatches(node, label)
 
 
-def _rewrite_reducer_segment(
-    segment: str, event: str, setter: str, helper: str, outcome: Outcome
-) -> str:
-    """Splice the live-thinking state updates into one recognised reducer.
+def _switch_on(case: js.Node, field: str) -> bool:
+    """Does the ``switch`` holding this arm discriminate on ``.<field>.type``?
 
-    Each dispatch point is its own named step, so a build that drops one --
-    upstream folding an arm away -- reads as that point's absence by name,
-    never as a bare count drop inside an aggregate. The two updates that *are*
-    the feature stay credited by their markers (:data:`_CORE_UPDATES`), not by
-    these insertion counts.
+    The reducer switches over three stream unions -- the event type, the content
+    block type, the delta type -- and a `case` label alone does not say which of
+    them an arm belongs to: ``"thinking"`` is a content-block type, but a decoy
+    arm of the same name in the *delta*-type switch drew the block-start update
+    to itself, at 14/14 with `thinking-start` merely 1/1 -> 2/2. They are told
+    apart by the authored name the discriminant reads ``.type`` off
+    (``event`` / ``content_block`` / ``delta``), never by the minified receiver
+    in front of it. Upstream folds side effects into the discriminant as a
+    parenthesised comma sequence, whose *value* is its last element -- so
+    unwrapping to the last child of each, once, reaches the read either way.
     """
-    ended = _reset(setter, "Date.now()")
-    cleared = _reset(setter, "void 0")
+    switch = js.up(case, "switch_statement")
+    node = switch.child_by_field_name("value") if switch is not None else None
+    while node is not None and node.type in (
+        "parenthesized_expression",
+        "sequence_expression",
+    ):
+        kids = js.children(node)
+        node = kids[-1] if kids else None
+    return (
+        node is not None
+        and js.reads(node, "type")
+        and js.reads(js.receiver(node), field)
+    )
 
-    segment = _guard_dispatch(
-        segment,
-        f'{event}.type==="stream_request_start"',
+
+def _dispatch(
+    handler: js.Node,
+    labels: tuple[str, ...],
+    update: str,
+    step: Outcome,
+    *,
+    on: str | None = None,
+) -> list[Edit]:
+    """Run ``update`` wherever the reducer dispatches one of these events -- in
+    whichever spelling this build ships.
+
+    A build routes a given event *either* as a ``case`` arm in a ``switch`` *or*
+    as an ``===`` test written into an ``if``; upstream uses both across the
+    reducer at once, and which one carries a given event is not a fact about that
+    event. Binding each event to one of two functions made a spelling flip cost
+    swapping them -- on 2.1.233 the ``message_stop`` ``if`` sits one line above
+    the ``switch`` it would fold into, and folding it would send a required step
+    to 0/0. Matching both spellings (:func:`_routes`) makes that flip cost
+    nothing, which is the promise CONDUCT makes about a new spelling.
+
+    The two spellings take the two edits they always did. A ``case`` arm gets the
+    update inserted at its dispatch point, after the whole consecutive label
+    chain (a fused ``case"a":case"b":`` arm once, split terminating arms once
+    each), and only when its ``switch`` discriminates the ``on`` union -- so a
+    decoy label in a sibling switch is not a dispatch point (:func:`_switch_on`).
+    ``on=None`` is an event whose union is not a ``.<field>.type`` read the
+    discriminant check can express (``stream_request_start`` routes on the
+    reducer's own ``e.type``), so it is matched only as a test. An ``===`` test
+    is wrapped ``(test&&((update),!0))``, value-preserving so it survives any
+    surrounding composition and needs no union check (the label *is* the union).
+    """
+    points: set[int] = set()
+    tests: list[js.Node] = []
+    for node in js.every(handler, lambda n: any(_routes(n, label) for label in labels)):
+        if node.type == "switch_case":
+            if on is not None and _switch_on(node, on):
+                points.add(js.dispatch(node))
+        else:
+            tests.append(node)
+    step.candidates += len(points) + len(tests)
+    step.applied += len(points) + len(tests)
+    return [Edit.at(at, f"{update};") for at in sorted(points)] + [
+        Edit.replace(test, f"({js.text(test)}&&(({update}),!0))") for test in tests
+    ]
+
+
+def _step_reducer(source: Source, found: Discovery, outcome: Outcome) -> Source:
+    """Splice the live-thinking state updates into the stream reducer.
+
+    Each dispatch point is its own named step, so a build that folds an arm
+    away reads as that point's absence by name rather than as a bare count drop
+    inside an aggregate.
+    """
+    step = outcome.step("reducer", expect=True)
+    helper = found.create_message_helper
+    handler = _reducer(source)
+    if handler is None or helper is None:
+        if helper is None:
+            # Without the helper the two marker steps can never land, so the
+            # fixpoint always drops the patch: a resets-only rewrite ships
+            # nothing.
+            step.note("no virtual-message helper discovered; skipped")
+        return source
+
+    bag = _options_bag(handler)
+    taken = js.positional(handler)
+    if bag is None or not taken:
+        return source
+    step.candidates += 1
+    step.applied += 1
+
+    event = js.text(js.binding(taken[0]))
+    setter = "__cc_onStreamingThinking"
+    # Taken out of the very object the reducer already destructures, under
+    # upstream's own name and into a name of ours. Whether upstream *also* binds
+    # it is not a case to handle: two patterns naming one property both read
+    # that property, so reusing their local name would buy a branch and nothing
+    # else. Threaded at the *front* of the pattern, which is valid whatever the
+    # pattern ends with -- a rest element or trailing comma there would make an
+    # append a SyntaxError no write verifier could see.
+    edits: list[Edit] = [Edit.before(bag.named_children[0], f"{_SETTER}:{setter},")]
+
+    ended, cleared = _reset(setter, "Date.now()"), _reset(setter, "void 0")
+    # The four resets are what *end* a live block, and every one of them is
+    # required. Their absence is not a shape some builds lack -- it is a
+    # shimmer that never stops, on a run that reports green off `reducer`
+    # alone. That is `branding`'s undeclared badge again, in the one patch
+    # whose failure mode is a UI that never settles rather than one that never
+    # appears. The dispatch strings they anchor on are the API's own
+    # vocabulary, so an arm going missing is news worth being told.
+    #
+    # `thinking-start` and `thinking-append` are deliberately not marked here:
+    # `_CORE_UPDATES` already declares their witnesses, and credits those off
+    # the bundle this run produced rather than off what a matcher reports about
+    # itself -- the stronger of the two checks, and not worth stating twice.
+    edits += _dispatch(
+        handler,
+        (_REQUEST_START,),
         f"{setter}?.(null)",
-        outcome.step("request-start"),
+        outcome.step("request-start", expect=True),
     )
-    segment = _guard_dispatch(
-        segment,
-        f'{event}.event.type==="message_stop"',
+    edits += _dispatch(
+        handler,
+        (_MESSAGE_STOP,),
         ended,
-        outcome.step("message-stop"),
+        outcome.step("message-stop", expect=True),
+        on="event",
     )
-    segment = _insert_after_labels(
-        segment, ("text",), cleared, outcome.step("text-clear")
+    edits += _dispatch(
+        handler,
+        ("text",),
+        cleared,
+        outcome.step("text-clear", expect=True),
+        on="content_block",
     )
-    segment = _insert_after_labels(
-        segment, ("message_delta",), cleared, outcome.step("message-delta-clear")
+    edits += _dispatch(
+        handler,
+        ("message_delta",),
+        cleared,
+        outcome.step("message-delta-clear", expect=True),
+        on="event",
     )
-    segment = _insert_after_labels(
-        segment,
+    edits += _dispatch(
+        handler,
         ("thinking", "redacted_thinking"),
         _block_start(event, setter, helper),
         outcome.step("thinking-start"),
+        on="content_block",
     )
-    return _insert_after_labels(
-        segment,
-        ("thinking_delta",),
+    edits += _dispatch(
+        handler,
+        (_THINKING_DELTA,),
         _delta(event, setter, helper),
         outcome.step("thinking-append"),
+        on="delta",
     )
-
-
-def _step_reducer_options(content: str, found: Discovery, outcome: Outcome) -> str:
-    """2.1.138+ shape: an options bag destructured at the head.
-
-    One step for every options-bag build: whether the bag already destructures
-    ``onStreamingThinking`` (2.1.138-183) or dropped it (2.1.183+) is the same
-    shape with the prop present or absent, so the setter is reused when found
-    and threaded into the destructuring when not -- one code path, no variant.
-    """
-    step = outcome.step("reducer-options", expect=REDUCER)
-    helper = found.create_message_helper
-    if helper is None:
-        step.note("no virtual-message helper discovered; skipped")
-        return content
-
-    output, pos = content, 0
-    while True:
-        match = _OPTIONS_HANDLER.search(output, pos)
-        if not match:
-            break
-        event, props = match.group(1), match.group(3)
-        pos = match.end()
-        if _prop_var(props, "onSetStreamMode", shorthand=True) is None:
-            continue
-
-        end = output.find("function ", match.end())
-        if end == -1:
-            continue
-        original = output[match.start() : end]
-        if not _handler_is_stream_reducer(original):
-            continue
-        step.candidates += 1
-
-        segment = original
-        setter = _prop_var(props, "onStreamingThinking", shorthand=True)
-        if setter is None:
-            # Threaded at the *front* of the pattern, which is valid whatever
-            # the pattern ends with -- a rest element or trailing comma there
-            # would make an append a SyntaxError the write verifier cannot see.
-            setter = "__cc_onStreamingThinking"
-            props_start = match.start(3) - match.start()
-            segment = splice(
-                segment, props_start, props_start, f"onStreamingThinking:{setter},"
-            )
-
-        updated = _rewrite_reducer_segment(segment, event, setter, helper, outcome)
-        _record_core_updates(updated, outcome)
-        if updated != original:
-            step.applied += 1
-            output = splice(output, match.start(), end, updated)
-            pos = match.start() + len(updated)
-        elif all(marker in original for _, marker in _CORE_UPDATES):
-            step.applied += 1  # a previous run already did the work: achieved
-    return output
-
-
-def _step_reducer_legacy(content: str, found: Discovery, outcome: Outcome) -> str:
-    """Pre-2.1.138 shape: positional parameters, no options bag."""
-    step = outcome.step("reducer-legacy", expect=REDUCER)
-    anchor = content.find(_LEGACY_ANCHOR)
-    if anchor == -1:
-        return content
-    if content.find('type==="stream_request_start"', anchor) == -1:
-        return content
-    if content.find('case"thinking_delta"', anchor) == -1:
-        return content
-
-    start = content.rfind("function ", 0, anchor)
-    end = content.find("function ", anchor + len(_LEGACY_ANCHOR))
-    if start == -1 or end == -1:
-        return content
-
-    segment = content[start:end]
-    signature = _FN_SIG.search(segment)
-    if not signature:
-        return content
-    params = [p.strip() for p in signature.group(1).split(",")]
-    if len(params) < 7:
-        return content
-
-    helper = found.create_message_helper
-    if helper is None:
-        # Without the helper the two marker steps can never land, so the
-        # fixpoint always drops the patch: a resets-only rewrite ships nothing.
-        step.note("no virtual-message helper discovered; skipped")
-        return content
-    step.candidates += 1
-
-    updated = _rewrite_reducer_segment(segment, params[0], params[6], helper, outcome)
-    _record_core_updates(updated, outcome)
-    if updated == segment:
-        if all(marker in segment for _, marker in _CORE_UPDATES):
-            step.applied += 1  # a previous run already did the work: achieved
-        return content
-    step.applied += 1
-    return splice(content, start, end, updated)
+    return source.apply(edits)
 
 
 # ------------------------------------------------------------------ assembly
 
 
-def _live_thinking(content: str, _options: Options, outcome: Outcome) -> str:
+def _live_thinking(source: Source, _options: Options, outcome: Outcome) -> Source:
     found = Discovery()
     # Declared before anything runs: an expectation that only comes into
     # existence once its own rewrite succeeds can never report that rewrite
     # missing -- which is exactly the silence being designed out here.
     for name, _marker in _CORE_UPDATES:
         outcome.step(name, expect=True)
-    output = _step_memo_cache(content, outcome)
-    _discover_streaming_var(output, found, outcome)
-    output = _step_prop_threading(output, found, outcome)
-    output = _step_display_mode(output, outcome)
-    output = _step_final_summary(output, outcome)
-    output = _step_memo_removal(output, outcome)
-    output = _step_linger(output, outcome)
-    output = _step_transcript_signature(output, found, outcome)
-    output = _step_inline_extras(output, found, outcome)
-    output = _step_bottom_row(output, outcome)
-    output = _step_reducer_options(output, found, outcome)
-    output = _step_reducer_legacy(output, found, outcome)
 
-    if found.streaming_var is None:
-        outcome.note("live-thinking state variable was never found")
-    return output
+    source = _step_prop_threading(source, outcome)
+    source = _step_display_mode(source, outcome)
+    source = _step_final_summary(source, outcome)
+    source = _step_transcript_signature(source, outcome)
+    source = _step_inline_extras(source, found, outcome)
+    source = _step_reducer(source, found, outcome)
+
+    # Credited off the bundle this run produced, never off a matcher: these two
+    # updates *are* the feature, and every other step can land without them.
+    for name, marker in _CORE_UPDATES:
+        if source.count(marker):
+            step = outcome.step(name, expect=True)
+            step.candidates += 1
+            step.applied += 1
+    return source
 
 
 PATCHES = [
@@ -828,10 +1014,11 @@ PATCHES = [
         group=GROUP_OUTPUT,
         fn=_live_thinking,
         anchors=(
-            "onStreamingThinking:",
-            'case"thinking_delta"',
-            'type==="stream_request_start"',
-            "content_block_start",
+            f"{_SETTER}:",
+            f'case"{_THINKING_DELTA}"',
+            f'"{_REQUEST_START}"',
+            _CONTENT_BLOCK_START,
+            _AGENT_DEFINITIONS,
         ),
     ),
 ]

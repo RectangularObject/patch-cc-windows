@@ -2,155 +2,240 @@
 
 from __future__ import annotations
 
-import re
-
-from .base import (
-    GROUP_OUTPUT,
-    IDENT,
-    Options,
-    Outcome,
-    Patch,
-    compile_js,
-    splice,
-    switch_case_end,
-)
+from .. import js
+from ..js import Edit, Source
+from .base import GROUP_OUTPUT, Options, Outcome, Patch
 
 # --------------------------------------------------------------- tool calls
 
-_COLLAPSED_RETURN = compile_js(
-    rf'case"collapsed_read_search":return ({IDENT})\.createElement\(({IDENT}),\{{([^}}]*)\}}\)'
-)
-_COLLAPSED_CALL = compile_js(
-    r"(?:createElement|jsx|jsxs)\("
-    + IDENT
-    + r",\{message:[^}]*inProgressToolUseIDs:[^}]*"
-    r"shouldAnimate:[^}]*verbose:[^,}]+,tools:[^}]*lookups:[^}]*isActiveGroup:[^}]*\}\)"
-)
-_VERBOSE_PROP = compile_js(r"verbose:[^,}]+")
+_COLLAPSED = '"collapsed_read_search"'
+_VERBOSE = "verbose"
 
 
-def _tool_call_verbose(content: str, _options: Options, outcome: Outcome) -> str:
-    """Render collapsed read/search rows as if verbose mode were on."""
+def _arm(node: js.Node) -> js.Node | None:
+    """The ``switch`` arm this label *labels*, rather than one it occurs in.
 
-    def rewrite_return(match: re.Match[str]) -> str:
-        ns, component, props = match.group(1), match.group(2), match.group(3)
-        if "verbose:" not in props:
-            return match.group(0)
-        outcome.candidates += 1
-        next_props = _VERBOSE_PROP.sub("verbose:!0", props, count=1)
-        if next_props == props:
-            return match.group(0)
-        outcome.applied += 1
-        return f'case"collapsed_read_search":return {ns}.createElement({component},{{{next_props}}})'
+    The label is an authored name and the arm is a node; ``case"x":`` spelled as
+    text is neither -- it is the two of them with the minifier's spacing in
+    between, which is the one thing about a build that has no reason to hold.
+    """
+    arm = js.up(node, "switch_case")
+    return arm if arm is not None and arm.child_by_field_name("value") == node else None
 
-    output = _COLLAPSED_RETURN.sub(rewrite_return, content)
 
-    # Newer builds use a block-form arm with a JSX-runtime call.
-    needle = 'case"collapsed_read_search":{'
-    index = 0
-    while True:
-        start = output.find(needle, index)
-        if start == -1:
-            break
-        end = switch_case_end(output, start + len(needle))
-        segment = output[start:end]
-        index = start + len(needle)
+def _tool_call_verbose(source: Source, _options: Options, outcome: Outcome) -> Source:
+    """Render collapsed read/search rows as if verbose mode were on.
 
-        has_renderer = any(
-            tok in segment for tok in ("createElement(", "jsx(", "jsxs(")
-        )
-        if not has_renderer or "verbose:" not in segment:
+    The arm is the dispatch label; the row is whatever inside it is *handed* a
+    ``verbose`` prop. Which render function receives it, whether the arm is an
+    expression or a block, and what else it is handed all belonged to the two
+    matchers this replaced -- one for the ``return``-form arm and one for the
+    block form, the second carrying six neighbouring prop names purely to
+    prove it had found the right call. The label proves that.
+
+    Handed, not taken apart. A prop being passed is an object literal; the same
+    name in a destructuring pattern is a local being bound, and writing ``!0``
+    over the name it binds is not a value flip but rubble. The gate would catch
+    it, which makes it this patch reported broken on a build that merely reads
+    the prop somewhere else -- a shape upstream is free to ship, and one this
+    rewrite has nothing to say about.
+    """
+    edits = []
+    for node in source.find(_COLLAPSED):
+        arm = _arm(node)
+        if arm is None:
             continue
-        if not _COLLAPSED_CALL.search(segment):
-            continue
-
-        outcome.candidates += 1
-        next_segment = _VERBOSE_PROP.sub("verbose:!0", segment, count=1)
-        if next_segment != segment:
-            outcome.applied += 1
-            output = splice(output, start, end, next_segment)
-            index = start + len(next_segment)
-
-    return output
+        # `scoped`: the row is what *this arm* hands a `verbose` prop, not what a
+        # callback nested inside it hands one -- a decoy object in such a callback
+        # would otherwise be flipped too.
+        for obj in js.every(arm, js.of_type("object"), scoped=True):
+            verbose = js.props(obj).get(_VERBOSE)
+            if verbose is None:
+                continue
+            outcome.candidates += 1
+            if not js.is_true(verbose):
+                edits.append(Edit.replace(verbose, b"!0"))
+                outcome.applied += 1
+    return source.apply(edits)
 
 
 # --------------------------------------------------------------- create diff
 
-_CREATE_RETURN = compile_js(
-    rf"return ({IDENT})\.(createElement|jsx|jsxs)\(({IDENT}),"
-    rf"\{{filePath:({IDENT}),content:({IDENT}),verbose:({IDENT})\}}\)"
-)
-_UPDATE_RENDERER = compile_js(
-    rf"(?:createElement|jsx|jsxs)\(({IDENT}),\{{filePath:[^}}]*structuredPatch:[^}}]*"
-    rf"style:({IDENT}),verbose:{IDENT}"
-)
-_LINE_COUNTER = compile_js(
-    rf"let {IDENT}=({IDENT})\({IDENT}\);return {IDENT}\.(?:createElement|jsxs)"
-    rf"\({IDENT},(?:null,|\{{children:\[)\"Wrote \""
-)
-_ALREADY_CREATE_DIFF = "structuredPatch:[{oldStart:1,oldLines:0,newStart:1"
+_CREATE = '"create"'
+_UPDATE = '"update"'
+
+#: What the created-file render is handed. Membership, never the whole set: the
+#: arm draws several other things -- a "/plan to preview" placeholder, two
+#: "Wrote N lines" summaries -- and these three pick it out of them alone, on
+#: every build in the corpus. Demanding *exactly* these was one added prop from
+#: reporting the anchor gone, which is precisely what upstream has already done
+#: twice to the sibling render below.
+_CREATE_PROPS = ("filePath", "content", "verbose")
+
+#: What the updated-file render is handed. Membership for the same reason:
+#: upstream keeps adding to this one (``previewHint`` and ``collapsed`` since
+#: this patch was written), and none of that is a fact about which render it is.
+_UPDATE_PROPS = ("filePath", "structuredPatch")
+
+#: The word the arm's own summary pluralises the count with -- what tells the
+#: line count from any other call the arm makes on the created file's text.
+_LINE = '"line"'
 
 
-def _create_diff_colors(content: str, _options: Options, outcome: Outcome) -> str:
-    """Render newly-created files through the diff component so lines get ``+``."""
-    output = content
-    index = 0
-    create_needle, update_needle = 'case"create":', 'case"update":'
+def _sibling_arm(arm: js.Node, label: str) -> js.Node | None:
+    """The arm for ``label`` in the same ``switch`` as ``arm``.
 
-    while True:
-        create_start = output.find(create_needle, index)
-        if create_start == -1:
-            break
-        update_start = output.find(update_needle, create_start + len(create_needle))
-        if update_start == -1:
-            index = create_start + len(create_needle)
+    Membership of one switch, never a direction: which of two arms upstream
+    lists first is not a fact about either, and walking forward only read a
+    build that lists `update` above `create` as the anchor being gone (0/0, on
+    a switch plainly carrying both).
+    """
+    return next(
+        (
+            sibling
+            for sibling in js.children(arm.parent)
+            if sibling.type == "switch_case"
+            and (value := sibling.child_by_field_name("value")) is not None
+            and js.text(value) == label
+        ),
+        None,
+    )
+
+
+def _line_count(arm: js.Node, content: str) -> str | None:
+    """How this build counts the lines of a created file.
+
+    The arm already computes it for its own "Wrote N lines" summary, so the
+    helper is borrowed rather than reimplemented, and what we render says the
+    same number the arm beside it does.
+
+    Which call that is, is settled by what the arm *says* about the number --
+    it pluralises it as a ``"line"``, upstream's own word -- and not by being
+    the first call in the arm taking the content. Any call does that: put a
+    bare ``String(t);`` at the arm's head and it was baked in as the file's
+    length, ``newLines:String(t)``, counted and green.
+
+    There is deliberately no inline fallback. One stood here, never ran on any
+    build in the corpus, and disagreed with the borrow it stood in for on the
+    commonest input there is: upstream's helper drops the empty trailing field
+    of a file that ends in a newline (and calls an empty file one line), while
+    ``split`` counts both. A second answer nothing exercises is not resilience,
+    it is a number that changes meaning on the build that finally reaches it.
+
+    The arm counts the same file twice (once per summary it may draw), so what
+    has to be single is the *answer*, not the call: two different counts would
+    leave nothing to borrow.
+    """
+    borrowed = {
+        js.text(counted)
+        for summary in js.every(arm, js.of_type("call_expression"))
+        if _LINE in [js.text(a) for a in js.arguments(summary)[1:]]
+        for counted in [_counted(arm, js.arguments(summary)[0])]
+        if counted is not None
+        and counted.type == "call_expression"
+        and [js.text(a) for a in js.arguments(counted)] == [content]
+    }
+    return borrowed.pop() if len(borrowed) == 1 else None
+
+
+def _counted(arm: js.Node, number: js.Node) -> js.Node | None:
+    """The expression behind the number a summary pluralises.
+
+    A minifier is free to bind it to a local first and free not to, so both
+    spellings answer one question -- and the local is resolved where it is
+    *read*, because each branch of this arm declares its own.
+    """
+    if number.type != "identifier":
+        return number
+    declared = js.first(
+        arm,
+        lambda n: (
+            n.type == "variable_declarator"
+            and (bound := n.child_by_field_name("name")) is not None
+            and js.text(bound) == js.text(number)
+            and js.visible(n, number)
+        ),
+    )
+    return declared.child_by_field_name("value") if declared is not None else None
+
+
+def _create_diff_colors(source: Source, _options: Options, outcome: Outcome) -> Source:
+    """Render newly-created files through the diff component so lines get ``+``.
+
+    A creation is a diff against nothing, so the row is re-pointed at the
+    renderer the neighbouring ``update`` arm already uses, handed a patch whose
+    every line is an addition. Both renders are found by what they are handed,
+    so nothing here depends on which JSX runtime the build emits or on the
+    order upstream lists the props in.
+    """
+    edits = []
+    for node in source.find(_CREATE):
+        create_arm = _arm(node)
+        if create_arm is None:
+            continue
+        update_arm = _sibling_arm(create_arm, _UPDATE)
+        if update_arm is None:
             continue
 
-        switch_end = switch_case_end(output, update_start + len(update_needle))
-        create_segment = output[create_start:update_start]
-        update_segment = output[update_start:switch_end]
-        index = update_start + len(update_needle)
-
-        if _ALREADY_CREATE_DIFF in create_segment:
-            continue
-
-        create_match = _CREATE_RETURN.search(create_segment)
-        if not create_match:
-            continue
-        update_match = _UPDATE_RENDERER.search(update_segment)
-        if not update_match:
+        # `js.only`, not `js.first`: the created render is rewritten and the
+        # update render is read for the renderer/component/style it lends, and a
+        # rewrite that takes the first of two matches is how a decoy wins without
+        # a counter moving (docs/PLAYBOOK.md). Cardinality is 1 on every build in
+        # the corpus, so this costs nothing today and turns a second match into
+        # one broken patch naming its own confusion.
+        created = js.only(
+            js.every(
+                create_arm,
+                lambda n: (
+                    n.type == "call_expression"
+                    and all(name in js.call_props(n) for name in _CREATE_PROPS)
+                ),
+            ),
+            "created-file renders in this arm",
+        )
+        updated = js.only(
+            js.every(
+                update_arm,
+                lambda n: (
+                    n.type == "call_expression"
+                    and all(name in js.call_props(n) for name in _UPDATE_PROPS)
+                ),
+            ),
+            "updated-file renders in this arm",
+        )
+        if created is None or updated is None:
             continue
 
         outcome.candidates += 1
-        ns, factory = create_match.group(1), create_match.group(2)
-        file_var, content_var, verbose_var = create_match.group(4, 5, 6)
-        diff_renderer, style_var = update_match.group(1), update_match.group(2)
-
-        counter = _LINE_COUNTER.search(create_segment)
-        line_count = (
-            f"{counter.group(1)}({content_var})"
-            if counter
-            else f'{content_var}===""?0:{content_var}.split(`\\n`).length'
+        made = js.call_props(created)
+        path, content, verbose = (
+            js.text(made["filePath"]),
+            js.text(made["content"]),
+            js.text(made[_VERBOSE]),
         )
+        renderer = js.text(updated.child_by_field_name("function"))
+        component = js.text(js.arguments(updated)[0])
+        style = js.text(js.call_props(updated)["style"])
+        lines = _line_count(create_arm, content)
+        if lines is None:
+            continue
 
-        before = create_match.group(0)
-        after = (
-            f"return {ns}.{factory}({diff_renderer},{{"
-            f"filePath:{file_var},structuredPatch:[{{oldStart:1,oldLines:0,newStart:1,"
-            f"newLines:{line_count},"
-            f'lines:{content_var}===""?[]:{content_var}.split(`\\n`)'
-            f'.map((__cc_line)=>"+"+__cc_line)}}],'
-            f"firstLine:{content_var}.split(`\\n`)[0]??null,"
-            f'fileContent:"",style:{style_var},verbose:{verbose_var},previewHint:void 0}})'
+        edits.append(
+            Edit.replace(
+                created,
+                f"{renderer}({component},{{"
+                f"filePath:{path},structuredPatch:[{{"
+                f"oldStart:1,oldLines:0,newStart:1,newLines:{lines},"
+                f'lines:{content}===""?[]:{content}.split(`\\n`)'
+                f'.map((__cc_line)=>"+"+__cc_line)}}],'
+                f"firstLine:{content}.split(`\\n`)[0]??null,"
+                f'fileContent:"",style:{style},verbose:{verbose},'
+                f"previewHint:void 0}})",
+            )
         )
+        outcome.applied += 1
 
-        next_segment = create_segment.replace(before, after, 1)
-        if next_segment != create_segment:
-            outcome.applied += 1
-            output = splice(output, create_start, update_start, next_segment)
-            index = create_start + len(next_segment)
-
-    return output
+    return source.apply(edits)
 
 
 PATCHES = [
@@ -160,7 +245,7 @@ PATCHES = [
         summary="Show full read/search tool calls instead of collapsed one-line summaries.",
         group=GROUP_OUTPUT,
         fn=_tool_call_verbose,
-        anchors=('case"collapsed_read_search"',),
+        anchors=(_COLLAPSED,),
     ),
     Patch(
         id="create-diff",
@@ -168,6 +253,6 @@ PATCHES = [
         summary="Render created files through the diff view so added lines keep + and green.",
         group=GROUP_OUTPUT,
         fn=_create_diff_colors,
-        anchors=('case"create":', 'case"update":'),
+        anchors=(_CREATE, _UPDATE, "structuredPatch:"),
     ),
 ]

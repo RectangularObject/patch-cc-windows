@@ -11,7 +11,8 @@ from pathlib import Path
 
 from . import __version__, locate
 from .bun import Bundle, container
-from .patches import ALL_PATCHES, DEFAULT_SUFFIX, Options, Outcome, Patch
+from .js import Edit, Source, SyntaxGateError
+from .patches import ALL_PATCHES, Options, Outcome, Patch
 
 #: Every patched bundle ends with one comment line recording exactly what was
 #: applied. Comments cannot collide with code, survive re-extraction, and make
@@ -57,11 +58,16 @@ class PatchReport:
 
     @property
     def ok(self) -> bool:
-        """Did this run write a binary carrying every selected patch, whole?
+        """Did this run write a binary with no *broken* patch dropped from it?
 
-        The exit code of both surfaces, in one place -- a broken patch is left
-        out of the binary, so a run that dropped one has not done what it was
-        asked and must not report success.
+        The exit code of both surfaces, in one place. ``broken`` is the bar, not
+        ``whole``: a broken patch (nothing landed) is left out of the binary, so
+        a run that dropped one has not done what it was asked and must not report
+        success. A ``partial`` patch -- some sites landed, some drifted -- *does*
+        ship and is not a regression here, because dropping a landed feature over
+        a missing refinement would cost the user more than the drift does; that
+        is the one verdict `apply` and `doctor` read differently on purpose
+        (:attr:`patch_cc.doctor.DryRun.unhealthy`).
         """
         return self.output is not None and not self.regressions
 
@@ -83,27 +89,18 @@ def manifest_payload(landed: list[str], options: Options) -> dict:
     """
     applied = set(landed)
     payload: dict = {"v": 1, "tool": __version__, "patches": landed}
-    if options.rebrands and "branding" in applied:
-        payload["brand"] = options.brand
-    if options.version_suffix != DEFAULT_SUFFIX and "version-marker" in applied:
-        payload["suffix"] = options.version_suffix
-    if options.subagent_models and "subagent-models" in applied:
-        payload["models"] = options.subagent_models
-    if "org-label" in applied:
-        # Recorded even when empty: "" is the asked-for value (hide the
-        # segment), and omitting it would make hidden indistinguishable from
-        # never-configured when the menu seeds from this manifest.
-        payload["org"] = options.org_label
-    if options.codex_models and "codex-models" in applied:
-        # Ids and a port -- the whole of what was asked for. A model's name and
-        # context window are baked into the bundle itself (the picker rows, the
-        # window table), and re-stating them here would be a second copy free to
-        # disagree with it; they are also derived from the plan, so a backend that
-        # relabelled a model would read as an edit nobody made.
-        payload["codex"] = {
-            "port": options.codex_port,
-            "models": [m.id for m in options.codex_models],
-        }
+    # Each configurable patch declares its own manifest key and how to fill it
+    # (`Patch.setting`), so this records what is *in the binary* without a chain
+    # of `patch.id ==` here that could drift from the cache's spelling. A value
+    # is recorded only when its patch landed *and* there is one worth recording
+    # (`recorded`): a brand at the default, or no override, leaves no key -- so
+    # `status` can never assert a name the bundle does not carry. `org-label`'s
+    # `recorded` is always true, because an empty org label is the real value
+    # "hide the segment", not the absence of a choice.
+    for patch in ALL_PATCHES:
+        setting = patch.setting
+        if setting is not None and patch.id in applied and setting.recorded(options):
+            payload[setting.manifest_key] = setting.to_manifest(options)
     return payload
 
 
@@ -113,22 +110,27 @@ def build_manifest(landed: list[str], options: Options) -> str:
     return "\n" + MANIFEST_PREFIX + payload + "\n"
 
 
-def read_manifest(source: str) -> dict | None:
-    """The applied-patch record, or ``None`` for pristine/legacy binaries."""
-    start = source.rfind("\n" + MANIFEST_PREFIX)
+def read_manifest(source: Source) -> dict | None:
+    """The applied-patch record, or ``None`` for pristine/legacy binaries.
+
+    A byte scan, so asking it never buys a parse -- `status` and the menu's
+    first screen answer from here without touching the grammar.
+    """
+    marker = ("\n" + MANIFEST_PREFIX).encode()
+    start = source.data.rfind(marker)
     if start == -1:
         return None
-    start += 1 + len(MANIFEST_PREFIX)
-    end = source.find("\n", start)
-    line = source[start:] if end == -1 else source[start:end]
+    start += len(marker)
+    end = source.data.find(b"\n", start)
+    line = source.data[start:] if end == -1 else source.data[start:end]
     try:
         data = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
     return data if isinstance(data, dict) else None
 
 
-def is_patched(source: str) -> bool:
+def is_patched(source: Source) -> bool:
     """Whether the bundle carries our manifest -- the one mark of our work.
 
     Authorship is declared, never inferred. This used to also sniff side
@@ -148,8 +150,8 @@ def selected_patches(ids: list[str]) -> list[Patch]:
 
 
 def run_patches(
-    source: str, patches: list[Patch], options: Options
-) -> tuple[str, list[tuple[Patch, Outcome]]]:
+    source: Source, patches: list[Patch], options: Options
+) -> tuple[Source, list[tuple[Patch, Outcome]]]:
     results: list[tuple[Patch, Outcome]] = []
     current = source
     for patch in patches:
@@ -255,9 +257,8 @@ def patch_installation(
     options: Options,
     *,
     bundle: Bundle | None = None,
-    out_path: Path | None = None,
 ) -> PatchReport:
-    """Patch ``install`` (or write to ``out_path``) with the ``selected`` patches.
+    """Patch ``install`` with the ``selected`` patches.
 
     Patching always starts from a pristine source (:func:`read_pristine`), so
     re-applying replaces the previous patch set instead of stacking on it.
@@ -271,6 +272,11 @@ def patch_installation(
             "so there is nothing clean to patch from. Run `patch-cc restore`, "
             "or reinstall Claude to get a clean binary."
         )
+
+    # Before anything is rewritten: a bundle that does not parse to begin with
+    # cannot be told apart from one a splice broke, and every rewrite made to it
+    # would be blamed in turn. Asked here, it is answered once and as itself.
+    source.source.verify()
 
     # A broken patch still rewrote *something*, and those orphan edits would ship
     # unrecorded -- a feature half-present that the manifest cannot describe. So
@@ -302,19 +308,42 @@ def patch_installation(
         # Nothing changed; writing would only strip bytecode for no benefit.
         return report
 
-    patched_source += build_manifest(landed, options)
+    # The manifest is appended through the same gated edit as every rewrite, so
+    # the bundle that gets written is one no splice -- the manifest's included --
+    # left unparseable, and it is checked as the bytes it will be rather than as
+    # a promise about them. Raising here leaves the install and the backup
+    # untouched: nothing below this line has run yet.
+    patched_source = patched_source.apply(
+        [Edit.at(len(patched_source), build_manifest(landed, options))]
+    )
 
-    target = out_path or install.binary
-    # Writing the install is the only case that needs a pristine copy kept; an
-    # `out_path` leaves it alone. There is deliberately no way to patch the
-    # install *without* the backup -- that switch existed, had no caller, and its
-    # only effect was to skip the one thing `restore` depends on.
-    if out_path is None:
-        report.backup = _backup(install)
+    # One last gate, on the exact bytes about to be written, from a `Source` that
+    # shares nothing with the incremental tree every edit above was checked
+    # against. `Source.apply` keeps that tree in step and reparses at each batch
+    # -- fast, and correct on every build in the corpus -- but it is one lineage,
+    # trusted end to end, and the write verifier below re-extracts and compares
+    # bytes, so it agrees with a splice the incremental parse blessed and a full
+    # parse would reject. A parse from scratch is the only thing that would catch
+    # an incremental-reparse bug before it reaches the user's binary. It costs
+    # one full parse (~3 s) on the final image alone, and `doctor` never exercises
+    # it (a dry run does not write), so this is its one home.
+    defect = Source(patched_source.data).defect()
+    if defect is not None:
+        raise SyntaxGateError(
+            "the patched bundle does not parse as a whole, though each edit did "
+            f"incrementally; refusing to write: {defect}"
+        )
 
-    container.write(source, patched_source, str(target))
-    report.output = Path(target)
-    report.patched_size = Path(target).stat().st_size
+    # Unconditional, and there is deliberately no way to ask for a write without
+    # it. Two parameters have offered one now -- a switch that skipped the copy,
+    # then an `out_path` that wrote somewhere else instead -- and neither ever had
+    # a caller. What each really added was a path on which `restore` has nothing
+    # to hand back, which is the one guarantee this file exists to keep.
+    report.backup = _backup(install)
+
+    container.write(source, patched_source.data, str(install.binary))
+    report.output = install.binary
+    report.patched_size = install.binary.stat().st_size
     return report
 
 
