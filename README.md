@@ -8,7 +8,7 @@ you want — inline and live thinking, detailed tool calls, subagent model
 overrides, your own startup name, your **ChatGPT/Codex-plan GPT models as
 native models** — and apply them to your installed `claude` in one keystroke.
 Fully reversible: a pristine backup is kept, `patch-cc restore` puts it back.
-Pure Python; no Node, no Bun.
+No Node, no Bun.
 
 ```bash
 uvx patch-cc                   # fullscreen menu, no install needed
@@ -63,7 +63,7 @@ patch-cc                       # then just run it
 | Chrome & branding | Disable spinner tips | No rotating tips on the spinner |
 | | Mark `--version` | Appends `(patched)` — or any marker you choose |
 | | Custom startup name | Defaults to `<your username>'s Code` |
-| | Startup org/email label | Replace the org/email on the welcome screen — or hide it |
+| | Startup org/email label | Replace the org/email on the welcome screen — or hide it (demo mode keeps the stock line) |
 
 ## Usage
 
@@ -168,9 +168,13 @@ startup name / `--version` marker are visible tells too.
 
 Claude Code now ships only as a Bun single-file executable; the npm package is a
 wrapper that downloads it. patch-cc edits the JavaScript bundle embedded in the
-binary's `.bun` section in place. It also drops the module's 154 MB of stale
-precompiled bytecode — editing the source invalidates it anyway — so a patched
-binary is *smaller* than the original (≈113 MB vs 267 MB), not larger.
+binary's `.bun` section in place. It also drops the entry module's stale
+precompiled bytecode — editing the source invalidates it anyway, and it is more
+than half the download — so on Linux, where the ELF section is rewritten in
+place, a patched binary is *smaller* than the original, not larger. (On macOS
+the freed bytes are not yet reclaimed, so the file keeps its size; it still runs
+correctly.) [docs/INTERNALS.md](docs/INTERNALS.md#the-bytecode-and-why-we-drop-it)
+has the measurements; `patch-cc status` has yours.
 
 See [docs/INTERNALS.md](docs/INTERNALS.md) for the container format and
 [docs/PLAYBOOK.md](docs/PLAYBOOK.md) for repairing a patch after an update.

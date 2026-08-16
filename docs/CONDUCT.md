@@ -30,26 +30,44 @@ shape that already absorbs every case, found rather than bolted on.
 
 - **Explicit invocations are hermetic.** A non-interactive command's arguments
   are its whole input; no saved state may *silently* change what it does.
-  Persisted choices pre-fill the interactive UI and never act on their own — the
-  lone exception is `apply --from-cache`, which takes the cache as its *named*
-  input, so the state it reads is declared in the arguments, not hidden behind a
-  default. Absent that flag, the same command still always yields the same result.
+  Persisted choices pre-fill the interactive UI and never act on their own. Two
+  flags do read state, and each *names* the state it reads: `apply --from-cache`
+  takes the remembered selection, and `apply --codex` takes your plan's
+  catalogue — asking for a Codex model is asking for the plan that describes it,
+  so the display name and context window are read from there rather than
+  invented. Neither is hidden behind a default, and absent both, the same command
+  always yields the same result. Asking for a Codex model is also the one thing
+  whose *output* can differ between two identical invocations — under either flag
+  that does it, `--codex` naming ids directly or `--from-cache` replaying a
+  remembered set that holds them (both re-read the plan at bake time): a plan
+  that cannot be reached is not an error, so the id still bakes, on its
+  fallbacks. That is the price of not guessing a context window, and it is paid
+  under flags that say so.
 
-- **Anchor matchers on meaning.** String literals, `case` labels, prop names,
-  control-flow shape — never a minified local that changes every build. A new
-  upstream shape earns a narrow new branch, not a looser regex. Full rules and
-  the repair loop: [PLAYBOOK.md](PLAYBOOK.md).
+- **Find by the name upstream wrote; edit the grammar node.** The authored
+  names — string literals, `case` labels, property names — and the shape of the
+  tree are what a build keeps. Never describe the syntax between them, and never
+  anchor on a minified local: that is the half a minifier regenerates. A new
+  upstream *shape* earns a narrow new branch; a new *spelling* of one shape
+  should already cost nothing. Full rules and the repair loop:
+  [PLAYBOOK.md](PLAYBOOK.md).
 
 - **Report absent apart from broken.** A matcher that finds nothing may be a
   shape this build simply lacks — most patches carry several — not a regression.
   Keep "gone", "already applied", and "not on this build" as distinct signals;
   never collapse them into one number. Which one a sub-step's silence means is
-  not guesswork: declare it (`expect=True`, or a variant group) so a green tick
-  cannot cover a dead feature. See [PLAYBOOK.md](PLAYBOOK.md).
+  not guesswork: declare it (`expect=True`) so a green tick cannot cover a dead
+  feature. A step nobody declared is a step that cannot report its own death:
+  `branding` carried none, so a name badge that stopped being a bold render was
+  a green run, an unchanged banner, and a manifest asserting the new name. See
+  [PLAYBOOK.md](PLAYBOOK.md).
 
-- **Port faithfully.** When you change a patch, verify its output against the
-  upstream reference on a real bundle — byte-identical where behaviour must not
-  change. The JS→Python porting traps are in [PLAYBOOK.md](PLAYBOOK.md).
+- **Port faithfully.** When you change a patch, verify its output against a real
+  bundle — byte-identical where behaviour must not change. `doctor` over the
+  archived corpus is that check, and the *diff* between two sweeps is the half
+  that matters: a red build is loud on its own, but a widened locator shows up
+  only as an old build's counts quietly moving. Be able to say what every moved
+  number means. The sweep is in [PLAYBOOK.md](PLAYBOOK.md).
 
 - **The user controls commits and releases.** Don't commit, push, or publish
   unless asked.

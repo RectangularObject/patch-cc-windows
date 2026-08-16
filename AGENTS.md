@@ -16,3 +16,10 @@ Verify with `uv run patch-cc doctor` (every patch against a clean bundle;
 point it at the pristine copies in `~/.local/share/patch-cc/backups/` to sweep
 older builds). There is no test suite by design — doctor against real bundles
 is the check.
+
+Be exact about what that covers: doctor runs the **matchers** and parses the
+bundle they produce. It never runs the gateway, the translator, the OAuth flow
+or the menu, so a change under `src/patch_cc/codex/` (the bridge — all of it
+runtime, none of it a patch; the Codex *patch* is `patches/codex.py`, which the
+sweep does cover) or in `menu.py` is checked by exercising it — a real `codex
+serve` against a real turn — and a green sweep says nothing about it.
