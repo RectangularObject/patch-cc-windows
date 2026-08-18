@@ -20,7 +20,7 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The reproducible set on the machine this was written on — 11 distinct binaries
+The reproducible set on the machine this was written on — 12 distinct binaries
 by content (the SHA-256 is the whole file, `sha256sum <version>.orig`):
 
 | version | size | sha256 |
@@ -36,13 +36,14 @@ by content (the SHA-256 is the whole file, `sha256sum <version>.orig`):
 | `2.1.227` | 304 MB | `6832dc3f1797b890b71116e5f2dbbf9a83fd3d0498c235b4b0f9cd0e6e499ad6` |
 | `2.1.228` | 309 MB | `d535985e6941a3eb00179ccd7f52ceb0c6623a0305a518ebc4e6514f84a94c99` |
 | `2.1.233` | 325 MB | `55d281096f57d411ebbdd94dbf5e9ff3accb7c05713e37348c2c11d4b83bf9d9` |
+| `2.1.234` | 328 MB | `3473601ea695d5bf769c5b202844d4cb4fbf723ae995450fcb6973204775c84a` |
 
 The backup directory holds a few more files than rows here, and that is not a
 discrepancy: a pre-0.2.0 backup doubled the version into its name
 (`2.1.216.2.1.216.orig`), and a binary installed under a non-version name is
 saved as `claude.unknown-<hash>.orig`. Both of the extras present hash-match the
 `2.1.216` row above — same bytes, a different filename — which is why the count
-of *files* (13) and the count of *distinct binaries* (11) differ.
+of *files* (14) and the count of *distinct binaries* (12) differ.
 
 ## Rebuild or extend it
 

@@ -116,6 +116,18 @@ The tree removes the *mechanical* fragility. It does not decide these:
   that branch verbatim rather than constructing a flush call; `org-label` builds
   its line from upstream's own no-org string, so nothing here spells the
   separator. What you copy cannot drift from what you copied it from.
+- **Match an identity by the weakest claim that still proves it; hold a rewrite
+  to the exact node.** The two jobs pull in opposite directions.
+  `thinking-inline`'s null-guard neutralises only a `return` that answers
+  exactly `null`, because deleting a conditional answer would delete behaviour
+  — for a rewrite, doubt means stop. The codex resolvers' *identity* is the
+  opposite case: "rejects an unknown model" was once asked as "the default
+  returns exactly `null`", and 2.1.234 wrapping that same rejection in a dead
+  recognizer (`return vXu(e)?xVe(t):null`, the stub answering `!1` — behaviour
+  identical) read the resolver as gone with every anchor count standing.
+  Identity asks what the node *can* answer — membership among its possible
+  values, the same rule props and arrays already follow — and exactness there
+  is a break waiting on upstream's next harmless addition.
 - **Never anchor on a minified local** (`A_`, `mET`, `wg6`). Unchanged, and now
   structural: you capture the node, so there is never a reason to spell one.
 
@@ -883,7 +895,7 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   |---|---|---|
   | `enum`\* | the Task tool's `model` enum, so a subagent can be pinned to a Codex id | `agents.model_enums` — the same arrays `discover_models` reads |
   | `validator`\* | the known-model array — it gates *resolution*, not just acceptance | the array whose strings *include* `sonnet`/`opus`/`haiku`/`opusplan` — membership, never their order |
-  | `resolver`\* | the override resolver (managed `availableModels` only) | the `"best"` arm whose `switch` answers `null` for an unknown model |
+  | `resolver`\* | the override resolver (managed `availableModels` only) | the `"best"` arm whose `switch` *can* answer `null` for an unknown model |
   | `general-resolver`\* | the resolver every ordinary request uses | the `"best"` arm whose `switch` has no answer of its own for one |
   | `redirect`\* | swaps the request origin to `127.0.0.1:<port>` | the `buildRequest` method that builds a URL (the others — two to four across the corpus — only delegate to `super`) |
   | `picker` | the `/model` list | the function every row list is handed to: it loops, adds, and returns its first parameter |
@@ -994,15 +1006,26 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   registered, with the manifest asserting the override. Now the dropped patch
   takes its pins down with it.
 
-  The two resolvers are told apart by **what they answer, never by their
-  minified names or by a statement form** — the override one rejects an unknown
-  model with `default:return null`, the general one has no answer for it and
-  falls through to handing the name back. That is a fact about what each
-  resolver is *for*. Braces around an arm are not: they were the discriminator
-  once, and putting a `let` in the general resolver's `case"best"` was enough to
-  make every family shortcut vanish with the patch still green and seven of
-  seven steps applied. The `buildRequest` methods and the
-  `models`-shaped objects are likewise separated by what they *do* and *carry*.
+  The two resolvers are told apart by **what each answers for an unknown
+  model, never by their minified names or by a statement form** — `null` is
+  among what the override one's default *can* answer, read off the grammar's
+  own value routing (a ternary answers with either branch, `||`/`??` with
+  their right side; 2.1.234 wrapped the same rejection in a dead recognizer,
+  `return vXu(e)?xVe(t):null` with the stub answering `!1`, and the exact
+  spelling read a behaviourally identical build as the resolver being gone),
+  while the general one has no answer of its own — nothing in its default
+  scoped to return or throw — and falls through to handing the name back.
+  Both identities are asked positively, of switches whose labels carry the
+  built-in models (the membership `validator` asks of its array, asked of the
+  labels — a throwaway `case"best":` elsewhere is nothing, not an arm to
+  classify), and an arm answering neither *raises* instead of swelling the
+  other side: under the complement this replaced, a reshaped override slid
+  silently into the general list, and only the required step's zero was left
+  to speak. Braces around an arm are no discriminator either: they were, once,
+  and a `let` in the general resolver's `case"best"` was enough to make every
+  family shortcut vanish with the patch still green and seven of seven steps
+  applied. The `buildRequest` methods and the `models`-shaped objects are
+  likewise separated by what they *do* and *carry*.
 
   **Two resolvers, and why both.** The **general** one turns `opus`
   into `claude-opus-4-8`, its return value *replaces* the model before the

@@ -165,52 +165,153 @@ def claimed_model_names(source: Source) -> set[str]:
 # ----------------------------------------------------------------- resolvers
 #
 # The binary has TWO model resolvers and a shortcut needs an arm in both. They
-# are told apart by what they *answer*, never by their minified names or by a
-# statement form: the override resolver (reached only when managed
-# `availableModels` are active) rejects an unknown name with `null`; the general
-# resolver -- the one every ordinary request uses, which turns `opus` into
-# `claude-opus-4-8` -- has no answer of its own for one and falls through to
-# passing it straight back.
+# are told apart by what each *answers* for an unknown model, never by their
+# minified names or by a statement form: the override resolver (reached only
+# when managed `availableModels` are active) has a closed list and rejects --
+# null is among what its default can answer -- while the general resolver (the
+# one every ordinary request uses, which turns `opus` into `claude-opus-4-8`)
+# has no answer of its own and falls through to passing the name straight back.
+# Both identities are asked positively, of every model resolver, and an arm
+# answering neither raises instead of swelling the other side: a complement
+# cannot report its own absence.
 
 
 def _best_arms(source: Source) -> list[js.Node]:
-    """Every arm labelled ``"best"``, which is where new model arms are spliced.
+    """Every model resolver's ``"best"`` arm -- where new model arms are spliced.
 
     The label is the name and the arm is the node; ``case"best":`` written out
-    is the two of them with the minifier's spacing in between.
+    is the two of them with the minifier's spacing in between. The switch also
+    has to *be* a model resolver -- its labels carry the built-in models, the
+    same membership `_validators` asks of its array -- because everything here
+    applies to every arm of the kind: a throwaway ``case"best":`` in unrelated
+    code must be nothing to a registration that would splice into it and to a
+    classifier that would be asked what it is (`_resolvers`).
     """
     found = []
     for node in source.find(_BEST):
         arm = js.up(node, "switch_case")
-        if arm is not None and arm.child_by_field_name("value") == node:
+        if (
+            arm is not None
+            and arm.child_by_field_name("value") == node
+            and set(_BUILT_IN_MODELS) <= _labels(arm)
+        ):
             found.append(arm)
     return found
 
 
-def _rejects_unknown(arm: js.Node) -> bool:
-    """Does this arm's ``switch`` answer ``null`` when nothing matched?
+def _labels(arm: js.Node) -> set[str]:
+    """The string labels of this arm's whole ``switch``, as their values.
 
-    The two resolvers differ in what an unknown model means to them, which is a
-    fact about what each is *for*: the override resolver has a closed list and
-    rejects, the general one passes the name through for something downstream to
-    judge. Whether either spells an arm as ``case"best":return f()`` or
-    ``case"best":{return f()}`` is the minifier's business -- and telling them
+    A set: which names the switch dispatches on is the question, and neither
+    their order nor what sits between them is part of it.
+    """
+    return {
+        js.text(value)[1:-1]
+        for case in js.children(arm.parent)
+        if case.type == "switch_case"
+        for value in [case.child_by_field_name("value")]
+        if value is not None and value.type == "string"
+    }
+
+
+def _answer(statement: js.Node) -> js.Node | None:
+    """The expression a ``return`` answers with -- nothing for a bare ``return;``."""
+    parts = [child for child in js.children(statement) if child.type != "comment"]
+    return parts[0] if parts else None
+
+
+def _may_answer_null(expr: js.Node | None) -> bool:
+    """Can this expression's value be ``null``?
+
+    Asked of the grammar's own value routing, so the rejection keeps counting
+    however much recognition upstream composes in front of it: a ternary
+    answers with either branch, parentheses and a sequence with their last
+    expression, ``||`` and ``??`` with their right side (a null on their left
+    is exactly what both exist to pass over), ``&&`` with either side (null is
+    falsy), an assignment with the value it assigns. Everything else -- a call,
+    an identifier, an ``await`` -- is opaque: it may well evaluate to null, but
+    the grammar does not say so, and a rejection hidden behind one is a new
+    shape to be told about (`_resolvers` raises), never one to absorb.
+
+    2.1.234 is why this is a question about *possible* answers and not the
+    answer's spelling: the override default became ``return vXu(e)?xVe(t):null``
+    with ``vXu`` a stub returning ``!1`` -- behaviour identical to ``return
+    null`` -- and "exactly a bare null" read that build's rejection as gone.
+    """
+    if expr is None:
+        return False
+    if expr.type == "null":
+        return True
+    if expr.type == "ternary_expression":
+        return any(
+            _may_answer_null(expr.child_by_field_name(field))
+            for field in ("consequence", "alternative")
+        )
+    if expr.type in ("parenthesized_expression", "sequence_expression"):
+        parts = [child for child in js.children(expr) if child.type != "comment"]
+        return bool(parts) and _may_answer_null(parts[-1])
+    if expr.type == "assignment_expression":
+        return _may_answer_null(expr.child_by_field_name("right"))
+    if expr.type == "binary_expression":
+        operator = expr.child_by_field_name("operator")
+        sides = {"&&": ("left", "right"), "||": ("right",), "??": ("right",)}
+        return any(
+            _may_answer_null(expr.child_by_field_name(field))
+            for field in sides.get("" if operator is None else operator.type, ())
+        )
+    return False
+
+
+def _resolvers(source: Source) -> tuple[list[js.Node], list[js.Node]]:
+    """Every model resolver, classified: (override, general).
+
+    Each identity is asked positively of the arm's own ``switch``: the override
+    resolver's default *can answer null* (`_may_answer_null`, over the
+    default's scoped returns -- a callback's ``return`` answers for the
+    callback); the general resolver's default has no answer of its own --
+    absent, or with nothing scoped to return or throw -- so an unknown model
+    falls out of the switch and back to the caller's passthrough. Whether
+    either spells an arm as ``case"best":return f()`` or
+    ``case"best":{return f()}`` is the minifier's business -- telling them
     apart by that was a silent failure waiting: brace the general resolver (a
     `let` in the arm is enough) and every family shortcut disappeared with the
     patch still green.
+
+    The identities exclude each other by construction, and an arm holding
+    neither -- a default that answers something, never null -- raises, which
+    `Patch.run` turns into one broken patch naming the new shape (the promise
+    `js.only` keeps for cardinality, kept here for classification). Under the
+    complement this replaced, such an arm slid silently into the general list,
+    and only a required step's zero was left to say anything at all.
     """
-    default = next(
-        (
-            sibling
-            for sibling in js.children(arm.parent)
-            if sibling.type == "switch_default"
-        ),
-        None,
-    )
-    if default is None:
-        return False
-    answer = js.first(default, js.of_type("return_statement"))
-    return answer is not None and [c.type for c in answer.named_children] == ["null"]
+    override: list[js.Node] = []
+    general: list[js.Node] = []
+    for arm in _best_arms(source):
+        default = next(
+            (
+                sibling
+                for sibling in js.children(arm.parent)
+                if sibling.type == "switch_default"
+            ),
+            None,
+        )
+        answers = js.every(default, js.of_type("return_statement"), scoped=True)
+        refusals = js.every(default, js.of_type("throw_statement"), scoped=True)
+        if not answers and not refusals:
+            general.append(arm)
+        elif any(_may_answer_null(_answer(statement)) for statement in answers):
+            override.append(arm)
+        else:
+            answered = [_answer(statement) for statement in answers]
+            kinds = sorted(
+                {"nothing" if value is None else value.type for value in answered}
+                | ({"a throw"} if refusals else set())
+            )
+            raise ValueError(
+                "a model resolver neither rejects an unknown model nor passes "
+                f"it through: its default answers {', '.join(kinds)}"
+            )
+    return override, general
 
 
 def _existing_arms(arm: js.Node) -> set[str]:
@@ -241,12 +342,12 @@ def _arms(resolution: dict[str, str]) -> str:
 
 def _override_resolvers(source: Source) -> list[js.Node]:
     """Every resolver reached only when managed ``availableModels`` are active."""
-    return [arm for arm in _best_arms(source) if _rejects_unknown(arm)]
+    return _resolvers(source)[0]
 
 
 def _general_resolvers(source: Source) -> list[js.Node]:
     """Every resolver an ordinary request goes through."""
-    return [arm for arm in _best_arms(source) if not _rejects_unknown(arm)]
+    return _resolvers(source)[1]
 
 
 def _register_arms(
@@ -760,6 +861,11 @@ def _codex_models(source: Source, options: Options, outcome: Outcome) -> Source:
         return source
 
     model_ids = [m.id for m in options.codex_models]
+    # Classified once here for the gate and the note; the registrations below
+    # re-derive from the source each hands the next, since every batch of edits
+    # is a new parse. A count that moves on a green run is the early warning.
+    override, general = _resolvers(source)
+    outcome.note(f"resolvers: {len(override)} override, {len(general)} general")
     # Family shortcuts (`sol` -> the newest `gpt-<ver>-sol`) resolve to an id
     # before the request is built, so they ride only the surfaces that accept,
     # resolve, and show a model -- validator, both resolvers, picker. They need no
@@ -770,7 +876,7 @@ def _codex_models(source: Source, options: Options, outcome: Outcome) -> Source:
     # so absent it, no shortcut is registered anywhere and the ids (which need none
     # of this) carry on untouched.
     shorts = family_aliases(options.codex_models)
-    if shorts and not _general_resolvers(source):
+    if shorts and not general:
         outcome.note("general model resolver anchor drifted; shortcuts skipped")
         shorts = {}
 
