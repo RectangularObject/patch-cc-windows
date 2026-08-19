@@ -957,7 +957,7 @@ class MenuApp:
         if creds is None:
             raise oauth.OAuthError("not signed in")
         token, creds = oauth.valid_access(creds)
-        return discover(token, creds.account_id, self.model.install.version or "")
+        return discover(token, creds.account_id, self.model.install.known_version or "")
 
     def _open_codex_picker(self, offered: list[CodexModel]) -> None:
         if not offered:
@@ -1058,14 +1058,14 @@ class MenuApp:
                 return
             self._start_worker(
                 "apply",
-                f"Patching Claude {self.model.install.version or '?'} …",
+                f"Patching Claude {self.model.install.known_version or '?'} …",
                 lambda: self._apply(selection),
             )
 
         count = len(selection.patches)
         self._push(
             ConfirmModal(
-                f"Patch Claude {self.model.install.version or '?'} "
+                f"Patch Claude {self.model.install.known_version or '?'} "
                 f"with {count} patch{'es' if count != 1 else ''}?",
                 "save",
             ),
@@ -1088,7 +1088,7 @@ class MenuApp:
             # Dropping belongs to the picker, which lists the plan live, so a model
             # that has gone simply has no row left to tick -- visible, and undoable.
             options.codex_models, _ = reconcile(
-                options.codex_models, self.model.install.version or ""
+                options.codex_models, self.model.install.known_version or ""
             )
         report = patcher.patch_installation(
             self.model.install,
@@ -1352,7 +1352,7 @@ class MenuApp:
     def _status_line(self) -> Text:
         model = self.model
         line = Text()
-        line.append(f"Claude {model.install.version or '?'}", style="bold")
+        line.append(f"Claude {model.install.known_version or '?'}", style="bold")
         line.append("  ·  ", style="dim")
         if model.status.patched:
             applied = len(model.applied_ids())

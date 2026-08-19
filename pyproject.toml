@@ -36,6 +36,11 @@ dependencies = [
     "rich>=13.7",
     "blessed>=1.47.0",
     "lief>=0.15; sys_platform == 'darwin'",
+    # Reads the FileVersion resource off the installed claude.exe, for display
+    # only (src/patch_cc/locate.py:_pe_display_version) -- the Windows install
+    # is a fixed-path copy whose name never carries the version the way a
+    # symlinked launcher's does.
+    "pefile>=2023.2.7; sys_platform == 'win32'",
     # How the bundle is located in and checked before writing
     # (src/patch_cc/js.py). No Node or Bun runtime is involved: the grammar is a
     # C library, shipped by `tree-sitter-javascript` as one abi3 wheel per
@@ -68,6 +73,11 @@ python_version = "3.11"
 # lief is a macOS-only dependency, so it is absent when checking anywhere else.
 [[tool.mypy.overrides]]
 module = "lief.*"
+ignore_missing_imports = true
+
+# pefile is a Windows-only dependency and ships no type stubs.
+[[tool.mypy.overrides]]
+module = "pefile.*"
 ignore_missing_imports = true
 
 [tool.hatch.version]

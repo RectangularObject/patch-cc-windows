@@ -49,6 +49,17 @@ class Installation:
     launcher: Path
     binary: Path
     version: str | None
+    #: Best-effort version for *display only*, when the filename does not carry
+    #: one -- every Windows install (see `_version_of`). Never read by
+    #: `patcher.py`: its backup-naming and restore-refusal logic keys off
+    #: `version is None` to mean "fixed-path launcher", and this field must not
+    #: change that verdict, only fill in the "?" a fixed path otherwise shows.
+    display_version: str | None = None
+
+    @property
+    def known_version(self) -> str | None:
+        """The version to show, even where `version` itself is `None`."""
+        return self.version or self.display_version
 
     @property
     def is_symlinked(self) -> bool:
@@ -58,6 +69,36 @@ class Installation:
 def _version_of(binary: Path) -> str | None:
     name = binary.name
     return name if _VERSION_DIR.match(name) else None
+
+
+def _pe_display_version(binary: Path) -> str | None:
+    """``FileVersion`` from a Windows PE's VERSIONINFO resource, or ``None``.
+
+    The Windows installer copies a plain ``claude.exe`` rather than symlinking
+    the launcher into ``versions/`` (see the module docstring), so `_version_of`
+    never has a version to read from that name -- every Windows install reports
+    `version=None` and the menu is left showing ``?``. The resource this reads
+    is untouched by patching (only the ``.bun`` section is rewritten), so it
+    reports correctly whether the binary is pristine or already patched.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import pefile
+    except ImportError:  # pragma: no cover - dependency is Windows-only
+        return None
+    try:
+        pe = pefile.PE(str(binary), fast_load=True)
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+        )
+        info = pe.VS_FIXEDFILEINFO[0]
+        major = info.FileVersionMS >> 16
+        minor = info.FileVersionMS & 0xFFFF
+        patch = info.FileVersionLS >> 16
+        return f"{major}.{minor}.{patch}"
+    except (pefile.PEFormatError, AttributeError, IndexError, OSError):
+        return None
 
 
 def _candidates() -> list[Path]:
@@ -86,7 +127,13 @@ def _resolve(path: Path) -> Installation | None:
     real = path.resolve()
     if not real.is_file():
         return None
-    return Installation(launcher=path, binary=real, version=_version_of(real))
+    version = _version_of(real)
+    return Installation(
+        launcher=path,
+        binary=real,
+        version=version,
+        display_version=version or _pe_display_version(real),
+    )
 
 
 def _is_native(binary: Path) -> bool:

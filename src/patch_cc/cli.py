@@ -496,7 +496,7 @@ def cmd_apply(args) -> int:
     else:
         selected, options = _requested(args, bundle.source)
 
-    version = install.version or "?"
+    version = install.known_version or "?"
     name = install.binary.name
     where = version if name == version else f"{version} ({name})"
     heading(f"Patching Claude {where}")
@@ -537,7 +537,7 @@ def cmd_status(args) -> int:
     bundle = container.read(str(install.binary))
     st = doctor.status(bundle)
 
-    heading(f"Claude {install.version or '?'}  ({install.binary})")
+    heading(f"Claude {install.known_version or '?'}  ({install.binary})")
     state = "[green]patched[/green]" if st.patched else "[yellow]not patched[/yellow]"
     console.print(f"  state:     {state}")
     if st.manifest:
@@ -600,7 +600,7 @@ def _doctor_target(path: str | None) -> tuple[Bundle, str] | None:
 
     install = locate.find_or_raise()
     bundle = container.read(str(install.binary))
-    label = f"Claude {install.version or '?'}"
+    label = f"Claude {install.known_version or '?'}"
     if not patcher.is_patched(bundle.source):
         return bundle, label
 
@@ -723,7 +723,7 @@ def cmd_extract(args) -> int:
 
 def _codex_version() -> str:
     install = locate.find()
-    return (install.version or "") if install else ""
+    return (install.known_version or "") if install else ""
 
 
 def _baked_port() -> int | None:
@@ -886,9 +886,9 @@ def _discover_binary() -> tuple[Source | None, str | None]:
     if install is None:
         return None, None
     try:
-        return patcher.read_pristine(install).source, install.version
+        return patcher.read_pristine(install).source, install.known_version
     except (BunError, OSError):
-        return None, install.version
+        return None, install.known_version
 
 
 def _example_model(models: list[str], offset: int = 0) -> str:
