@@ -11,7 +11,8 @@ Before the first patch of a version, patch-cc copies the pristine binary to
 `~/.local/share/patch-cc/backups/<version>.orig` ([INTERNALS.md](INTERNALS.md#safety)).
 The corpus is exactly those copies: not a fixture checked into the repo (each is
 ~300 MB), but a set that **accretes on its own** as Claude auto-updates and you
-re-patch. `doctor <path>` reads one; the sweep below reads all of them.
+re-patch — and that can be backfilled by saving any pristine native binary under
+the same name. `doctor <path>` reads one; the sweep below reads all of them.
 
 The binaries are the artifact, not this file — `doctor` recomputes every count
 from them, so nothing here can drift from what a matcher actually does. This
@@ -20,42 +21,52 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The reproducible set on the machine this was written on — 13 distinct binaries
-by content (the SHA-256 is the whole file, `sha256sum <version>.orig`):
+The whole published span `2.1.210` → `2.1.236` — 2.1.230 was never published —
+one pristine binary per version, 26 in all. Two pairs share a byte count
+(`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`) and are still distinct binaries,
+which is why the identity column is the hash (of the whole file,
+`sha256sum <version>.orig`) and never the size:
 
 | version | size | sha256 |
 |---|---|---|
+| `2.1.210` | 261 MB | `e7d2ceb53ed4c2ced1fe7fc1c6331c98dc5f7b4c9b2722d9c5fa3dd5dff6f719` |
+| `2.1.211` | 262 MB | `8272c8a474ac9ea1bc35f19b9f7c7e7dc4dc4eb6d5ad3e484b19335ac72446b2` |
+| `2.1.212` | 264 MB | `044a88cf3a5180776617fd3da1238dcbf9141ddec449a39cf7d2af1ac78e684e` |
+| `2.1.213` | 265 MB | `7999631426e1b6e4444e4ecf9cd8a63a05a0411ccfe503927d4c9d57bc41bc64` |
+| `2.1.214` | 265 MB | `3c029136f7c81f54ed4a38e9d52e655aad536433dbbde50519c8c31bb646ad14` |
+| `2.1.215` | 265 MB | `c1efffaaf370aa187cb6a09dd93d4e511c646899b0078476f83791b664bde7fe` |
 | `2.1.216` | 267 MB | `74deca45220b8080ec75ab099bd5a5980e41a2b5879846a008fb115d436de085` |
 | `2.1.217` | 269 MB | `2630fc5dc6db61bc03f86b95daf47766e5ed5b61873f7bb7cfea764c5ac5a9ba` |
 | `2.1.218` | 273 MB | `e12071751a9336b8af1012c103358ff04ac18f9aaff4a738cff7ba5cdfaf63f2` |
 | `2.1.219` | 275 MB | `22cfd6f5b3061c0391ba84e9cf8c9deaa37783aac18b004d42ec061e98f00691` |
 | `2.1.220` | 275 MB | `674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863` |
 | `2.1.221` | 289 MB | `60db8e88d42c24b5199c92cfd56ec88370c510c3789c6f364af748354f087ada` |
+| `2.1.222` | 289 MB | `10caae8f22b915c26bfff0e013a4d45608c4f1ae287583626569156f447730e5` |
 | `2.1.223` | 291 MB | `98226474f802e3094d6a86c5ade8883c16206d0fcb5c400b7401c800063e99d7` |
+| `2.1.224` | 296 MB | `a2b5add7dc4bcd8eaa029f4e8bdac4df7769b4073698db7989d206baf9419c2d` |
+| `2.1.225` | 298 MB | `0a3be8d18cb0f5357d38ce2d588601753a60b44cc9c622579ed8b8405dee231e` |
 | `2.1.226` | 298 MB | `4e9bec1177ce9690e8bd988b710ac24105e70da428dd094c5adcbbe786a55555` |
 | `2.1.227` | 304 MB | `6832dc3f1797b890b71116e5f2dbbf9a83fd3d0498c235b4b0f9cd0e6e499ad6` |
 | `2.1.228` | 309 MB | `d535985e6941a3eb00179ccd7f52ceb0c6623a0305a518ebc4e6514f84a94c99` |
+| `2.1.229` | 311 MB | `200338139a3df04a9ad22233837d1fb53fb6dffa21cd82e47559bfaa115acc1b` |
+| `2.1.231` | 311 MB | `47a01daebf794f6c86c13d1875ad6e5be0627029ad8600731161f24018ecde5b` |
+| `2.1.232` | 323 MB | `61d23f8749136907d586d5b11831ea8a5234d4c1dea40a5e55c33b52e204c6d1` |
 | `2.1.233` | 325 MB | `55d281096f57d411ebbdd94dbf5e9ff3accb7c05713e37348c2c11d4b83bf9d9` |
 | `2.1.234` | 328 MB | `3473601ea695d5bf769c5b202844d4cb4fbf723ae995450fcb6973204775c84a` |
 | `2.1.235` | 331 MB | `bfcf0ae2dbf94b2b6a106074aabf3938b9a10889c3b678e4cb5a00c03274d5d5` |
+| `2.1.236` | 335 MB | `6c8818fa22187aa555c242be4abbacc44d6b71a32ac9631ee7b2b5d12f51f752` |
 
-The backup directory holds a few more files than rows here, and that is not a
-discrepancy: a pre-0.2.0 backup doubled the version into its name
-(`2.1.216.2.1.216.orig`), a binary installed under a non-version name is
-saved as `claude.unknown-<hash>.orig`, and a binary patched under a
-non-canonical filename keeps that filename (`2.1.235` entered the corpus as a
-downloaded `claude-2.1.235`, so its backup is `claude-2.1.235.orig`). The two
-extra 2.1.216-era files hash-match the `2.1.216` row above — same bytes, a
-different filename — which is why the count of *files* (15) and the count of
-*distinct binaries* (13) differ.
+This set covers the span the playbook's tree-move measurements were taken over
+(`2.1.210` → `2.1.233`), so those numbers are re-checkable here rather than
+historical.
 
 ## Rebuild or extend it
 
-There is nothing to download and no fixture to restore: the corpus is whatever
-pristine backups you have accumulated, and it grows every time patch-cc touches
-a new build. To widen it, run patch-cc across Claude updates — each first patch
-of a version leaves its `.orig`. To read the JS a given binary carries without
-patching anything:
+The corpus grows every time patch-cc touches a new build — each first patch of
+a version leaves its `.orig` — and a version this machine never patched joins
+the same way: save its pristine native binary as
+`~/.local/share/patch-cc/backups/<version>.orig`. To read the JS a given binary
+carries without patching anything:
 
 ```bash
 patch-cc extract ~/.local/share/patch-cc/backups/2.1.233.orig > 2.1.233.js
@@ -75,12 +86,3 @@ sweep
 
 `doctor` is read-only — it runs the matchers and parses their output, and never
 writes a binary — so the sweep is safe to run against every backup at any time.
-
-## Provenance of the wider span
-
-Some measurements in the playbook were taken during "the move to the tree"
-across a wider set than is durably on disk now — the range `2.1.210` → `2.1.233`
-(2.1.230 was never published), whose earliest builds predate this backup set.
-Those numbers were real when taken; the set above is what reproduces today, and
-a claim that names a build not listed here is a historical one this file does
-not stand behind byte-for-byte.
