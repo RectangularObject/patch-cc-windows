@@ -725,16 +725,28 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
 - **`live-thinking`** — the fourteen-step patch above.
 
   **`prop-threading`** inserts `streamingThinking:<state>,` before the
-  `agentDefinitions` property of every props bag that also carries
-  `conversationId` and `messages`. Three things do the work, and each replaced
-  something that had broken:
+  `conversationId` property of every props bag *handed to a component* — an
+  argument — that also carries `messages`. Being an argument is part of the
+  identity: a module-level literal, a return-value payload, or a config object
+  may legitimately carry the pair, and none of them is a render. Three things
+  do the work, and each replaced something that had broken:
 
-  - **Identity is membership.** The props that make a render a conversation
-    render, asked of one object rather than of a span of text. Four matchers
-    once modelled this — a brace-free `createElement` call, an ordered prompt
-    renderer, and two regexes differing only in the order two call sites listed
-    the same props. 2.1.229 killed the ordered pair at once by inserting
-    `onRateLimitAutoQueueContinue:` between two of them.
+  - **Identity is membership — of the essential props alone.** The props that
+    make a render a conversation render, asked of one object rather than of a
+    span of text. Four matchers once modelled this — a brace-free
+    `createElement` call, an ordered prompt renderer, and two regexes differing
+    only in the order two call sites listed the same props. 2.1.229 killed the
+    ordered pair at once by inserting `onRateLimitAutoQueueContinue:` between
+    two of them. The membership then carried `agentDefinitions` as a third
+    conjunct — witness and insertion point in one — and 2.1.235 retired that
+    prop from the bag: an identity resting on a *neighbour* read a build that
+    plainly drew four conversation renders as drawing none, with every anchor
+    count standing (`agentDefinitions` still occurs 97 times — as other
+    components' prop). The conversation pair is what the render *is*; the
+    neighbour was one more thing upstream had to keep, and upstream owes the
+    matcher nothing. Same class as the resolver default on 2.1.234: the
+    identity must be the weakest claim that still proves it, and every conjunct
+    past that is a break waiting on a harmless refactor.
   - **The insertion point is a prop boundary**, so nothing computes where a
     literal ends. Being an `object` and not an `object_pattern` is what
     separates a prop being *passed* from one being *received*; the regex spelled
@@ -782,7 +794,17 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
 
   **`transcript-signature` and `inline-extras`** are one hand-off and two
   steps: the first threads `streamingThinking` into every renderer whose
-  signature carries the transcript trio, the second rewrites that renderer's
+  signature carries `messages` and `streamingToolUses`, inserting before the
+  latter — an insertion point inside the identity, for `prop-threading`'s
+  reason. The signature was a trio until `showAllInTranscript` was measured to
+  discriminate nothing on any build in the corpus: a third conjunct that was
+  find-anchor, identity and insertion point in one, the exact triple role
+  `agentDefinitions` held when 2.1.235 retired it. Deriving the renderer from
+  its consumer instead — the scope that binds what the extras memo computes
+  over — was measured and rejected: the memo's receiver is a react-compiler
+  memoized *local* on every current build, with real dataflow between it and
+  the signature, and a dataflow pass is a tool this project deliberately does
+  not build. The second step rewrites that renderer's
   extras memo to draw the live block in order. What the memo reads is resolved
   in **its own scope** — the prop its enclosing function was handed — rather
   than carried over from whichever renderer the first step happened to see

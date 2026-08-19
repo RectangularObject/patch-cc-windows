@@ -20,7 +20,7 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The reproducible set on the machine this was written on — 12 distinct binaries
+The reproducible set on the machine this was written on — 13 distinct binaries
 by content (the SHA-256 is the whole file, `sha256sum <version>.orig`):
 
 | version | size | sha256 |
@@ -37,13 +37,17 @@ by content (the SHA-256 is the whole file, `sha256sum <version>.orig`):
 | `2.1.228` | 309 MB | `d535985e6941a3eb00179ccd7f52ceb0c6623a0305a518ebc4e6514f84a94c99` |
 | `2.1.233` | 325 MB | `55d281096f57d411ebbdd94dbf5e9ff3accb7c05713e37348c2c11d4b83bf9d9` |
 | `2.1.234` | 328 MB | `3473601ea695d5bf769c5b202844d4cb4fbf723ae995450fcb6973204775c84a` |
+| `2.1.235` | 331 MB | `bfcf0ae2dbf94b2b6a106074aabf3938b9a10889c3b678e4cb5a00c03274d5d5` |
 
 The backup directory holds a few more files than rows here, and that is not a
 discrepancy: a pre-0.2.0 backup doubled the version into its name
-(`2.1.216.2.1.216.orig`), and a binary installed under a non-version name is
-saved as `claude.unknown-<hash>.orig`. Both of the extras present hash-match the
-`2.1.216` row above — same bytes, a different filename — which is why the count
-of *files* (14) and the count of *distinct binaries* (12) differ.
+(`2.1.216.2.1.216.orig`), a binary installed under a non-version name is
+saved as `claude.unknown-<hash>.orig`, and a binary patched under a
+non-canonical filename keeps that filename (`2.1.235` entered the corpus as a
+downloaded `claude-2.1.235`, so its backup is `claude-2.1.235.orig`). The two
+extra 2.1.216-era files hash-match the `2.1.216` row above — same bytes, a
+different filename — which is why the count of *files* (15) and the count of
+*distinct binaries* (13) differ.
 
 ## Rebuild or extend it
 

@@ -116,13 +116,22 @@ def _delta(event: str, setter: str, helper: str) -> str:
 #: props freely and inserts new ones between them, and neither is a fact about a
 #: set. Two regexes once differed only in the order two call sites listed the
 #: same props, and 2.1.229 killed both at once by inserting
-#: `onRateLimitAutoQueueContinue:` between two of them.
+#: `onRateLimitAutoQueueContinue:` between two of them. The pair is also the
+#: *whole* identity: it once had `agentDefinitions` beside it as witness and
+#: insertion point, and 2.1.235 retired that prop from the bag -- an identity
+#: resting on a neighbour reported no conversation renders on a build that
+#: plainly drew four. The conversation is what the render is *for*; the props
+#: that name it are the weakest claim that still proves it.
 _CONVERSATION = ("conversationId", "messages")
-
-_AGENT_DEFINITIONS = "agentDefinitions"
 _STREAMING = "streamingThinking"
 _SETTER = "onStreamingThinking"
-_TRANSCRIPT_SIGNATURE = ("messages", "streamingToolUses", "showAllInTranscript")
+#: What the transcript renderer's signature *is*: the conversation it draws and
+#: the streaming tool-uses the extras memo computes over. A third conjunct
+#: (`showAllInTranscript`) stood here as find-anchor, identity and insertion
+#: point in one -- the exact triple role `agentDefinitions` held in
+#: `prop-threading` when 2.1.235 retired it -- and discriminates nothing on any
+#: build in the corpus: the pair already names the same one renderer.
+_TRANSCRIPT_SIGNATURE = ("messages", "streamingToolUses")
 _INJECTED = "__cc_streamingThinking"
 
 
@@ -140,26 +149,34 @@ def _outermost(scope: js.Node) -> bool:
 def _conversation_renders(source: Source) -> list[js.Node]:
     """Every props bag that is a conversation render, as the object it is.
 
-    ``agentDefinitions`` is both a witness and the insertion point -- a new
-    property immediately before an existing one is valid in any object literal
-    -- so nothing here computes where the bag *ends*. That question used to be
-    the whole difficulty: delimiting an object literal in minified JS means
-    telling a regex literal from division, and a hand-rolled scanner that
-    guesses returns a `}` that is merely wrong.
+    The identity is one of the identity's own props -- a new property
+    immediately before an existing one is valid in any object literal -- so
+    nothing here computes where the bag *ends*, and the insertion point cannot
+    be absent from a bag the identity admitted. Ending the literal used to be
+    the whole difficulty: delimiting one in minified JS means telling a regex
+    literal from division, and a hand-rolled scanner that guesses returns a
+    `}` that is merely wrong.
 
     Being an ``object`` and not an ``object_pattern`` is what separates a prop
     being *passed* from one being *received*; inserting into the latter would
     rebind a local. The regex spelled that as a call-opening it had to match.
+    A render bag is also *handed to* a component -- an argument -- which is
+    what keeps a module-level literal, a return-value payload, or a config
+    object that happens to carry the pair from being read as a render: those
+    are the decoys the pair alone admits, and being an argument is a fact
+    about what a render *is*, not about how this build spells one.
     """
     found = []
-    for node in source.find(_AGENT_DEFINITIONS):
+    for node in source.find(_CONVERSATION[0]):
         pair = js.named(node)
         if pair is None:
             continue
         bag = js.owner(pair)
         if bag is None or bag.type != "object":
             continue
-        if js.carries(bag, *_CONVERSATION):
+        if bag.parent is None or bag.parent.type != "arguments":
+            continue
+        if js.carries(bag, *_CONVERSATION[1:]):
             found.append(bag)
     return found
 
@@ -253,7 +270,7 @@ def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
         step.applied += 1
         edits.append(
             Edit.before(
-                js.entry(js.props(bag)[_AGENT_DEFINITIONS]), f"{_STREAMING}:{state},"
+                js.entry(js.props(bag)[_CONVERSATION[0]]), f"{_STREAMING}:{state},"
             )
         )
     return source.apply(edits)
@@ -487,11 +504,24 @@ def _step_final_summary(source: Source, outcome: Outcome) -> Source:
 
 
 def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
-    """Make sure the transcript renderer actually receives the live state."""
+    """Make sure the transcript renderer actually receives the live state.
+
+    The insertion point is one of the identity's own names, so it cannot be
+    absent from a pattern the identity admitted -- the guarantee
+    ``prop-threading`` moved to after 2.1.235 retired its third conjunct.
+
+    Deriving the renderer from its consumer instead -- the scope that binds
+    what the streaming-extras memo computes over -- was measured and rejected:
+    on every current build the memo's receiver is a react-compiler memoized
+    *local* (``Te=useMemo(...)``), with real dataflow between it and the
+    signature, and a dataflow pass is a tool this project deliberately does
+    not build. Membership of the pair is the weakest claim the grammar can
+    still prove.
+    """
     step = outcome.step("transcript-signature", expect=True)
     edits = []
 
-    for node in source.find(_TRANSCRIPT_SIGNATURE[2]):
+    for node in source.find(_TRANSCRIPT_SIGNATURE[1]):
         pattern = js.owner(node)
         # A destructured parameter list, not a props bag being passed: this is
         # the renderer's own signature, and the same property names appear on
@@ -509,7 +539,7 @@ def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
             continue
         edits.append(
             Edit.before(
-                js.entry(carried[_TRANSCRIPT_SIGNATURE[2]]),
+                js.entry(carried[_TRANSCRIPT_SIGNATURE[1]]),
                 f"{_STREAMING}:{_INJECTED},",
             )
         )
@@ -1018,7 +1048,7 @@ PATCHES = [
             f'case"{_THINKING_DELTA}"',
             f'"{_REQUEST_START}"',
             _CONTENT_BLOCK_START,
-            _AGENT_DEFINITIONS,
+            _CONVERSATION[0],
         ),
     ),
 ]
