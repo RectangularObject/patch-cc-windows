@@ -590,6 +590,20 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   arm's head was baked in as the file's length, `newLines:String(t)`, counted
   and green.
 
+  **Alive by eye:** ask for a new file *via the Write tool* — the row reads
+  `Added N lines` over green `+` rows. Two things legitimately show no diff and
+  are not this patch failing: a file created through **Bash** (heredoc, `tee`,
+  a script) is Bash output and never enters this renderer; and upstream keeps
+  planting early returns *ahead of* the spliced render — plan-directory files
+  ("/plan to preview"), condensed contexts (subagent progress rows, session
+  summaries: "Wrote N lines to path"), and scratchpad/`.workshop.*` files in
+  non-verbose re-renders ("Wrote N lines ⧉"). The live conversation renders
+  the current message verbose, so the diff shows there today; those guards are
+  the patch's effective coverage narrowing upstream-side, which `doctor` —
+  counting matchers, not paths — cannot see. Measured on 2.1.234 (live,
+  resume, plain/workshop/scratchpad files): every reachable path drew the
+  diff.
+
 ### Thinking — `thinking.py`
 
 - **`thinking-summaries`** — stop echoing the account's server-side experiment
