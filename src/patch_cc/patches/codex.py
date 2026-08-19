@@ -29,7 +29,7 @@ and the subagent pins: the ids to register, and the port to route them to.
 Nothing here reads a store of its own, which is what makes the binary's manifest
 the one record of what a patched Claude Code answers to.
 
-Required steps (``expect=True``): without any one, the feature is dead --
+Required steps: without any one, the feature is dead --
 ``enum`` (subagent use), ``validator`` and ``resolver`` (the model is accepted
 and resolves -- an id to itself, a shortcut to the newest id in its family),
 ``redirect`` (requests actually reach the gateway). ``general-resolver`` is
@@ -663,8 +663,8 @@ def _register_context(source: Source, models, outcome: Outcome) -> Source:
     # place to bake it -- a drifted window resolver then reads as this step
     # finding nothing, not as no step at all. Created *after* the search, a
     # renamed CLAUDE_CODE_MAX_CONTEXT_TOKENS produced seven steps, no note and no
-    # absent-step line, the exact silence PLAYBOOK's "declare an expectation
-    # before the work" rule (and `_live_thinking`) exists to break.
+    # absent-step line, the exact silence `Outcome.declare` now exists to break.
+    outcome.declare(optional=("context",))
     step = outcome.step("context")
     resolver = _window_resolver(source)
     body = js.body(resolver) if resolver is not None else None
@@ -880,29 +880,39 @@ def _codex_models(source: Source, options: Options, outcome: Outcome) -> Source:
         outcome.note("general model resolver anchor drifted; shortcuts skipped")
         shorts = {}
 
-    source = _register(
-        source, model_enums(source), model_ids, outcome.step("enum", expect=True)
+    # `general-resolver` is owed exactly when a shortcut is; `context` declares
+    # itself where its own work is owed (see _register_context).
+    outcome.declare(
+        required=(
+            "enum",
+            "validator",
+            "resolver",
+            *(("general-resolver",) if shorts else ()),
+            "redirect",
+        ),
+        optional=("picker", "registry"),
     )
+    source = _register(source, model_enums(source), model_ids, outcome.step("enum"))
     source = _register(
         source,
         _validators(source),
         model_ids + list(shorts),
-        outcome.step("validator", expect=True),
+        outcome.step("validator"),
     )
     source = _register_arms(
         source,
         _override_resolvers(source),
         {i: i for i in model_ids} | shorts,
-        outcome.step("resolver", expect=True),
+        outcome.step("resolver"),
     )
     if shorts:
         source = _register_arms(
             source,
             _general_resolvers(source),
             shorts,
-            outcome.step("general-resolver", expect=True),
+            outcome.step("general-resolver"),
         )
-    source = _redirect(source, options, outcome.step("redirect", expect=True))
+    source = _redirect(source, options, outcome.step("redirect"))
     source = _register_picker(
         source, options.codex_models, shorts, outcome.step("picker")
     )

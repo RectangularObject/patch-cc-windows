@@ -254,7 +254,7 @@ def _state_in_scope(site: js.Node) -> str | None:
 
 def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
     """Pass the live-thinking state into the renderers that need it."""
-    step = outcome.step("prop-threading", expect=True)
+    step = outcome.step("prop-threading")
     edits = []
     renders = _conversation_renders(source)
     # Printed every run, green ones included: an early warning held back until
@@ -344,7 +344,7 @@ def _step_display_mode(source: Source, outcome: Outcome) -> Source:
     gains a default. Whatever guards reach it, and in whatever order the
     declaration lists them, is untouched because it is never matched.
     """
-    step = outcome.step("display-mode", expect=True)
+    step = outcome.step("display-mode")
     edits = []
     seen: set[int] = set()
 
@@ -518,7 +518,7 @@ def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
     not build. Membership of the pair is the weakest claim the grammar can
     still prove.
     """
-    step = outcome.step("transcript-signature", expect=True)
+    step = outcome.step("transcript-signature")
     edits = []
 
     for node in source.find(_TRANSCRIPT_SIGNATURE[1]):
@@ -623,7 +623,7 @@ def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
 
 def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> Source:
     """Render live thinking inline, ordered with streaming tool-use blocks."""
-    step = outcome.step("inline-extras", expect=True)
+    step = outcome.step("inline-extras")
     computed = _flatmap_extras(source)
     if computed is None:
         step.note("no streaming-extras memo in this build")
@@ -921,7 +921,7 @@ def _step_reducer(source: Source, found: Discovery, outcome: Outcome) -> Source:
     away reads as that point's absence by name rather than as a bare count drop
     inside an aggregate.
     """
-    step = outcome.step("reducer", expect=True)
+    step = outcome.step("reducer")
     helper = found.create_message_helper
     handler = _reducer(source)
     if handler is None or helper is None:
@@ -967,27 +967,27 @@ def _step_reducer(source: Source, found: Discovery, outcome: Outcome) -> Source:
         handler,
         (_REQUEST_START,),
         f"{setter}?.(null)",
-        outcome.step("request-start", expect=True),
+        outcome.step("request-start"),
     )
     edits += _dispatch(
         handler,
         (_MESSAGE_STOP,),
         ended,
-        outcome.step("message-stop", expect=True),
+        outcome.step("message-stop"),
         on="event",
     )
     edits += _dispatch(
         handler,
         ("text",),
         cleared,
-        outcome.step("text-clear", expect=True),
+        outcome.step("text-clear"),
         on="content_block",
     )
     edits += _dispatch(
         handler,
         ("message_delta",),
         cleared,
-        outcome.step("message-delta-clear", expect=True),
+        outcome.step("message-delta-clear"),
         on="event",
     )
     edits += _dispatch(
@@ -1012,11 +1012,26 @@ def _step_reducer(source: Source, found: Discovery, outcome: Outcome) -> Source:
 
 def _live_thinking(source: Source, _options: Options, outcome: Outcome) -> Source:
     found = Discovery()
-    # Declared before anything runs: an expectation that only comes into
-    # existence once its own rewrite succeeds can never report that rewrite
-    # missing -- which is exactly the silence being designed out here.
-    for name, _marker in _CORE_UPDATES:
-        outcome.step(name, expect=True)
+    # Every step this patch can take, declared before anything runs: an
+    # expectation that only comes into existence once its own rewrite succeeds
+    # can never report that rewrite missing. The dispatch points are declared
+    # here too, so a build whose reducer is gone fails *them* by name as well,
+    # instead of them never having existed.
+    outcome.declare(
+        required=(
+            "prop-threading",
+            "display-mode",
+            "transcript-signature",
+            "inline-extras",
+            "reducer",
+            "request-start",
+            "message-stop",
+            "text-clear",
+            "message-delta-clear",
+            *(name for name, _marker in _CORE_UPDATES),
+        ),
+        optional=("final-summary", "thinking-start", "thinking-append"),
+    )
 
     source = _step_prop_threading(source, outcome)
     source = _step_display_mode(source, outcome)
@@ -1029,7 +1044,7 @@ def _live_thinking(source: Source, _options: Options, outcome: Outcome) -> Sourc
     # updates *are* the feature, and every other step can land without them.
     for name, marker in _CORE_UPDATES:
         if source.count(marker):
-            step = outcome.step(name, expect=True)
+            step = outcome.step(name)
             step.candidates += 1
             step.applied += 1
     return source

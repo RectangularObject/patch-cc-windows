@@ -145,7 +145,7 @@ def _ungrouped(arm: js.Node) -> js.Node | None:
 
 def _reroute_grouping(source: Source, outcome: Outcome) -> Source:
     """Send finished thinking messages to the visible list, not the group."""
-    step = outcome.step("group-routing", expect=True)
+    step = outcome.step("group-routing")
     edits: list[Edit] = []
     seen: set[int] = set()
 
@@ -255,8 +255,9 @@ def _thinking_inline(source: Source, _options: Options, outcome: Outcome) -> Sou
     the value forced to ``!0`` here and the name the early return is keyed on
     there, so neither rewrite is looking for a gate the other cannot see.
     """
-    guard = outcome.step("null-guard", expect=True)
-    props = outcome.step("renderer-props", expect=True)
+    outcome.declare(required=("group-routing", "null-guard", "renderer-props"))
+    guard = outcome.step("null-guard")
+    props = outcome.step("renderer-props")
     source = _reroute_grouping(source, outcome)
     edits: list[Edit] = []
 
@@ -439,8 +440,9 @@ def _whitelist(node: js.Node) -> js.Node | None:
 
 def _max_effort(source: Source, _options: Options, outcome: Outcome) -> Source:
     """Let ``/effort max`` save as the default for new sessions."""
-    gate = outcome.step("gate", expect=True)
-    schema = outcome.step("schema", expect=True)
+    outcome.declare(required=("gate", "schema"))
+    gate = outcome.step("gate")
+    schema = outcome.step("schema")
     edits: list[Edit] = []
     seen: set[int] = set()
 

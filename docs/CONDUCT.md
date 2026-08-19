@@ -56,7 +56,7 @@ shape that already absorbs every case, found rather than bolted on.
   shape this build simply lacks — most patches carry several — not a regression.
   Keep "gone", "already applied", and "not on this build" as distinct signals;
   never collapse them into one number. Which one a sub-step's silence means is
-  not guesswork: declare it (`expect=True`) so a green tick cannot cover a dead
+  not guesswork: declare it (`Outcome.declare`) so a green tick cannot cover a dead
   feature. A step nobody declared is a step that cannot report its own death:
   `branding` carried none, so a name badge that stopped being a bold render was
   a green run, an unchanged banner, and a manifest asserting the new name. See

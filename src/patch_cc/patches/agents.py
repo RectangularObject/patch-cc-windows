@@ -100,7 +100,8 @@ def _subagent_prompt(source: Source, _options: Options, outcome: Outcome) -> Sou
     ``transcript && content && ...`` conjunction, which gates the agent's
     *output* and is not this patch's business.
     """
-    gate = outcome.step("gate", expect=True)
+    outcome.declare(required=("gate",))
+    gate = outcome.step("gate")
     edits: list[Edit] = []
     seen: set[int] = set()
 
@@ -346,7 +347,7 @@ def discover_models(source: Source) -> list[str]:
     by a guessed default. A hardcoded fallback (`haiku/sonnet/opus`) read a lost
     enum as those three: `doctor` printed a plausible list, every pin to one of
     them landed, and a pin to a name the real bundle accepts was refused -- the
-    same emptiness that `codex-models`' own `enum` step (`expect=True`) reports
+    same emptiness that `codex-models`' own required `enum` step reports
     as broken in the same run. With nothing to offer, the offer is empty:
     `discover_models` returns `[]`, `doctor` shows `models: inherit` alone, and a
     requested pin fails its required step rather than landing on a name nothing
@@ -481,13 +482,14 @@ def _subagent_models(source: Source, options: Options, outcome: Outcome) -> Sour
     found = {agent.name: agent for agent in agents}
     edits: list[Edit] = []
 
+    # Required: every override reaching a patch has already been validated
+    # against this bundle by its surface (CLI, --from-cache, or the menu), so
+    # one that cannot be written is not a shape this build lacks -- it is the
+    # asked-for change failing. Left optional, the patch stayed green, the
+    # binary shipped without the override, and the manifest claimed it.
+    outcome.declare(required=tuple(sorted(options.subagent_models)))
     for name, target in sorted(options.subagent_models.items()):
-        # Required: every override reaching a patch has already been validated
-        # against this bundle by its surface (CLI, --from-cache, or the menu),
-        # so one that cannot be written is not a shape this build lacks -- it is
-        # the asked-for change failing. Left optional, the patch stayed green,
-        # the binary shipped without the override, and the manifest claimed it.
-        step = outcome.step(name, expect=True)
+        step = outcome.step(name)
         if target not in offered:
             step.note(f"model {target!r} not offered by this bundle; skipped")
             continue
@@ -522,7 +524,11 @@ def _subagent_models(source: Source, options: Options, outcome: Outcome) -> Sour
     for bypass in bypasses:
         if bypass.agent not in options.subagent_models:
             continue
-        step = outcome.step(f"bypass:{bypass.agent}", expect=True)
+        # Declared the moment the guard resolves the agent's name -- the
+        # earliest this step *can* exist -- while a vanished guard stays the
+        # note above, with no name left to declare.
+        outcome.declare(required=(f"bypass:{bypass.agent}",))
+        step = outcome.step(f"bypass:{bypass.agent}")
         step.candidates += 1
         step.applied += 1
         edits.append(

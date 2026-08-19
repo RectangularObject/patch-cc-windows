@@ -368,13 +368,13 @@ and why `prop-threading` resolves scope itself.
 
 Counting alone cannot tell "this build lacks that shape" from "the feature is
 dead": a patch whose optional shapes rewrite happily while a load-bearing one
-is gone still changes bytes, and would read as green. So each sub-step declares
-what its absence *means* (`Outcome.step(..., expect=...)`):
+is gone still changes bytes, and would read as green. So each sub-step is
+declared with what its absence *means* (`Outcome.declare`):
 
 | mark | meaning | absence is |
 |---|---|---|
-| *(default)* | a shape only some builds carry | informational |
-| `expect=True` | the patch does nothing useful without it | a regression |
+| `optional` | a shape only some builds carry | informational |
+| `required` | the patch does nothing useful without it | a regression |
 
 `Outcome.unmet()` turns a violation into a sentence (`required step
 group-routing found nothing`); `Outcome.failures()` adds any exception the
@@ -404,9 +404,15 @@ Three rules keep the net from having holes:
   feature are now checked by the markers their builders emit
   (`streaming._CORE_UPDATES`), which no amount of neighbouring churn can fake.
 - **Declare an expectation before the work, not inside it.** A step created only
-  by its own success cannot report its own absence. `_live_thinking` registers
-  the core updates up front; `agents.bypassed_agents` resolves the pinned agent
-  from the helper's durable head so a drifted body still has a step to fail.
+  by its own success cannot report its own absence. This is the API's shape,
+  not a discipline: `Outcome.declare` is the only way a step comes to exist
+  (up front, required and optional named apart), and `outcome.step(name)`
+  retrieves — an undeclared name raises, so a typo cannot mint a silently
+  optional step. Work that is owed conditionally declares under the same
+  condition it runs (`codex._register_context`), and a name resolved from the
+  bundle is declared the moment it resolves — `agents.bypassed_agents` has no
+  step to name until the helper's guard gives up the pinned agent, and a guard
+  that vanishes leaves the always-printed note, with no name left to declare.
 
 `apply` acts on the verdict: a broken patch is re-run out of the final pass, so
 its orphan edits never reach the binary, the manifest never claims it, and the
@@ -888,10 +894,10 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   `CLAUDE_CODE_DISABLE_EXPLORE_INHERIT_CAP` escape hatch in the middle, which
   silently cost every Explore override until the body matcher learned to skip
   intervening statements. The body is a node now, so there is nothing left to
-  skip. Resolving the agent from the guard alone is what makes a future body
-  reshape *loud*: we still know an override is at stake, so `bypass:<agent>` is
-  a required step that fails, instead of the agent's identity vanishing with the
-  match and the step never existing.
+  skip. Resolving the agent from the guard alone is why a future body reshape
+  costs nothing at all: the body is replaced whole, however upstream grows it,
+  and `bypass:<agent>` stands in the report as the record that an override was
+  at stake.
 
   If the **guard** goes too there is no step to fail — nothing left names the
   agent — and no way to tell "upstream stopped pinning" from "the guard
@@ -924,7 +930,7 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   | `context` | the real context window | the function that *reads* `CLAUDE_CODE_MAX_CONTEXT_TOKENS` as a member and returns what it read, taking the model as a parameter; the table goes before its first statement |
   | `registry` | the binary's own model table — the status-line name, effort capabilities, `/advisor` eligibility | the object carrying both `models` and `aliases`, confirmed by its entries carrying `id`/`family`/`display_name` |
 
-  \* required (`expect=True`) — without any one of them the feature is dead.
+  \* required — without any one of them the feature is dead.
   `picker`, `context` and `registry` are refinements: absent, you can still
   type `/model <id>` and get the 200k default under the model's raw id.
   `context` has no step at all when no chosen model reports a window — there

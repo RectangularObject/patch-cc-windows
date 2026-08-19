@@ -109,7 +109,7 @@ class Outcome:
     notes: list[str] = field(default_factory=list)
     #: Named sub-steps, for patches built from several independent rewrites.
     steps: dict[str, Outcome] = field(default_factory=dict)
-    #: What this sub-step's absence means (set via :meth:`step`). ``False`` --
+    #: What this sub-step's absence means (set via :meth:`declare`). ``False`` --
     #: a shape some builds simply lack; ``True`` -- the patch is broken without
     #: it.
     expect: bool = False
@@ -167,18 +167,43 @@ class Outcome:
     def note(self, message: str) -> None:
         self.notes.append(message)
 
-    def step(self, name: str, expect: bool = False) -> Outcome:
-        """Get (or create) a named sub-outcome.
+    def declare(
+        self, required: tuple[str, ...] = (), optional: tuple[str, ...] = ()
+    ) -> None:
+        """Create sub-steps, before any of them does its work.
+
+        Declaring is the only way a step comes to exist (:meth:`step` only
+        retrieves), which makes "declare an expectation before the work" the
+        API's shape instead of each patch's discipline: a code path that never
+        runs leaves a required step at 0/0 with a verdict to fail, where a step
+        created by its own success could never report its own absence --
+        `branding`'s badge went unrenamed under exactly that silence, and the
+        lazily-created step was the hole the discipline papered over.
+        Conditional work declares under the same condition it runs (`context`),
+        and a name resolved from the bundle is declared the moment it resolves
+        (`bypass:<agent>`).
+        """
+        for name in required:
+            self.steps.setdefault(name, Outcome()).expect = True
+        for name in optional:
+            self.steps.setdefault(name, Outcome())
+
+    def step(self, name: str) -> Outcome:
+        """A declared sub-step, to record work against.
 
         A single scalar count cannot distinguish "all twelve rewrites landed"
         from "six landed and six silently drifted" -- which is exactly how
         upstream's live-thinking patch hides its own regressions. Recording each
         rewrite separately turns that into an actionable "reducer.message_stop
         missed".
+
+        Retrieval only: a name nobody declared is a programming error and
+        raises, which :meth:`Patch.run` reports as the patch broken -- loud,
+        never a silently-optional step minted by a typo.
         """
-        sub = self.steps.setdefault(name, Outcome())
-        sub.expect = sub.expect or expect
-        return sub
+        if name not in self.steps:
+            raise RuntimeError(f"step {name!r} was never declared")
+        return self.steps[name]
 
     def finalize(self) -> Outcome:
         """Roll sub-step totals up into this outcome."""

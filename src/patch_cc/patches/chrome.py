@@ -268,7 +268,8 @@ def _branding(source: Source, options: Options, outcome: Outcome) -> Source:
     # rather than a green tick over a binary that still says Claude Code. The
     # other two are sentences upstream may reword or drop, and their absence is
     # a build lacking a shape, not a dead feature.
-    badge = outcome.step("badge", expect=True)
+    outcome.declare(required=("badge",), optional=("styled", "welcome"))
+    badge = outcome.step("badge")
     styled = outcome.step("styled")
     welcome = outcome.step("welcome")
 
