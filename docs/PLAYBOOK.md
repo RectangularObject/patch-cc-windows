@@ -455,7 +455,11 @@ Each sub-step records its own `candidates`/`applied`:
   reducer whose setter threading applied while every arm had drifted once
   reported hits and streamed nothing.
 - **`final-summary`**, optional: redacted thinking in the closing summary is a
-  refinement, not the feature.
+  refinement, not the feature. Its guard is whichever enclosing `if` *tests the
+  block* — 2.1.236 nested an experiment gate between the test and the summary
+  it guards, and "the nearest `if`" read a shape that had merely moved as one
+  that was gone. The climb is bounded by the function that declares the block,
+  because a receiver's name is only a spelling until its scope is said.
 
 An *optional* sub-step that finds nothing is reported as absent, not broken —
 it is just a shape this build doesn't have. A sub-step that finds a shape but
@@ -788,6 +792,28 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
     *initialised* to is deliberately not asked: `useState(null)` is every
     build's spelling and `useState(void 0)` would be the same state, while the
     setter is the identity that matters.
+  - **The state has two homes, and the handed setter names both.** Through
+    2.1.235 the scope that hands `onStreamingThinking` declared the state
+    itself, and the state is the array pattern binding the handed setter —
+    `useState`'s pair. 2.1.236 moved it into an external stream store
+    (`subscribe`/`getSnapshot`/`_publish` — the `useSyncExternalStore` shape)
+    and hands `<store>.setStreamingThinking` instead; the same scope reads the
+    store back by destructuring the hook call it hands the store to
+    (`{streamingToolUses:…}=useX(<store>)`), so the state is that pattern's own
+    `streamingThinking` binding — upstream's the day it takes one, the goal
+    achieved, and until then ours, inserted at the front of the pattern. The
+    pattern is proven the snapshot read by the store expression itself: the
+    call's *only* argument is the very expression the setter was read off, one
+    answer or none (`js.only`). Sole argument is deliberate — a second is a
+    selector whose result is no longer the snapshot, and extending a pattern of
+    unknowable provenance binds `undefined` with every count green. The
+    insertion also pays for a witness the way `thinking-summaries` does: the
+    field it binds must still be named by the bundle's own objects (the store's
+    snapshot initialiser, its publish call), so a store that renames the field
+    reads as the step reporting the store rather than threading `undefined`.
+    Two things come free with the store: its setter takes functional updaters —
+    React's own contract, which the reducer splices already speak — and it
+    hides a finished block itself after 30 s, upstream's own linger.
 
   A render was once selected by *position* — the observation that the real sites
   fall after the state's `useState` declaration. That is worth recording as a
@@ -1245,10 +1271,10 @@ enumerated with their hashes in [corpus.md](corpus.md). Each removed matcher hit
 can still be running; each was carried as "kept for older builds", which is a
 claim the corpus disproves. The verbatim matchers were re-run from `HEAD` over
 the whole corpus after the move, and they are still zero everywhere. The
-measurements this section quotes were taken during the move across a wider span
-(2.1.210 → 2.1.233; 2.1.230 was never published), some of whose early builds
-predate the current backup set — `corpus.md` is the reproducible subset on disk
-now, and re-running `doctor` over it is one command (below).
+measurements this section quotes were taken during the move across
+2.1.210 → 2.1.233 (2.1.230 was never published) — a span the corpus has since
+grown to hold in full, so they are re-checkable rather than historical, and
+re-running `doctor` over it is one command (below).
 
 - **`live-thinking` / `reducer-legacy`** — the pre-2.1.138 reducer with
   positional parameters. Its removal collapsed the `reducer` variant *group*

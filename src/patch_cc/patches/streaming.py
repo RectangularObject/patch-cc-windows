@@ -132,6 +132,9 @@ _SETTER = "onStreamingThinking"
 #: `prop-threading` when 2.1.235 retired it -- and discriminates nothing on any
 #: build in the corpus: the pair already names the same one renderer.
 _TRANSCRIPT_SIGNATURE = ("messages", "streamingToolUses")
+#: Our local for the threaded state, wherever one has to be minted: the
+#: renderer signatures `transcript-signature` extends, and the store-snapshot
+#: pattern `prop-threading` extends on builds that keep the state in a store.
 _INJECTED = "__cc_streamingThinking"
 
 
@@ -199,8 +202,10 @@ def _bound_in_scope(site: js.Node, prop: str) -> str | None:
     return None
 
 
-def _state_in_scope(site: js.Node) -> str | None:
-    """The live-thinking state variable visible at this render, if any.
+def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
+    """The live-thinking state at this render: the name to thread, and the
+    snapshot pattern to extend first when the state has to be read out of a
+    store rather than a binding upstream already made.
 
     Resolved from the site outwards, so what is threaded is a variable actually
     in scope where it is threaded -- the one thing the old matcher named as
@@ -211,34 +216,48 @@ def _state_in_scope(site: js.Node) -> str | None:
     gate could see it; it throws when that component renders.
 
     The state is identified by its setter: the scope that holds live thinking
-    is the scope that hands ``onStreamingThinking`` to the reducer.
+    is the scope that hands ``onStreamingThinking`` to the reducer. The setter
+    is asked of the whole subtree on purpose -- a scope may hand it from inside
+    a callback, and that says nothing about where the state lives -- while the
+    binding threaded has to be one this render can *see* (:func:`js.visible`),
+    which a nested function's is not and a block's own is not either.
 
-    Outwards is only half of lexical, and the half a subtree walk gets wrong:
-    the declaration has to be one this render can *see* (:func:`js.visible`),
-    which a nested function's is not and a block's own is not either. Threading
-    one anyway produced a binary that parsed and threw -- the same failure as
-    the bundle-wide answer this replaced, one door along -- and took the note
-    that says a render was skipped with it. The setter is the other question and
-    keeps the whole subtree: a scope may hand its setter to the reducer from
-    inside a callback, and that says nothing about where the state lives.
+    What the handed setter *is* has two upstream spellings, and each names the
+    state its own way:
 
-    What the state is initialised to is not asked. ``useState(null)`` was the
-    spelling on every build in the corpus and ``useState(void 0)`` is the same
-    state, while the line below is the identity that matters: the pair whose
-    second name is the setter this scope hands the reducer *is* the live
-    thinking state, whatever produced it.
+    - **A bare identifier** -- a ``useState`` setter, every build through
+      2.1.235. The state is the array pattern that binds it: the pair whose
+      second name is the setter this scope hands the reducer *is* the live
+      thinking state, whatever produced it (``useState(null)`` and
+      ``useState(void 0)`` are the same state, so the initialiser is never
+      asked).
+    - **A member read on a store** -- 2.1.236 moved the state into an external
+      stream store (``subscribe``/``getSnapshot``/``_publish``) and hands the
+      reducer ``<store>.setStreamingThinking``. The scope reads that store back
+      by destructuring the hook call it hands the same store to
+      (``{streamingToolUses:…}=useX(<store>)``), so the state is that pattern's
+      own ``streamingThinking`` binding: upstream's, the day it takes one --
+      the goal achieved, same as every other judged-on-achievement step -- and
+      until then ours, inserted into the pattern. The pattern is proven the
+      snapshot read by the store expression itself: the call's *only* argument
+      is the very expression the setter was read off, with one answer or none
+      (:func:`js.only`). Sole argument is deliberate -- a second argument is a
+      selector whose result is no longer the snapshot, and extending a pattern
+      of unknowable provenance binds ``undefined`` with every count green, so
+      that shape is refused loudly instead.
     """
     scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
     while scope is not None and not _outermost(scope):
-        setters = {
-            js.text(js.binding(value))
+        handed = [
+            value
             for node in js.every(
                 scope,
                 lambda n: n.type == "property_identifier" and js.text(n) == _SETTER,
             )
             if (pair := js.named(node)) is not None
             and (value := pair.child_by_field_name("value")) is not None
-        }
+        ]
+        setters = {js.text(js.binding(value)) for value in handed}
         for declarator in js.every(scope, js.of_type("variable_declarator")):
             name = declarator.child_by_field_name("name")
             if name is None or name.type != "array_pattern":
@@ -247,7 +266,33 @@ def _state_in_scope(site: js.Node) -> str | None:
                 continue
             bound = [js.text(child) for child in name.named_children]
             if len(bound) == 2 and bound[1] in setters:
-                return bound[0]
+                return bound[0], None
+        snapshots: dict[int, js.Node] = {}
+        for setter in (v for v in handed if v.type == "member_expression"):
+            store = js.text(js.receiver(setter))
+            for declarator in js.every(scope, js.of_type("variable_declarator")):
+                name = declarator.child_by_field_name("name")
+                value = declarator.child_by_field_name("value")
+                if name is None or name.type != "object_pattern":
+                    continue
+                if not js.children(name) or value is None:
+                    continue
+                if value.type != "call_expression":
+                    continue
+                taken = js.arguments(value)
+                if len(taken) != 1 or js.text(taken[0]) != store:
+                    continue
+                if not js.visible(declarator, site):
+                    continue
+                snapshots[declarator.start_byte] = name
+        pattern = js.only(
+            list(snapshots.values()), "snapshot reads of the live-thinking store"
+        )
+        if pattern is not None:
+            carried = js.props(pattern)
+            if _STREAMING in carried:
+                return js.text(js.binding(carried[_STREAMING])), None
+            return _INJECTED, pattern
         scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
     return None
 
@@ -257,22 +302,55 @@ def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
     step = outcome.step("prop-threading")
     edits = []
     renders = _conversation_renders(source)
-    # Printed every run, green ones included: an early warning held back until
-    # something breaks arrives too late to be one.
-    step.note(f"{len(renders)} conversation render(s)")
-
+    # The durable witness behind a snapshot insertion: the field it binds is
+    # one the bundle's own objects still name (the store's snapshot initialiser
+    # and its publish call, on 2.1.236). Extending the pattern is a rewrite the
+    # matcher can only vouch for itself, and a store that renames the field
+    # would leave it threading `undefined` with every count green -- the same
+    # hole `thinking-summaries` pays a header-name count for.
+    field_named = any(
+        (pair := js.named(node)) is not None and pair.type == "pair"
+        for node in source.find(_STREAMING)
+    )
+    extended: set[int] = set()
+    unreached = 0
     for bag in renders:
-        state = _state_in_scope(bag)
-        if state is None:
-            step.note("a conversation render has no live-thinking state in scope")
+        resolved = _state_in_scope(bag)
+        if resolved is None:
+            # By design on every build we hold: the resume view, the transcript
+            # overlay and the message picker draw conversations too, in scopes
+            # where nothing ever streams. Counted rather than worth a sentence
+            # each -- the note below carries the number, and the number moving
+            # is the signal (a render newly skipped was the only sign of the
+            # 2.1.232 out-of-scope threading).
+            unreached += 1
+            continue
+        state, pattern = resolved
+        if pattern is not None and not field_named:
+            step.note(f"the stream store no longer names a {_STREAMING} field")
             continue
         step.candidates += 1
         step.applied += 1
-        edits.append(
-            Edit.before(
-                js.entry(js.props(bag)[_CONVERSATION[0]]), f"{_STREAMING}:{state},"
+        carried = js.props(bag)
+        if _STREAMING in carried:
+            # Upstream already threads it into this render; the goal achieved.
+            continue
+        if pattern is not None and pattern.start_byte not in extended:
+            # Two renders in one scope read one snapshot: the pattern gains the
+            # field once, at the front, which is valid whatever it ends with.
+            extended.add(pattern.start_byte)
+            edits.append(
+                Edit.before(pattern.named_children[0], f"{_STREAMING}:{state},")
             )
+        edits.append(
+            Edit.before(js.entry(carried[_CONVERSATION[0]]), f"{_STREAMING}:{state},")
         )
+    # Printed every run, green ones included: an early warning held back until
+    # something breaks arrives too late to be one.
+    step.note(
+        f"{len(renders)} conversation render(s)"
+        + (f", {unreached} with no live-thinking state in scope" if unreached else "")
+    )
     return source.apply(edits)
 
 
@@ -473,19 +551,34 @@ def _step_final_summary(source: Source, outcome: Outcome) -> Source:
         if not js.reads(thinking, _SUMMARY_PROPS[0]):
             continue
         block = js.text(js.receiver(thinking))
+        # The block's home is the function that produced it -- the one holding
+        # the `.find` whose predicate selects thinking -- resolved from the
+        # summary outwards, since the summary itself sits inside the callback
+        # that hands it over.
+        scope = js.climb(summary, lambda n: n.type in js.FUNCTIONS)
+        predicate = None
+        while scope is not None and not _outermost(scope):
+            if (predicate := _selects_thinking(scope, block)) is not None:
+                break
+            scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+        if predicate is None or scope is None:
+            continue
+        # Which `if` guards the summary is answered by what its condition
+        # tests, never by being the nearest: 2.1.236 nested an unrelated gate
+        # between the thinking test and the summary it guards, and the nearest
+        # `if` read a shape that had merely moved as one that was gone. The
+        # climb stays inside the block's own home, because its name is only a
+        # spelling until the scope it belongs to is said.
         guard = js.up(summary, "if_statement")
-        if guard is None:
-            continue
-        condition = guard.child_by_field_name("condition")
-        scope = js.climb(guard, lambda n: n.type in js.FUNCTIONS)
-        if condition is None or scope is None:
-            continue
-        # The two tests that reject a redacted block: the one inside the `.find`
-        # that produced it, and the one this summary is guarded by. Each is a
-        # node; none of the code between them is.
-        predicate = _selects_thinking(scope, block)
-        test = _tests_thinking(condition, block)
-        if predicate is None or test is None:
+        test = None
+        while (
+            guard is not None
+            and guard.start_byte >= scope.start_byte
+            and (test := _tests_thinking(guard.child_by_field_name("condition"), block))
+            is None
+        ):
+            guard = js.up(guard.parent, "if_statement")
+        if test is None:
             continue
         step.candidates += 1
         step.applied += 1
