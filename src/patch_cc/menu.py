@@ -42,6 +42,7 @@ from rich.text import Text
 
 from . import cache, locate, patcher
 from .bun import Bundle, BunError, container
+from .bun.errors import INSTALL_HINT
 from .codex import DEFAULT_PORT, is_valid_port
 from .codex.models import CodexModel, discover, reconcile
 from .patches import (
@@ -620,7 +621,14 @@ class MenuApp:
 
     @staticmethod
     def _disable_flow_control() -> None:
-        """Free ctrl+s from XOFF so a stray press cannot freeze the screen."""
+        """Free ctrl+s from XOFF so a stray press cannot freeze the screen.
+
+        Nothing to lift on Windows, whose console never claims ctrl+s. Tested
+        with ``sys.platform`` rather than importing by name, because mypy narrows
+        on it -- so the calls below stay checked on the platforms that run them.
+        """
+        if sys.platform == "win32":
+            return
         try:
             import termios
 
@@ -1184,8 +1192,11 @@ class MenuApp:
             self.exit_code = 0 if payload.clean else 1
             self.view = "doctor"
         elif kind == "restore":
-            if error is not None:
-                self.flash = error
+            if error is not None or payload is None:
+                # `None` without an error is an outcome, not a failure: nothing
+                # was patched, so nothing was put back. A flash is one line, so
+                # it states the reason rather than the paragraph the CLI prints.
+                self.flash = error or "nothing to restore: this binary is not patched"
                 self.view = "select"
                 return
             self.exit_message = "Restored the original binary. Restart Claude Code."
@@ -1579,16 +1590,14 @@ def run_menu() -> int:
     install = locate.find()
     if install is None:
         err("No Claude Code native install found.")
-        console.print(
-            "  Install it with: [cyan]curl -fsSL https://claude.ai/install.sh | bash[/cyan]"
-        )
+        console.print(f"  Install it with: [cyan]{INSTALL_HINT}[/cyan]")
         return 1
 
     try:
         installed = container.read(str(install.binary))
-        # Before the first apply there is no backup, and the installed binary
-        # *is* the pristine source -- handing it over keeps a first run from
-        # reading the same 275 MB file twice.
+        # The installed binary is what `read_pristine` consults first, and it is
+        # already in hand for the status line -- handing it over keeps every run
+        # from reading the same 275 MB file twice.
         pristine = patcher.read_pristine(install, installed=installed)
     except BunError as exc:
         err(str(exc))

@@ -18,12 +18,13 @@ uvx patch-cc                   # fullscreen menu, no install needed
 
 ## Requirements
 
-- **Linux or macOS**
+- **Linux, macOS or Windows**
 - **Python 3.11+**
 - **[uv](https://docs.astral.sh/uv/)** — how patch-cc is run and installed
-  below. Install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`.
-  Not using uv? `pipx install patch-cc` (or `pip install patch-cc`) works too;
-  it is an ordinary PyPI package.
+  below. Install it with `curl -LsSf https://astral.sh/uv/install.sh | sh`, or
+  on Windows `irm https://astral.sh/uv/install.ps1 | iex`. Not using uv?
+  `pipx install patch-cc` (or `pip install patch-cc`) works too; it is an
+  ordinary PyPI package.
 - **macOS only:** the Xcode command line tools, for `codesign` — a patched
   binary has to be re-signed or macOS refuses to run it.
 
@@ -168,13 +169,15 @@ startup name / `--version` marker are visible tells too.
 
 Claude Code now ships only as a Bun single-file executable; the npm package is a
 wrapper that downloads it. patch-cc edits the JavaScript bundle embedded in the
-binary's `.bun` section in place. It also drops the entry module's stale
+binary's `.bun` section in place — an ELF section on Linux, `__BUN,__bun` on
+macOS, a PE section on Windows. It also drops the entry module's stale
 precompiled bytecode — editing the source invalidates it anyway, and it is more
-than half the download — so on Linux, where the ELF section is rewritten in
-place, a patched binary is *smaller* than the original, not larger. (On macOS
-the freed bytes are not yet reclaimed, so the file keeps its size; it still runs
-correctly.) [docs/INTERNALS.md](docs/INTERNALS.md#the-bytecode-and-why-we-drop-it)
-has the measurements; `patch-cc status` has yours.
+than half the download — so on Linux and Windows, where the section is
+rewritten in place, a patched binary is *smaller* than the original, not
+larger. (On macOS the freed bytes are not yet reclaimed, so the file keeps its
+size; it still runs correctly.)
+[docs/INTERNALS.md](docs/INTERNALS.md#the-bytecode-and-why-we-drop-it) has the
+measurements; `patch-cc status` has yours.
 
 See [docs/INTERNALS.md](docs/INTERNALS.md) for the container format and
 [docs/PLAYBOOK.md](docs/PLAYBOOK.md) for repairing a patch after an update.

@@ -28,7 +28,7 @@ from pathlib import Path
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - non-POSIX; patch-cc targets Linux/macOS
+except ImportError:  # pragma: no cover - Windows has no fcntl
     fcntl = None  # type: ignore[assignment]
 
 #: OpenAI's public Codex client id (device-code grant). Not a secret.
@@ -359,10 +359,10 @@ def _refresh_lock() -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # type: ignore[attr-defined]
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
         os.close(fd)
 
 

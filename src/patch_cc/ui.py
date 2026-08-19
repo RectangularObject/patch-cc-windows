@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import io
+import os
+import sys
 from typing import TYPE_CHECKING
 
 from rich.console import Console
@@ -10,6 +13,38 @@ from .patches.base import Options, Outcome, Patch
 
 if TYPE_CHECKING:
     from .doctor import DryRun
+
+
+def _harden_stream_encoding() -> None:
+    """Keep a glyph like the doctor marks from crashing output.
+
+    Git Bash sets ``MSYSTEM``, and its terminal (mintty, or the console it
+    wraps) renders UTF-8 correctly -- but Python's own stdout encoding on
+    Windows falls back to the system's ANSI code page (cp1252 here) whenever
+    it is not attached to a real Win32 console, which under Git Bash it never
+    is. So UTF-8 is forced there specifically. Everywhere else ``errors``
+    alone is loosened, so a code page that truly cannot represent ✓ substitutes
+    a replacement character instead of raising past rich's own writer, which
+    calls `file.write` with no encoding guard of its own.
+    """
+    want_utf8 = os.name == "nt" and "MSYSTEM" in os.environ
+    for stream in (sys.stdout, sys.stderr):
+        # `TextIO` (what `sys.stdout` is typed as) doesn't declare `reconfigure`
+        # -- only the concrete `TextIOWrapper` does -- so the check is on that
+        # class rather than `getattr(..., None)`, which a type checker cannot
+        # narrow past when the attribute isn't on the declared type at all.
+        if not isinstance(stream, io.TextIOWrapper):
+            continue
+        try:
+            if want_utf8:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            else:
+                stream.reconfigure(errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
+_harden_stream_encoding()
 
 console = Console()
 
