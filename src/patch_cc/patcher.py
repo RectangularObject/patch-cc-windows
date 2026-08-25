@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import __version__, locate
 from .bun import Bundle, container
-from .js import Edit, Source, SyntaxGateError
+from .js import Source, SyntaxGateError
 from .patches import ALL_PATCHES, Options, Outcome, Patch
 
 #: Every patched bundle ends with one comment line recording exactly what was
@@ -308,26 +308,25 @@ def patch_installation(
         # Nothing changed; writing would only strip bytecode for no benefit.
         return report
 
-    # The manifest is appended through the same gated edit as every rewrite, so
-    # the bundle that gets written is one no splice -- the manifest's included --
-    # left unparseable, and it is checked as the bytes it will be rather than as
-    # a promise about them. Raising here leaves the install and the backup
-    # untouched: nothing below this line has run yet.
-    patched_source = patched_source.apply(
-        [Edit.at(len(patched_source), build_manifest(landed, options))]
-    )
+    # The manifest is appended to the entry module through the same gated edit as
+    # every rewrite, so the bundle that gets written is one no splice -- the
+    # manifest's included -- left unparseable, and it is checked as the bytes it
+    # will be rather than as a promise about them. Raising here leaves the install
+    # and the backup untouched: nothing below this line has run yet.
+    patched_source = patched_source.append_manifest(build_manifest(landed, options))
 
-    # One last gate, on the exact bytes about to be written, from a `Source` that
-    # shares nothing with the incremental tree every edit above was checked
-    # against. `Source.apply` keeps that tree in step and reparses at each batch
-    # -- fast, and correct on every build in the corpus -- but it is one lineage,
-    # trusted end to end, and the write verifier below re-extracts and compares
-    # bytes, so it agrees with a splice the incremental parse blessed and a full
-    # parse would reject. A parse from scratch is the only thing that would catch
-    # an incremental-reparse bug before it reaches the user's binary. It costs
-    # one full parse (~3 s) on the final image alone, and `doctor` never exercises
-    # it (a dry run does not write), so this is its one home.
-    defect = Source(patched_source.data).defect()
+    # One last gate, on the exact bytes about to be written, from trees that share
+    # nothing with the incremental ones every edit above was checked against.
+    # `Source.apply` keeps those in step and reparses each edited module at each
+    # batch -- fast, and correct on every build in the corpus -- but it is one
+    # lineage, trusted end to end, and the write verifier below re-extracts and
+    # compares bytes, so it agrees with a splice the incremental parse blessed and
+    # a full parse would reject. A parse from scratch of each edited module is the
+    # only thing that would catch an incremental-reparse bug before it reaches the
+    # user's binary; unedited modules were never incrementally touched, so this
+    # costs the edits' own parses, not the whole surface's. `doctor` never
+    # exercises it (a dry run does not write), so this is its one home.
+    defect = patched_source.fresh_defect()
     if defect is not None:
         raise SyntaxGateError(
             "the patched bundle does not parse as a whole, though each edit did "
@@ -341,7 +340,7 @@ def patch_installation(
     # to hand back, which is the one guarantee this file exists to keep.
     report.backup = _backup(install)
 
-    container.write(source, patched_source.data, str(install.binary))
+    container.write(source, patched_source, str(install.binary))
     report.output = install.binary
     report.patched_size = install.binary.stat().st_size
     return report

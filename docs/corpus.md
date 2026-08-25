@@ -21,11 +21,13 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The whole published span `2.1.210` → `2.1.236` — 2.1.230 was never published —
-one pristine binary per version, 26 in all. Two pairs share a byte count
-(`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`) and are still distinct binaries,
-which is why the identity column is the hash (of the whole file,
-`sha256sum <version>.orig`) and never the size:
+The whole published span `2.1.210` → `2.1.243` — 2.1.230 was never published —
+one pristine binary per version, 33 in all. It straddles the **2.1.242 code
+split** (INTERNALS.md): `2.1.242`/`2.1.243` are the first many-module builds, and
+they jump ~35 MB over `2.1.241` for it. Several pairs share a byte count
+(`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`, `2.1.239`–`2.1.241`, `2.1.242`/`2.1.243`)
+and are still distinct binaries, which is why the identity column is the hash (of
+the whole file, `sha256sum <version>.orig`) and never the size:
 
 | version | size | sha256 |
 |---|---|---|
@@ -55,10 +57,17 @@ which is why the identity column is the hash (of the whole file,
 | `2.1.234` | 328 MB | `3473601ea695d5bf769c5b202844d4cb4fbf723ae995450fcb6973204775c84a` |
 | `2.1.235` | 331 MB | `bfcf0ae2dbf94b2b6a106074aabf3938b9a10889c3b678e4cb5a00c03274d5d5` |
 | `2.1.236` | 335 MB | `6c8818fa22187aa555c242be4abbacc44d6b71a32ac9631ee7b2b5d12f51f752` |
+| `2.1.237` | 335 MB | `73975167f0108693cf6fd6614994781657ebb8456ebef5d247458734abfb3916` |
+| `2.1.238` | 339 MB | `0933b286cf94e1b2504b35ac165ab76b8f822735d53371c56393988c23040d58` |
+| `2.1.239` | 343 MB | `7de1b1576e2e0be73ce91c2b4dedf16a41058ea633b957a36fdc6044ddfc0f3c` |
+| `2.1.240` | 343 MB | `1386169da77de19a655f07a86ab80f5775983a50eb0c9c27a7daf16e7320322d` |
+| `2.1.241` | 343 MB | `0771bd866cff82b76581fc0499f6529e1a36845078f144f8c81dccb3bc7037b8` |
+| `2.1.242` | 378 MB | `528ef039aa7d64d7b3fbc06925132755a516b4dcaad784cf0b51fe03167360d4` |
+| `2.1.243` | 378 MB | `4b0dafeedd0b469c41988e200036fd773e7553ba960349c9f02a82c6d1f2ba27` |
 
 This set covers the span the playbook's tree-move measurements were taken over
-(`2.1.210` → `2.1.233`), so those numbers are re-checkable here rather than
-historical.
+(`2.1.210` → `2.1.233`) and the 2.1.242 split, so both are re-checkable here
+rather than historical.
 
 ## Rebuild or extend it
 

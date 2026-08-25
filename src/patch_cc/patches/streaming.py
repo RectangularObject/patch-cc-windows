@@ -44,7 +44,20 @@ _CORE_UPDATES = (
 class Discovery:
     """Identifiers found in one step and consumed by later ones."""
 
+    #: The virtual-message builder's local name in the *memo's* module -- what the
+    #: memo rewrite uses, and the fallback the reducer uses when the two share a
+    #: module (the monolith).
     create_message_helper: str | None = None
+    #: The builder's external (exported) name when the memo imports it, so the
+    #: reducer -- which may sit in a different module that names the same function
+    #: differently -- can resolve *its own* local for it. ``None`` when the memo's
+    #: helper is not an import (one module, one name).
+    helper_export: str | None = None
+    #: The blob index of the memo's module. When the helper is *not* imported
+    #: (``helper_export`` is None) its local name only carries to a reducer in the
+    #: *same* module; this is what lets the reducer confirm that rather than
+    #: assume it, closing the mirror of the imported-name hazard.
+    helper_module: int | None = None
 
 
 # --------------------------------------------------------------- JS builders
@@ -141,12 +154,31 @@ _INJECTED = "__cc_streamingThinking"
 def _outermost(scope: js.Node) -> bool:
     """Is this the module wrapper -- the one scope not worth searching?
 
-    The bundle is one enormous top-level function. Everything below it is a
-    real lexical scope worth asking a question of; it is not, and walking its
-    twelve million nodes to find out is the difference between a search that
-    takes microseconds and one that does not finish.
+    A scope handing the reducer its callbacks, or a memo over the streaming
+    tool-uses, lives inside a component; the module's whole-body wrapper never
+    does, and walking its twelve million nodes to find that out is the
+    difference between a search that takes microseconds and one that does not
+    finish. So the climb stops at the wrapper -- but *which* scope is the wrapper
+    is a fact about the build, not a fixed position.
+
+    Pre-2.1.242 the bundle is one enormous top-level function: the module's
+    ``program`` is a single ``(function(){...})()`` statement wrapping every
+    line, and a top-level scope there *is* that wrapper. Since the code split,
+    a module's ``program`` is dozens of statements -- imports, several
+    components, exports -- and its top-level functions are real components, each
+    a small part of a small module and exactly what the state resolution has to
+    search. The signal that separates the two is structural and needs no size to
+    guess at: a wrapper module is one (or, allowing a trailing statement, two)
+    top-level statements; a component module is many. A scope nested inside a
+    function is never the wrapper, whichever era it is.
     """
-    return js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS) is None
+    if js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS) is not None:
+        return False
+    program = scope
+    while program.parent is not None:
+        program = program.parent
+    statements = [child for child in program.children if child.type != "comment"]
+    return len(statements) <= 2
 
 
 def _conversation_renders(source: Source) -> list[js.Node]:
@@ -284,7 +316,7 @@ def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
                     continue
                 if not js.visible(declarator, site):
                     continue
-                snapshots[declarator.start_byte] = name
+                snapshots[declarator.id] = name
         pattern = js.only(
             list(snapshots.values()), "snapshot reads of the live-thinking store"
         )
@@ -335,10 +367,10 @@ def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
         if _STREAMING in carried:
             # Upstream already threads it into this render; the goal achieved.
             continue
-        if pattern is not None and pattern.start_byte not in extended:
+        if pattern is not None and pattern.id not in extended:
             # Two renders in one scope read one snapshot: the pattern gains the
             # field once, at the front, which is valid whatever it ends with.
-            extended.add(pattern.start_byte)
+            extended.add(pattern.id)
             edits.append(
                 Edit.before(pattern.named_children[0], f"{_STREAMING}:{state},")
             )
@@ -428,14 +460,14 @@ def _step_display_mode(source: Source, outcome: Outcome) -> Source:
 
     for node in source.find(_DISABLE_THINKING):
         declaration = js.up(node, "lexical_declaration", "variable_declaration")
-        if declaration is None or declaration.start_byte in seen:
+        if declaration is None or declaration.id in seen:
             continue
         # The value itself, not the ternary that chooses it: what is edited is
         # what identified it, so there is no second reach for the same child.
         display = js.first(declaration, _chooses)
         if display is None:
             continue
-        seen.add(declaration.start_byte)
+        seen.add(declaration.id)
         value = _defaulting(display)
         step.candidates += 1
         step.applied += 1
@@ -644,7 +676,6 @@ def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
 _CONTENT_BLOCK = "contentBlock"
 _CONTENT = "content"
 _UUID = "uuid"
-_USE_MEMO = "useMemo"
 _FLAT_MAP = "flatMap"
 
 
@@ -680,11 +711,18 @@ def _wraps_block(call: js.Node | None) -> bool:
 def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
     """The memo that turns streaming tool-uses into renderable messages.
 
-    Identified by what it computes: a ``useMemo`` over a ``flatMap`` that
-    builds one virtual message per streaming content block. Everything the
-    replacement needs -- the helper that builds a message, the one that stamps
-    its uuid, the one that normalises a list -- is read out of that computation
-    rather than matched by name, because every one of those names is minified.
+    Identified by what it computes: a memo hook over a ``flatMap`` that builds
+    one virtual message per streaming content block. Everything the replacement
+    needs -- the memo's own callee, the array it maps, the helper that builds a
+    message, the one that stamps its uuid, the one that normalises a list -- is
+    read out of that computation rather than matched by name, because every one
+    of those names is minified. The memo hook is one of them: the monolith
+    reaches it as ``<React>.useMemo(...)`` (the property name survives), but a
+    code-split module imports it under a local (``import{useMemo as te}`` ->
+    ``te(...)``), so keying on ``useMemo`` read a build that memoizes exactly the
+    same way as one with no memo at all. The computation is the identity -- an
+    arrow whose whole body is a ``flatMap`` wrapping the block -- and the call
+    that takes that arrow is the memo, however it is spelled.
 
     Both nodes come back, the memo to replace and the ``flatMap`` that proved
     it was the right one, so the caller reads what was identified rather than
@@ -692,26 +730,97 @@ def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
     """
     found: dict[int, tuple[js.Node, js.Node]] = {}
     for node in source.find(_CONTENT_BLOCK):
-        memo = js.climb(
+        flat = js.climb(
             node,
             lambda n: (
                 n.type == "call_expression"
-                and js.reads(n.child_by_field_name("function"), _USE_MEMO)
+                and js.reads(n.child_by_field_name("function"), _FLAT_MAP)
             ),
         )
-        arrow = next(iter(js.arguments(memo)), None)
-        if arrow is None or arrow.type != "arrow_function":
+        if flat is None or js.first(flat, _wraps_block) is None:
             continue
-        flat = js.body(arrow)
-        if (
-            memo is not None
-            and flat is not None
-            and flat.type == "call_expression"
-            and js.reads(flat.child_by_field_name("function"), _FLAT_MAP)
-            and js.first(flat, _wraps_block) is not None
-        ):
-            found[memo.start_byte] = (memo, flat)
+        # The arrow whose *whole body* is that flatMap, and the call that takes
+        # it -- the memo. An expression-bodied arrow, so the flatMap is the body
+        # itself, not a statement inside one; the callback the flatMap runs is a
+        # different arrow, nested below the flatMap and never climbed into.
+        arrow = js.up(flat, "arrow_function")
+        body = js.body(arrow) if arrow is not None else None
+        if body is None or body.id != flat.id:
+            continue
+        memo = js.up(arrow, "call_expression")
+        if memo is None or next(iter(js.arguments(memo)), None) != arrow:
+            continue
+        found[memo.id] = (memo, flat)
     return js.only(list(found.values()), "streaming-extras memos")
+
+
+# ---- cross-module name resolution for the one name two modules share ----
+#
+# The virtual-message builder is discovered in the memo's module and used again
+# in the reducer's, and since 2.1.242 those are different modules that alias the
+# same imported function under different locals. `_flatmap_extras`'s `Ah` is a
+# regex-escape helper in the reducer's chunk; the builder is `xg` there. So the
+# name is resolved on the reducer's side through the one export hop between them,
+# never carried across as a spelling -- the same lesson `find_local` states for a
+# module-local, reaching an *inter*-module name. In the monolith the two share a
+# scope and there is no import to follow, which `_imported_name` reports as None.
+
+
+def _imported_name(source: Source, local: js.Node) -> str | None:
+    """The external name a local was imported under, in the local's own module.
+
+    ``import{X as Ah}`` binds ``Ah`` to the external name ``X`` -- how any other
+    module names the same value. A local that is not imported (defined in this
+    module, or the monolith's single scope) returns ``None``: its own name is the
+    only name there is.
+    """
+    name = js.text(local)
+    for node in source.find_local(local, name):
+        specifier = js.up(node, "import_specifier")
+        if specifier is None:
+            continue
+        alias = specifier.child_by_field_name("alias")
+        bound = alias if alias is not None else specifier.child_by_field_name("name")
+        if bound is not None and js.text(bound) == name:
+            external = specifier.child_by_field_name("name")
+            return js.text(external) if external is not None else None
+    return None
+
+
+def _module_local(source: Source, anchor: js.Node, external: str) -> str | None:
+    """This module's own local for an external name -- the reducer's ``xg``.
+
+    A module names an imported value in one of two ways, and both are read as the
+    grammar's own specifiers rather than spelled: it *defines and exports* the
+    value (``export{xg as ZNa}`` -- the local is the export's ``name``), or it
+    *imports* it (``import{ZNa as x}`` -- the local is the import's ``alias``).
+    ``None`` when the module neither defines nor imports it, which fails the
+    reducer step loudly rather than splicing a call to a name that is not there.
+    """
+    locals_found = []
+    for node in source.find_local(anchor, external):
+        export = js.up(node, "export_specifier")
+        if export is not None:
+            exported = export.child_by_field_name(
+                "alias"
+            ) or export.child_by_field_name("name")
+            bound = export.child_by_field_name("name")
+            if (
+                exported is not None
+                and bound is not None
+                and js.text(exported) == external
+            ):
+                locals_found.append(js.text(bound))
+            continue
+        imp = js.up(node, "import_specifier")
+        if imp is not None:
+            imported = imp.child_by_field_name("name")
+            if imported is not None and js.text(imported) == external:
+                bound = imp.child_by_field_name("alias") or imported
+                locals_found.append(js.text(bound))
+    return js.only(
+        list(dict.fromkeys(locals_found)), f"module-local bindings of {external!r}"
+    )
 
 
 def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> Source:
@@ -727,7 +836,11 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
     # -- which `transcript-signature` has just made sure of -- rather than a
     # variable some other renderer bound under the same name.
     var = _bound_in_scope(memo, _STREAMING)
-    ns = js.text(js.receiver(memo.child_by_field_name("function")))
+    # The memo's own callee, reused verbatim: `<React>.useMemo` in the monolith,
+    # a bare imported local (`te`) in a code-split module. Reading the receiver
+    # and re-spelling `.useMemo` assumed a member call and crashed on the local;
+    # copying the callee keeps the rewrite memoized the way this build memoizes.
+    memo_fn = js.text(memo.child_by_field_name("function"))
     tool_uses = js.text(js.receiver(flat.child_by_field_name("function")))
     callback = js.arguments(flat)[0]
     taken = js.positional(callback)
@@ -755,9 +868,13 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
         step.note("no virtual message built per streaming block")
         return source
     message = js.text(built.child_by_field_name("name"))
-    helper = js.text(
-        (built.child_by_field_name("value") or built).child_by_field_name("function")
+    helper_node = (built.child_by_field_name("value") or built).child_by_field_name(
+        "function"
     )
+    if helper_node is None:
+        step.note("the virtual-message builder call has no callee")
+        return source
+    helper = js.text(helper_node)
     stamp = js.first(
         block,
         lambda n: (
@@ -786,13 +903,15 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
     normalize_fn = js.text(normalize.child_by_field_name("function"))
 
     found.create_message_helper = helper
+    found.helper_export = _imported_name(source, helper_node)
+    found.helper_module = source.module_index(helper_node)
     step.candidates += 1
     step.applied += 1
     return source.apply(
         [
             Edit.replace(
                 memo,
-                f"{ns}.useMemo(()=>{{"
+                f"{memo_fn}(()=>{{"
                 f"let __cc_streamingToolUseExtras={tool_uses}.map(({entry})=>{{"
                 f"let {message}={helper}({{content:[{entry}.{_CONTENT_BLOCK}]}});"
                 f"return {message}.{_UUID}={uuid_helper}({entry}.{_CONTENT_BLOCK}.id,0),"
@@ -849,7 +968,7 @@ def _reducer(source: Source) -> js.Node | None:
                 for label in (_REQUEST_START, _THINKING_DELTA, _CONTENT_BLOCK_START)
             )
         ):
-            found[handler.start_byte] = handler
+            found[handler.id] = handler
     return js.only(list(found.values()), "stream reducers")
 
 
@@ -992,17 +1111,20 @@ def _dispatch(
     is wrapped ``(test&&((update),!0))``, value-preserving so it survives any
     surrounding composition and needs no union check (the label *is* the union).
     """
-    points: set[int] = set()
+    # Each dispatch point is an offset with the arm it belongs to, so the
+    # insertion routes to the arm's own module (`Edit.at`'s `within`); the arm is
+    # the natural anchor since the reducer, arm and update are all one module.
+    points: dict[int, js.Node] = {}
     tests: list[js.Node] = []
     for node in js.every(handler, lambda n: any(_routes(n, label) for label in labels)):
         if node.type == "switch_case":
             if on is not None and _switch_on(node, on):
-                points.add(js.dispatch(node))
+                points[js.dispatch(node)] = node
         else:
             tests.append(node)
     step.candidates += len(points) + len(tests)
     step.applied += len(points) + len(tests)
-    return [Edit.at(at, f"{update};") for at in sorted(points)] + [
+    return [Edit.at(at, f"{update};", within=points[at]) for at in sorted(points)] + [
         Edit.replace(test, f"({js.text(test)}&&(({update}),!0))") for test in tests
     ]
 
@@ -1028,6 +1150,32 @@ def _step_reducer(source: Source, found: Discovery, outcome: Outcome) -> Source:
     bag = _options_bag(handler)
     taken = js.positional(handler)
     if bag is None or not taken:
+        return source
+
+    # The builder's name *in the reducer's module*. When the memo imports it
+    # (every split build), the same function is a different local here -- the
+    # memo's `Ah` is a regex helper in the reducer's chunk, which builds the
+    # message as `xg` -- so it is resolved through the export the two modules
+    # share, never carried across as a spelling. A build where the reducer's
+    # module cannot reach the builder fails this required step loudly rather than
+    # splicing a call to a name that resolves to something else.
+    if found.helper_export is not None:
+        helper = _module_local(source, handler, found.helper_export)
+        if helper is None:
+            step.note(
+                "the virtual-message builder is not reachable in the reducer's "
+                "module; skipped"
+            )
+            return source
+    elif found.helper_module is not None and found.helper_module != source.module_index(
+        handler
+    ):
+        # The helper is a local the memo *defines*, not one it imports, so its
+        # spelling only carries to a reducer in that same module. Here they are
+        # different modules (the monolith is one, so this never fires there), and
+        # a memo-module local would resolve to something else in the reducer's --
+        # the mirror of the imported-name hazard, closed the same loud way.
+        step.note("the virtual-message builder is a local of another module; skipped")
         return source
     step.candidates += 1
     step.applied += 1

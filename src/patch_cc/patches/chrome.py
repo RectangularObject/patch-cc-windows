@@ -129,8 +129,12 @@ def _version_output(source: Source, options: Options, outcome: Outcome) -> Sourc
         if fragment is None:
             continue
         outcome.candidates += 1
-        after = fragment.end_byte
-        if source.data[after : after + len(marker)] != marker:
+        # Whether the marker is already there, read from the literal the fragment
+        # sits in rather than from a bundle-wide buffer -- the bundle is many
+        # modules now, and this literal is one small node in one of them.
+        literal_bytes = literal.text or b""
+        after = fragment.end_byte - literal.start_byte
+        if literal_bytes[after : after + len(marker)] != marker:
             edits.append(Edit.after(fragment, marker))
             outcome.applied += 1
     return source.apply(edits)
@@ -325,7 +329,7 @@ def _interpolates_org(node: js.Node) -> bool:
     return js.up(node, "template_substitution") is not None
 
 
-def _appended(source: Source, line: js.Node, label: str) -> str | None:
+def _appended(line: js.Node, label: str) -> str | None:
     """What ``label`` adds to upstream's no-org line -- nothing, when hiding.
 
     A segment is introduced by the separator this very line already uses: the
@@ -335,16 +339,21 @@ def _appended(source: Source, line: js.Node, label: str) -> str | None:
     2.1.232 writes `\\xB7` baked ``${model} / ${plan} \\xB7 Ada``, half its
     punctuation and half ours.
 
-    A line with nothing to copy from (one interpolation, so no separator ever
-    written) is a line this patch cannot extend, and says so by finding nothing
-    rather than by inventing the character it would have needed.
+    Read from the line's own bytes, not a bundle-wide buffer: the line is one
+    template node in one module. A line with nothing to copy from (one
+    interpolation, so no separator ever written) is a line this patch cannot
+    extend, and says so by finding nothing rather than by inventing the
+    character it would have needed.
     """
     if not label:
         return ""
     marks = [c for c in js.children(line) if c.type == "template_substitution"]
     if len(marks) < 2:
         return None
-    separator = source.data[marks[-2].end_byte : marks[-1].start_byte]
+    line_bytes = line.text or b""
+    separator = line_bytes[
+        marks[-2].end_byte - line.start_byte : marks[-1].start_byte - line.start_byte
+    ]
     return f"{separator.decode('utf8')}{_js_template_escape(label)}"
 
 
@@ -375,7 +384,7 @@ def _org_label(source: Source, options: Options, outcome: Outcome) -> Source:
         if _interpolates_org(node):
             outcome.candidates += 1
         line = js.up(node, "ternary_expression")
-        if line is None or line.start_byte in seen:
+        if line is None or line.id in seen:
             continue
         with_org = line.child_by_field_name("consequence")
         no_org = line.child_by_field_name("alternative")
@@ -391,10 +400,10 @@ def _org_label(source: Source, options: Options, outcome: Outcome) -> Source:
         # very half upstream keeps changing here (`process.env` through 2.1.227,
         # a local from 2.1.228) and the one `js.reads` exists to stop describing.
         demo = js.first(condition, lambda n: js.reads(n, _IS_DEMO))
-        tail = _appended(source, no_org, label)
+        tail = _appended(no_org, label)
         if demo is None or tail is None:
             continue
-        seen.add(line.start_byte)
+        seen.add(line.id)
         plain = js.text(no_org)
         edits.append(
             Edit.replace(

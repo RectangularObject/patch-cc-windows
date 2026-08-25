@@ -697,7 +697,17 @@ def cmd_extract(args) -> int:
     from .bun import container
 
     bundle = container.read(args.path)
-    sys.stdout.buffer.write(bundle.source.data)
+    # Every JS module the container carries, each behind a header naming its blob
+    # index, joined into one stream. Since 2.1.242 the app is split across many
+    # modules; concatenating them keeps the PLAYBOOK repair loop's `rg` working
+    # over one file, and the headers say which module a hit lives in. A pre-split
+    # build is one module, so this is its bytes behind a single header.
+    out: list[bytes] = []
+    for index, data in sorted(bundle.source.contents().items()):
+        out.append(f"// ==== patch-cc module {index} ====\n".encode())
+        out.append(data)
+        out.append(b"\n")
+    sys.stdout.buffer.write(b"".join(out))
     sys.stdout.buffer.flush()
     return 0
 

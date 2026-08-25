@@ -552,9 +552,7 @@ def _row_assembler(source: Source) -> js.Node | None:
         if block is None or js.first(block, js.of_type("for_in_statement")) is None:
             continue
         returned = js.first(block, js.returns(js.text(js.binding(taken[0]))))
-        if returned is not None and returned.start_byte not in {
-            node.start_byte for node in found
-        }:
+        if returned is not None and returned.id not in {node.id for node in found}:
             found.append(returned)
     return js.only(found, "row assemblers")
 

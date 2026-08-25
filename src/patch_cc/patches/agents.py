@@ -110,9 +110,9 @@ def _subagent_prompt(source: Source, _options: Options, outcome: Outcome) -> Sou
             node,
             lambda n: n.type in js.FUNCTIONS and _TRANSCRIPT_MODE in js.parameters(n),
         )
-        if component is None or component.start_byte in seen:
+        if component is None or component.id in seen:
             continue
-        seen.add(component.start_byte)
+        seen.add(component.id)
         transcript = js.text(js.parameters(component)[_TRANSCRIPT_MODE])
         prompts = _prompt_vars(component)
         if not prompts:
@@ -213,6 +213,12 @@ def _resolved_name(source: Source, value: js.Node) -> str | None:
     *write*, and ``name`` is only used to offer the agent (the edit hangs off
     ``anchor``/``model_node``), so nothing about the rewrite changes.
 
+    The declarator is looked for in the constant's *own module*
+    (:meth:`js.Source.find_local`): a minified local is only unique there, and
+    since 2.1.242 the bundle is many modules, so the same two letters bind a
+    string in a dozen unrelated chunks. Before the split the module was the whole
+    bundle and the distinction did not exist.
+
     ``None`` is ordinary absence -- a computed or otherwise unreadable type, the
     same answer the old literal-only gate gave every constant. Two declarators
     for one identifier is not absence but ambiguity, and :func:`js.only` makes it
@@ -227,7 +233,7 @@ def _resolved_name(source: Source, value: js.Node) -> str | None:
     binding = js.only(
         [
             declarator
-            for node in source.find(name)
+            for node in source.find_local(value, name)
             if node.type == "identifier"
             and (declarator := node.parent) is not None
             and declarator.type == "variable_declarator"

@@ -157,13 +157,13 @@ def _reroute_grouping(source: Source, outcome: Outcome) -> Source:
         # to is what it absorbs the entry into.
         group = js.text(accounted.child_by_field_name("object"))
         arm = js.climb(node, _absorbing(group, node))
-        if arm is None or arm.start_byte in seen:
+        if arm is None or arm.id in seen:
             continue
         absorb = _absorbed(arm.child_by_field_name("consequence"), group)
         ungrouped = _ungrouped(arm)
         if absorb is None or ungrouped is None:
             continue
-        seen.add(arm.start_byte)
+        seen.add(arm.id)
         step.candidates += 1
         edits.append(Edit.replace(absorb, js.text(ungrouped).rstrip(";")))
         edits += [
@@ -450,9 +450,9 @@ def _max_effort(source: Source, _options: Options, outcome: Outcome) -> Source:
         if node.type != "string":
             continue
         condition = _whitelist(node)
-        if condition is None or condition.start_byte in seen:
+        if condition is None or condition.id in seen:
             continue
-        seen.add(condition.start_byte)
+        seen.add(condition.id)
         gate.candidates += 1
         gate.applied += 1
         subject = js.first(condition, js.of_type("identifier"))

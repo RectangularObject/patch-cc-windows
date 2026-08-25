@@ -13,7 +13,11 @@ binary:
 - **Windows**: a PE `.bun` section (not supported here)
 
 Inside that section is a *Bun module graph*: a flat arena of payloads, a module
-table describing them, and a trailer.
+table describing them, and a trailer. Before 2.1.242 the graph was the app in one
+module plus a few asset modules; since then the app is **code-split** across
+~1,300 `chunk-*.js` modules that the entry lazily imports (see
+[the split](#the-21242-split-and-the-patchable-surface)). Either way patch-cc
+treats every module the container declares to be JavaScript as one surface.
 
 ```
 .bun section
@@ -35,52 +39,85 @@ A module record (new 52-byte format) is six such pairs — `name`, `contents`,
 `sourcemap`, `bytecode`, `moduleInfo`, `bytecodeOriginPath` — followed by four
 `u8` flags (`encoding`, `loader`, `moduleFormat`, `side`).
 
-The module we patch is the entrypoint, which the offsets struct names by index
-(`entry_point_id`) — the same index Bun itself resolves it by. Its `contents` is
-the JS we edit. Its *name* is upstream's to change and we never read it:
-2.1.229 renamed it `/$bunfs/root/src/entrypoints/cli.js` → `/$bunfs/root/cli`.
-
 Code: `src/patch_cc/bun/blob.py`.
+
+## The 2.1.242 split, and the patchable surface
+
+Through 2.1.241 the entrypoint module *was* the app: one ~28 MB `contents`
+carrying every line patch-cc anchors on. 2.1.242 turned on Bun code-splitting
+with lazy loading, and the shape changed under the tool:
+
+| build | modules | entrypoint `contents` |
+|---|---|---|
+| 2.1.241 | 11 | 28,249,679 bytes (the whole app) |
+| 2.1.243 | 1,385 | 19,952 bytes (an argv shim) |
+
+The entrypoint is now a ~20 KB shim that parses argv and lazily
+`import()`s the app across ~1,300 `/$bunfs/root/chunk-*.js` modules; ~46 MB of
+JS, the largest chunk 7.3 MB. The code did not disappear — every anchor is still
+in the binary — but it left the one module patch-cc used to read, and it does not
+concentrate in a single chunk (`branding` spans a dozen modules, `org-label` ten,
+`spinner-tips` six).
+
+So the patchable surface is **every module the container declares to be
+JavaScript**, discovered the way the entrypoint itself is discovered — off the
+artifact, never hardcoded. A module's *loader* (the second trailing flag) is how
+Bun decides whether to compile it as source or hand it over as opaque bytes, and
+the entrypoint is by definition the JS Bun runs, so its loader *is* the JS loader
+(`Blob.js_modules`). The asset modules (the native addons, the bundled
+`mermaid`/`hljs`, the HTML template) carry other loaders and are left alone. A
+pre-split build is the one-module case of this — `js_modules()` returns just the
+monolith — so [`js.Source`](PLAYBOOK.md#the-many-module-surface) spans one module
+or a thousand through the same code.
+
+The entrypoint still matters for one thing: it is where the manifest lives and
+what `status` reads, named by the offsets struct's `entry_point_id` — the same
+index Bun resolves it by. Its *name* is upstream's to change and we never read
+it: 2.1.229 renamed it `/$bunfs/root/src/entrypoints/cli.js` → `/$bunfs/root/cli`.
 
 ## The bytecode, and why we drop it
 
-The entry module also carries precompiled Bun **bytecode** — more than half the
-binary. Every other module has none.
+Modules carry precompiled Bun **bytecode** — most of the binary. Before the
+split only the entry module had any (~half of it); the code-split builds carry it
+on nearly every chunk (232 MB of 377 on 2.1.243, across ~1,375 modules).
 
-Any edit to `contents` invalidates that bytecode; Bun detects the mismatch and
-recompiles from source at launch. So keeping it buys nothing:
+Any edit to a module's `contents` invalidates *that module's* bytecode; Bun
+detects the mismatch and recompiles that module from source at launch. So keeping
+a stale copy buys nothing — the recompile is paid either way — and dropping it
+reclaims the space and guarantees our edits are what runs. patch-cc drops the
+bytecode of exactly the modules it edited (`rebuild` over `changed_modules`) and
+leaves every untouched module its bytecode and its fast start. On Linux, where
+the ELF section is rewritten in place, the binary is smaller by exactly the
+edited modules' bytecode.
 
-| binary | size | startup |
-|---|---|---|
-| original (valid bytecode) | 323 MB | ~100 ms |
-| patched, bytecode kept | 323 MB | ~650 ms |
-| patched, bytecode dropped | **125 MB** | ~650 ms |
+Measured on 2.1.243, the full patch set:
 
-Patching pays the recompile cost either way, so patch-cc drops the entry
-module's bytecode (`rebuild(..., drop_bytecode=True)`). The result runs source,
-guaranteeing our edits are authoritative, and — on Linux — is smaller by
-exactly the bytecode.
+| binary | size | bytecode | startup |
+|---|---|---|---|
+| pristine | 378 MB | 232 MB (every module) | ~13 ms `--version` |
+| patched (edited modules' bytecode dropped) | **295 MB** | 150 MB (untouched modules) | ~15 ms |
 
-The size figures are the **ELF** path: the `.bun` section is rewritten in place,
-so the dropped bytecode is genuinely reclaimed (`container.verify` refuses a
-Linux write that did not shrink). On **macOS** the file keeps its original size:
-`macho.py` grows a segment but never shrinks one, so the freed bytes stay as
-dead space. The binary still runs correctly (the bytecode is gone), it is just
-not smaller — reclaiming it means shrinking the Mach-O segment and re-laying
-`__LINKEDIT`, which is not done yet.
+The 83 MB reclaimed is the ~45 edited modules' bytecode; the rest stays, which is
+why a split-build patched binary is smaller but not the *half* a patched monolith
+was. The recompile is now per lazily-imported edited module rather than the whole
+app at once, so startup barely moves. Read the current figures off any binary
+with `patch-cc status` rather than off this table — the bytecode total grows every
+few builds.
 
-Those are **2.1.232's** Linux numbers, and they are a measurement rather than a
-promise: the same table read 267 / 113 MB against 2.1.216, because the bytecode
-grew from 154 MB to 198 MB in the fifteen builds between them (2.1.230 was
-never published). Read the current pair off any
-binary with `patch-cc status` rather than off this table.
+The size story is the **ELF** path: the `.bun` section is rewritten in place, so
+the dropped bytecode is genuinely reclaimed (`container.verify` refuses a Linux
+write that did not shrink by about that much). On **macOS** the file keeps its
+original size: `macho.py` grows a segment but never shrinks one, so the freed
+bytes stay as dead space. The binary still runs correctly (the bytecode is gone),
+it is just not smaller — reclaiming it means shrinking the Mach-O segment and
+re-laying `__LINKEDIT`, which is not done yet.
 
-Every write asserts the binary it produced carries `bytecode == 0`
-(`container.verify`, beside the round-trip check), and `patch-cc status` reports
-the field for an installed one. `doctor` cannot: a dry run is handed a *clean*
-bundle, which still has its bytecode by definition. If a future Bun build makes
-bytecode authoritative over source, that assert is the tripwire — every patch
-would silently no-op otherwise.
+Every write asserts each **edited** module carries `bytecode == 0` in the binary
+it produced (`container.verify`, beside the round-trip check), and `patch-cc
+status` reports the total for an installed one. `doctor` cannot: a dry run is
+handed a *clean* bundle, which still has all its bytecode by definition. If a
+future Bun build makes bytecode authoritative over source, that assert is the
+tripwire — every edit would silently no-op otherwise.
 
 ## Writing it back without ballooning
 
@@ -108,8 +145,10 @@ edit is followed by an ad-hoc `codesign` (mandatory on Apple Silicon).
 
 ## The manifest
 
-Every patched bundle ends with a single comment line — the one description of
-its shape; [PLAYBOOK.md](PLAYBOOK.md) covers what it means for matcher health:
+Every patched bundle carries a single comment line — appended to the **entry
+module**, the one module always present and always re-extracted, and the one
+`status` reads — describing its shape; [PLAYBOOK.md](PLAYBOOK.md) covers what it
+means for matcher health:
 
 ```
 //patch-cc {"v":1,"tool":"<version>","patches":[...],"brand":...,"suffix":...,
@@ -157,7 +196,8 @@ rather than from a store of their own.
   and dropped rather than aborting the run. See
   [PLAYBOOK.md](PLAYBOOK.md#the-syntax-gate).
 - Every write is verified: patch-cc re-extracts the JS from the binary it just
-  wrote and asserts it equals what it meant to write.
+  wrote and asserts every module equals what it meant to write, and that each
+  module it edited carries no leftover bytecode to run instead of the edit.
 - Patching a binary that is already marked, when no pristine backup exists, is
   refused outright — there is nothing clean to start from, and our edits change
   lengths, so a second pass would corrupt rather than update. `restore` or a
