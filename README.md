@@ -168,14 +168,15 @@ startup name / `--version` marker are visible tells too.
 ## Why native-only, and why it stays small
 
 Claude Code now ships only as a Bun single-file executable; the npm package is a
-wrapper that downloads it. patch-cc edits the JavaScript bundle embedded in the
+wrapper that downloads it. patch-cc edits the JavaScript modules embedded in the
 binary's `.bun` section in place — an ELF section on Linux, `__BUN,__bun` on
-macOS, a PE section on Windows. It also drops the entry module's stale
-precompiled bytecode — editing the source invalidates it anyway, and it is more
-than half the download — so on Linux and Windows, where the section is
-rewritten in place, a patched binary is *smaller* than the original, not
-larger. (On macOS the freed bytes are not yet reclaimed, so the file keeps its
-size; it still runs correctly.)
+macOS, a PE section on Windows; since 2.1.242 the app is code-split across
+~1,300 modules, and patch-cc treats every one as a single surface. It also drops
+the stale precompiled bytecode of the modules it edits — editing a module's
+source invalidates its bytecode anyway — so on Linux and Windows, where the
+section is rewritten in place, a patched binary is *smaller* than the original,
+not larger (83 MB smaller on 2.1.243). (On macOS the freed bytes are not yet
+reclaimed, so the file keeps its size; it still runs correctly.)
 [docs/INTERNALS.md](docs/INTERNALS.md#the-bytecode-and-why-we-drop-it) has the
 measurements; `patch-cc status` has yours.
 

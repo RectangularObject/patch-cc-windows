@@ -61,15 +61,21 @@ def detect(path: str) -> str:
 class Bundle:
     """The JS bundle plus everything needed to put it back.
 
-    ``source`` is the entrypoint as a :class:`patch_cc.js.Source` -- the bytes
-    the blob carries, plus the parse of them, held together so a bundle is read
-    and parsed at most once however many surfaces ask it a question. Its tree is
-    lazy, so the surfaces that only scan for a literal never buy one.
+    ``source`` is every JavaScript module the container declares, spanned as one
+    :class:`patch_cc.js.Source` -- the bytes the blob carries plus their parse,
+    held together so a bundle is read once however many surfaces ask it a
+    question. The parse is lazy per module, so a surface that only scans for a
+    literal never buys grammar, and the many-module surface is the one-module
+    surface with more than one module (:meth:`patch_cc.bun.blob.Blob.js_modules`).
 
-    There is no decoding here any more. The layers below work in ``bytes``
-    (``blob.entry_source``, ``blob.rebuild``), tree-sitter indexes ``bytes``,
-    and a ``str`` in the middle bought nothing but a second unit of offset for a
-    splice to be wrong in.
+    There is no decoding here. The layers below work in ``bytes``
+    (``blob.js_modules``, ``blob.rebuild``), tree-sitter indexes ``bytes``, and a
+    ``str`` in the middle bought nothing but a second unit of offset for a splice
+    to be wrong in.
+
+    ``bytecode_size`` is the total across every module -- one carried it before
+    2.1.242, every chunk carries one after -- which is what ``status`` reports
+    and the write's size tripwire measures its reclaim against.
     """
 
     path: str
@@ -93,10 +99,13 @@ def read(path: str) -> Bundle:
 
     payload, header_size = blobmod.unwrap_section(section)
     parsed = blobmod.parse(payload)
+    modules = [
+        (m.index, parsed.payload(m.ranges["contents"])) for m in parsed.js_modules()
+    ]
     return Bundle(
         path=path,
         kind=kind,
-        source=js.Source(parsed.entry_source()),
+        source=js.Source.over(modules, parsed.entry_point_id),
         blob=parsed,
         header_size=header_size,
         binary_size=os.path.getsize(path),
@@ -105,17 +114,23 @@ def read(path: str) -> Bundle:
 
 
 def write(
-    bundle: Bundle, source: bytes, out_path: str, *, drop_bytecode: bool = True
+    bundle: Bundle, patched: js.Source, out_path: str, *, drop_bytecode: bool = True
 ) -> None:
-    """Repack ``source`` into a copy of the binary at ``out_path``.
+    """Repack the patched modules into a copy of the binary at ``out_path``.
 
-    The patched image is staged to a temp file and verified -- re-extracted and
-    compared against ``source`` -- *before* it is moved into place. A rebuild
-    bug therefore fails without ever touching the live binary.
+    Only the modules whose bytes actually changed are re-emitted (and, when
+    ``drop_bytecode``, have their now-stale bytecode dropped); every other
+    module keeps its bytes and its fast start. The patched image is staged to a
+    temp file and verified -- re-extracted and compared module for module --
+    *before* it is moved into place, so a rebuild bug fails without ever
+    touching the live binary.
     """
     import shutil
 
-    new_blob = blobmod.rebuild(bundle.blob, source, drop_bytecode=drop_bytecode)
+    contents = patched.contents()
+    changed = blobmod.changed_modules(bundle.blob, contents)
+    dropped = sum(bundle.blob.modules[i].ranges["bytecode"][1] for i in changed)
+    new_blob = blobmod.rebuild(bundle.blob, changed, drop_bytecode=drop_bytecode)
     section = blobmod.wrap_section(new_blob, bundle.header_size)
     tmp = f"{out_path}{TMP_SUFFIX}"
 
@@ -126,21 +141,22 @@ def write(
         else:
             with open(bundle.path, "rb") as handle:
                 raw = handle.read()
-            patched = (
+            patched_bytes = (
                 pe.write_section(raw, section)
                 if bundle.kind == "pe"
                 else elf.write_section(raw, section)
             )
             with open(tmp, "wb") as handle:
-                handle.write(patched)
+                handle.write(patched_bytes)
             os.chmod(tmp, os.stat(bundle.path).st_mode & 0o7777)
 
         # raises before we commit if anything is off, size half included
         verify(
             tmp,
-            source,
+            contents,
+            edited=set(changed),
             original_size=bundle.binary_size,
-            bytecode_size=bundle.bytecode_size,
+            dropped_bytecode=dropped if drop_bytecode else 0,
             kind=bundle.kind,
         )
         replace(tmp, out_path)
@@ -151,38 +167,47 @@ def write(
 
 def verify(
     path: str,
-    expected: bytes,
+    expected: dict[int, bytes],
     *,
+    edited: set[int],
     original_size: int | None = None,
-    bytecode_size: int = 0,
+    dropped_bytecode: int = 0,
     kind: str = "elf",
 ) -> None:
     """Re-extract from a written binary and assert it round-trips exactly.
 
-    ``original_size`` and ``bytecode_size`` describe the *pristine* binary and
-    switch on the size half of the tripwire below; ``kind`` scopes it to the
-    container that reclaims space.
+    ``expected`` is every module's intended bytes by blob index; ``edited`` are
+    the modules whose source changed, which must run source rather than stale
+    bytecode. ``original_size`` and ``dropped_bytecode`` describe the *pristine*
+    binary and switch on the size half of the tripwire below; ``kind`` scopes it
+    to the container that reclaims space.
     """
     try:
         written = read(path)
     except Exception as exc:
         raise ContainerError(f"patched binary could not be re-read: {exc}") from exc
-    if written.source.data != expected:
-        raise ContainerError(
-            "patched binary did not round-trip: extracted source differs from "
-            f"what we wrote ({len(written.source):,} vs {len(expected):,} bytes)"
-        )
-    if written.bytecode_size:
-        # Read back off the written file, not asserted in memory. Bun runs the
-        # bytecode in preference to the source, so any left behind would run the
-        # *unpatched* program while every check above agreed the source was ours
-        # -- every patch a silent no-op. docs/INTERNALS.md calls this the tripwire
-        # for a Bun that makes bytecode authoritative; this is where it trips.
-        raise ContainerError(
-            f"patched binary still carries {written.bytecode_size:,} bytes of "
-            "entrypoint bytecode, which would run instead of our edits"
-        )
-    # The size half of the tripwire: dropping the entrypoint bytecode should
+    got = written.source.contents()
+    for index, want in expected.items():
+        if got.get(index) != want:
+            raise ContainerError(
+                "patched binary did not round-trip: extracted module "
+                f"{index} differs from what we wrote"
+            )
+    # Read back off the written file, not asserted in memory. Bun runs a
+    # module's bytecode in preference to its source, so any left on a module we
+    # edited would run the *unpatched* code while every byte comparison above
+    # agreed the source was ours -- a silent no-op. docs/INTERNALS.md calls this
+    # the tripwire for a Bun that makes bytecode authoritative; this is where it
+    # trips, now per edited module rather than for the one old entrypoint.
+    by_index = {m.index: m for m in written.blob.modules}
+    for index in edited:
+        left = by_index[index].ranges["bytecode"][1] if index in by_index else 0
+        if left:
+            raise ContainerError(
+                f"patched binary still carries {left:,} bytes of bytecode on "
+                f"edited module {index}, which would run instead of our edits"
+            )
+    # The size half of the tripwire: dropping the edited modules' bytecode should
     # leave the file smaller by about that much. The ELF path rewrites in place
     # and reclaims it (measured: reclaimed == bytecode to within the manifest's
     # own bytes), so a write that reclaimed little or nothing bloated the binary
@@ -193,12 +218,12 @@ def verify(
     # shrinks one, so the file keeps its size (a working binary that is not
     # smaller, docs/INTERNALS.md) -- a limitation to fix with a Mac in hand, not
     # a corruption to refuse a working Mac user over.
-    if kind == "elf" and original_size is not None and bytecode_size:
+    if kind == "elf" and original_size is not None and dropped_bytecode:
         reclaimed = original_size - written.binary_size
-        if reclaimed < bytecode_size // 2:
+        if reclaimed < dropped_bytecode // 2:
             raise ContainerError(
                 f"patched binary reclaimed only {reclaimed:,} of "
-                f"{bytecode_size:,} dropped bytecode bytes; the in-place ELF "
+                f"{dropped_bytecode:,} dropped bytecode bytes; the in-place ELF "
                 "write bloated rather than trimmed it"
             )
 

@@ -24,6 +24,11 @@ from .errors import BunError
 TRAILER = b"\n---- Bun! ----\n"
 OFFSETS_SIZE = 32
 
+#: Index of the ``loader`` byte in a module record's four trailing flags
+#: (``encoding, loader, module_format, side``). It is how Bun decides whether a
+#: module is JavaScript it compiles or an asset it hands over as bytes.
+LOADER = 1
+
 #: Module record field order. Old Bun (<1.3.7) stops after ``bytecode``.
 FIELDS_NEW = (
     "name",
@@ -86,18 +91,40 @@ class Blob:
         """
         return self.modules[self.entry_point_id]
 
-    def entry_source(self) -> bytes:
-        return self.payload(self.entry_module().ranges["contents"])
+    def js_modules(self) -> list[Module]:
+        """Every module Bun loads the way it loads the entrypoint: the JS the
+        app is made of.
+
+        Since 2.1.242 the entrypoint is a ~20 KB argv shim that lazily imports
+        the app across ~1,300 ``chunk-*.js`` modules; before it, the entrypoint
+        *was* the whole app. Both are one question -- which modules carry the
+        JavaScript we patch -- and the loader byte answers it: a module's
+        ``loader`` (the second trailing flag) says how Bun reads it, and the
+        entry is by definition the JS Bun runs, so its loader *is* the JS loader.
+        Read off the artifact, exactly as :meth:`entry_module` reads the
+        entrypoint -- never hardcoded to a value, and never by name -- so a build
+        that renumbers the loader still answers correctly. The assets (native
+        addons, the bundled ``mermaid``/``hljs`` minified files, the HTML
+        template) carry other loaders and are excluded: they are opaque bytes to
+        Bun and would not parse as our JavaScript.
+
+        Pre-split, this is the one-element list ``[entry_module()]`` -- the
+        monolith -- so the single-module world is exactly the many-module world
+        with one module, and every layer above flows through the same code.
+        """
+        loader = self.entry_module().trailing[LOADER]
+        return [m for m in self.modules if m.trailing[LOADER] == loader]
 
     def bytecode_size(self) -> int:
-        """Bytes of precompiled bytecode on the entrypoint, for either layout.
+        """Total precompiled Bun bytecode across every module, for either layout.
 
         ``bytecode`` is the fourth pair, so *both* record formats carry it --
-        ``FIELDS_OLD`` is the first four of ``FIELDS_NEW``. Reporting zero for the
-        36-byte layout said "already stripped" about a module that had 154 MB of
-        it, which is the one thing ``status`` reads this for.
+        ``FIELDS_OLD`` is the first four of ``FIELDS_NEW``. Before 2.1.242 only
+        the entrypoint carried any; the code-split builds carry it on every
+        chunk, so the figure ``status`` reports and the write reclaims is the sum,
+        not one module's.
         """
-        return self.entry_module().ranges["bytecode"][1]
+        return sum(m.ranges["bytecode"][1] for m in self.modules)
 
 
 def _detect_struct_size(modules_len: int) -> int:
@@ -192,20 +219,29 @@ def parse(data: bytes) -> Blob:
     )
 
 
-def rebuild(blob: Blob, source: bytes, *, drop_bytecode: bool = True) -> bytes:
-    """Return a new blob with the entrypoint's source replaced.
+def rebuild(
+    blob: Blob, sources: dict[int, bytes], *, drop_bytecode: bool = True
+) -> bytes:
+    """Return a new blob with the given modules' source replaced.
 
-    Payloads are re-emitted in their original file order so the result stays as
-    close to the input layout as possible.
+    ``sources`` maps a module index to its new ``contents``; every other
+    module's bytes are re-emitted unchanged. Payloads keep their original file
+    order so the result stays as close to the input layout as possible. One
+    edited module or a thousand is the same code -- the pre-split monolith is
+    just ``{entry_index: new_bytes}``.
 
-    ``drop_bytecode`` removes the entrypoint's precompiled Bun bytecode. Editing
-    the source invalidates that bytecode anyway -- Bun recompiles from source --
-    so keeping it costs more than half the binary for no benefit. What that is in
-    megabytes is a fact about the build, and :meth:`Blob.bytecode_size` reads it;
-    docs/INTERNALS.md has the measurements.
+    ``drop_bytecode`` removes the precompiled Bun bytecode of exactly the
+    modules whose source changed. Editing a module's source invalidates its
+    bytecode -- Bun recompiles that module from source -- so keeping it would
+    run the recompile cost *and* the megabytes; dropping it reclaims the space
+    and, more importantly, guarantees our edits are what runs
+    (docs/INTERNALS.md). A module we did not touch keeps its bytecode and its
+    fast start. The set actually changed is returned by :func:`changed_modules`;
+    here we drop for every module handed new bytes, since a caller only passes
+    bytes it means to replace.
     """
-    entry = blob.entry_module()
     fields = blob.fields
+    changed = set(sources)
 
     # Every payload, in the order it appears in the source arena.
     placed: list[
@@ -222,15 +258,15 @@ def rebuild(blob: Blob, source: bytes, *, drop_bytecode: bool = True) -> bytes:
     new_ranges: dict[tuple[int, str], tuple[int, int]] = {}
     prev_end = 0
     for off, length, mod_index, field in placed:
-        is_entry = mod_index == entry.index
-        if is_entry and field == "bytecode" and drop_bytecode:
+        edited = mod_index in changed
+        if edited and field == "bytecode" and drop_bytecode:
             new_ranges[(mod_index, field)] = (0, 0)
             prev_end = off + length
             continue
 
         payload = (
-            source
-            if (is_entry and field == "contents")
+            sources[mod_index]
+            if (edited and field == "contents")
             else blob.data[off : off + length]
         )
         # Preserve the 1-byte separators Bun emits between payloads.
@@ -268,14 +304,31 @@ def rebuild(blob: Blob, source: bytes, *, drop_bytecode: bool = True) -> bytes:
     struct.pack_into("<I", out, offsets_at + 28, blob.flags)
 
     if drop_bytecode:
-        # The entry now carries no bytecode -- whether we dropped a real payload
-        # or it had none to begin with. Reading the outcome with a ``(0, 0)``
-        # default is what lets the had-none case flow through the same check
-        # instead of raising ``KeyError`` past both CLI handlers: a field the
-        # ``placed`` loop never saw a length for is absent from ``new_ranges``,
-        # and absent *is* stripped.
-        assert new_ranges.get((entry.index, "bytecode"), (0, 0)) == (0, 0)
+        # Each edited module now carries no bytecode -- whether we dropped a real
+        # payload or it had none to begin with. Reading the outcome with a
+        # ``(0, 0)`` default is what lets the had-none case flow through the same
+        # check instead of raising ``KeyError``: a field the ``placed`` loop never
+        # saw a length for is absent from ``new_ranges``, and absent *is*
+        # stripped.
+        for index in changed:
+            assert new_ranges.get((index, "bytecode"), (0, 0)) == (0, 0)
     return bytes(out)
+
+
+def changed_modules(blob: Blob, sources: dict[int, bytes]) -> dict[int, bytes]:
+    """The subset of ``sources`` whose bytes actually differ from the blob.
+
+    A module the patches parsed but left byte-identical must not have its
+    bytecode dropped: that would trade a working fast-start module for a slow
+    recompile of code that never changed. So the write reclaims bytecode for the
+    modules that moved and no others, and the size tripwire measures against that
+    same set.
+    """
+    return {
+        index: data
+        for index, data in sources.items()
+        if data != blob.payload(blob.modules[index].ranges["contents"])
+    }
 
 
 def unwrap_section(section: bytes) -> tuple[bytes, int]:

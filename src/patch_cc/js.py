@@ -79,43 +79,56 @@ def _parser():
 
 @dataclass(frozen=True, slots=True)
 class Edit:
-    """One replacement of a half-open byte range.
+    """One replacement of a half-open byte range in one module.
 
     Always built from a node, so a rewrite cannot land between grammar nodes.
     Insertions are the empty range at a node's edge -- the same operation, not a
     second kind of one, which is what lets :meth:`Source.apply` order a mixed
     batch by offset alone.
+
+    The bundle is many modules now, each its own parse, and ``start``/``end`` are
+    offsets *within one of them*. ``anchor`` is a node from the module the edit
+    belongs to, so :meth:`Source.apply` can route the edit to that module and
+    nowhere else -- the node carries its module the way an offset cannot. Every
+    edit has one: it is either the node being rewritten, or (for the two bare
+    offsets below) a node standing in the same module as the point.
     """
 
     start: int
     end: int
     text: bytes
+    anchor: Node
 
     @classmethod
     def replace(cls, node: Node, text: bytes | str) -> Edit:
-        return cls(node.start_byte, node.end_byte, _bytes(text))
+        return cls(node.start_byte, node.end_byte, _bytes(text), node)
 
     @classmethod
     def before(cls, node: Node, text: bytes | str) -> Edit:
-        return cls(node.start_byte, node.start_byte, _bytes(text))
+        return cls(node.start_byte, node.start_byte, _bytes(text), node)
 
     @classmethod
     def after(cls, node: Node, text: bytes | str) -> Edit:
-        return cls(node.end_byte, node.end_byte, _bytes(text))
+        return cls(node.end_byte, node.end_byte, _bytes(text), node)
 
     @classmethod
-    def at(cls, offset: int, text: bytes | str) -> Edit:
+    def at(cls, offset: int, text: bytes | str, *, within: Node) -> Edit:
         """An insertion at a bare offset, for a point no node's edge names.
 
         There are two, and they are the whole licence for this constructor: a
         `switch` arm's dispatch point when the label chain carries no body of
-        its own (:func:`dispatch` computes it), and the end of the bundle (the
+        its own (:func:`dispatch` computes it), and the end of a module (the
         manifest append). Anything else has a node, and a node is what an edit
         should be built from -- including "the start of this function's body",
         which is the *first statement*, not one byte past a brace, and "just
         after this literal", which is its fragment's own edge (:meth:`after`).
+
+        ``within`` is a node in the module the offset addresses -- the ``case``
+        whose dispatch point this is, or the module the manifest lands in -- so
+        the edit still routes to its module without being built from the node at
+        the point itself.
         """
-        return cls(offset, offset, _bytes(text))
+        return cls(offset, offset, _bytes(text), within)
 
 
 def _bytes(text: bytes | str) -> bytes:
@@ -154,33 +167,71 @@ class Defect:
         return f"{what} at byte {self.offset:,}\n    ...{self.context}..."
 
 
-class Source:
-    """The bundle's bytes and its parse, kept together and kept in step.
+#: The module-linkage *clauses* the syntax gate reads *past*. tree-sitter's
+#: JavaScript grammar does not model a reserved word as an import/export alias
+#: (``export{x as if}``, ``import{if as a}`` -- legal ES2015, which the
+#: code-split minifier emits when its two-letter alias generator lands on ``if``,
+#: ``in`` or ``do``), so it plants a localized ERROR inside the specifier list.
+#: patch-cc never locates in or edits module linkage -- every anchor is
+#: executable code (a property, a `case` label, a call, a string *in code*) -- so
+#: an error confined to a specifier list cannot touch a matcher or a splice.
+#:
+#: Only the *clause* nodes are here, never ``import_statement``/
+#: ``export_statement``: those enclose executable code too -- ``export default
+#: <expr>``, ``export const x = <code>`` -- and a splice that broke *that* must
+#: still be caught. A specifier list holds nothing but names, so an error under
+#: one of these is always the grammar's alias gap and never our damage; on every
+#: build in the corpus the real errors sit directly under ``export_clause`` or
+#: ``named_imports`` (docs/PLAYBOOK.md).
+_LINKAGE = (
+    "import_clause",
+    "export_clause",
+    "named_imports",
+    "import_specifier",
+    "export_specifier",
+)
 
-    Immutable, and enforced rather than assumed: :meth:`apply` returns a new
-    `Source` and never touches this one's bytes or its tree, so a patch that
-    raises half-way through discards its own partial rewrites simply by not
-    returning -- the same property the old string-threading pipeline had, for
-    the same reason. The fixpoint leans on it hardest, running every pass from
-    the same pristine `Source`.
 
-    Bytes, not text. tree-sitter indexes bytes, the container layer already
-    hands over bytes (``blob.entry_source``) and takes bytes back
-    (``blob.rebuild``), so decoding in the middle only bought a second unit of
+class _Module:
+    """One module's bytes and its parse, kept together and kept in step.
+
+    A build ships one such module before 2.1.242 (the whole app) and ~1,300
+    after it (the app dealt across ``chunk-*.js`` files); :class:`Source` spans
+    them, and this is one. Immutable, and enforced rather than assumed:
+    :meth:`apply` returns a new `_Module` and never touches this one's bytes or
+    its tree, so a patch that raises half-way discards its own partial rewrites
+    simply by not returning. The fixpoint leans on it, running every pass from
+    the same pristine modules.
+
+    Bytes, not text. tree-sitter indexes bytes, the container hands bytes over
+    and takes bytes back, so decoding in the middle only bought a second unit of
     offset for a splice to be wrong in.
 
-    The parse is lazy, and that is what keeps it from being a tax. Finding a
-    name, counting an anchor and reading the manifest are byte scans; `status`,
-    `list` and the menu's first screen ask only those and never pay the ~3 s.
-    Grammar is bought by the surfaces that edit.
+    The parse is lazy, and that is what keeps it from being a tax: a name is
+    found, an anchor counted and the manifest read by byte scan, and a module a
+    scan never hits is never parsed. `status`, `list` and the menu's first
+    screen ask only scans and never pay for grammar; an edit buys it, for the
+    handful of modules an anchor actually lands in.
     """
 
-    __slots__ = ("_lines", "_tree", "data")
+    __slots__ = ("_lines", "_tree", "data", "dirty", "index")
 
-    def __init__(self, data: bytes, tree: Tree | None = None) -> None:
+    def __init__(
+        self, data: bytes, index: int, tree: Tree | None = None, *, dirty: bool = False
+    ) -> None:
         self.data = data
+        #: The blob module-table index this came from, so the container can
+        #: splice the edited bytes back into the right record.
+        self.index = index
+        #: Whether these bytes differ from the pristine module -- what the final
+        #: from-scratch gate and the bytecode drop key off.
+        self.dirty = dirty
         self._tree = tree
         self._lines: tuple[int, ...] | None = None
+
+    @property
+    def parsed(self) -> bool:
+        return self._tree is not None
 
     @property
     def tree(self) -> Tree:
@@ -192,80 +243,34 @@ class Source:
     def root(self) -> Node:
         return self.tree.root_node
 
-    def __len__(self) -> int:
-        return len(self.data)
-
-    # ------------------------------------------------------------ locating
-
-    def find(self, name: bytes | str) -> Iterator[Node]:
-        """Every node that *is* this authored name.
-
-        The name is the anchor -- a property name, a `case` label, an API
-        string, a setting -- and the node it spells is what the edit is
-        expressed against. Callers filter by ``node.type`` to say which *kind*
-        of occurrence they meant: a `property_identifier` is a real property, an
-        `identifier` a use of the same name.
-
-        The name has to be the *whole* node, because bytes that merely occur
-        inside a longer name are a different name and no later check sees the
-        difference: `agentType` is not `subagentType`, and rewriting
-        ``ya().spinnerTipsEnabledAt>0`` as a read of `spinnerTipsEnabled` gave
-        ``!1>0`` -- a rewrite that counted, verified and parsed. `node.type` is
-        no guard there either: the longer name is a `property_identifier` too.
-        On 2.1.232 the substring rule handed out 27 nodes named `subagentType`
-        for `agentType` and 30 named something else for `contentBlock`.
-
-        Prose that merely *contains* a name is :meth:`literals`' question.
-        """
-        needle = _bytes(name)
-        # A node that contains the name and is no longer than it *is* the name.
+    def find(self, needle: bytes) -> Iterator[Node]:
+        # Byte-scan first: a module the name is not in is never parsed.
+        if needle not in self.data:
+            return
         yield from (
             node
             for node in self._spanning(needle)
             if node.end_byte - node.start_byte == len(needle)
         )
 
-    def literals(self, text: bytes | str) -> Iterator[Node]:
-        """Every string or template literal carrying this text.
-
-        The other half of :meth:`find`: a name is a whole node, but prose *has*
-        no node of its own -- the product name inside a sentence, the opening
-        words of a describe-string. Each literal is yielded once however often
-        it says it.
-        """
+    def literals(self, needle: bytes) -> Iterator[Node]:
+        if needle not in self.data:
+            return
         seen: set[int] = set()
-        for node in self._spanning(_bytes(text)):
+        for node in self._spanning(needle):
             literal = up(node, "string", "template_string")
             if literal is not None and literal.start_byte not in seen:
                 seen.add(literal.start_byte)
                 yield literal
 
     def _spanning(self, needle: bytes) -> Iterator[Node]:
-        """The smallest node containing each occurrence of these bytes.
-
-        Never absent: the needle was found in these bytes, so the range it
-        occupies lies inside the tree that parsed them, and every range inside a
-        tree has a smallest node containing it.
-        """
         root, at = self.root, self.data.find(needle)
         while at != -1:
             yield cast("Node", root.descendant_for_byte_range(at, at + len(needle)))
             at = self.data.find(needle, at + 1)
 
-    def count(self, name: bytes | str) -> int:
-        """Raw occurrences of a literal -- what a patch counts candidates off.
-
-        Deliberately the *text* count, not a node count: a patch that reports
-        `candidates` off its own matcher cannot distinguish "the shape moved"
-        from "upstream retired the mechanism", and that distinction is the
-        difference between a matcher to repair and a patch to delete.
-        """
-        return self.data.count(_bytes(name))
-
-    # ------------------------------------------------------------- editing
-
-    def apply(self, edits: Iterable[Edit]) -> Source:
-        """Splice a batch and reparse, or raise if this rewrite broke the parse.
+    def apply(self, edits: list[Edit]) -> _Module:
+        """Splice a batch into this module and reparse, or raise on rubble.
 
         Applied high offset first so earlier edits keep the offsets every node
         in the batch was found at -- which is why a patch collects its edits and
@@ -279,8 +284,8 @@ class Source:
         cannot see, because it parses. A batch is a patch's own doing, so the
         overlap is a defect here rather than a shape upstream can ship: nothing
         in the corpus emits one, and a matcher that starts to (an `if` and the
-        `if` nested inside it, both read as the same guard) is now told so
-        instead of writing the difference into a binary.
+        `if` nested inside it, both read as the same guard) is told so instead of
+        writing the difference into a binary.
 
         The gate is here rather than at the end of the run because here it can
         say *which* rewrite produced rubble. `Patch.run` turns that into one
@@ -289,17 +294,14 @@ class Source:
 
         The tree is copied before it is edited, which is what makes the
         immutability above true rather than merely intended. ``Tree.edit``
-        mutates in place, so editing our own would leave the input `Source`
-        holding a tree that no longer describes its bytes -- and `apply`'s whole
-        point is that the input survives a rewrite that fails. It read as
-        someone else's failure: the fixpoint re-runs every patch from the same
-        `Source`, so one drifted matcher poisoned the second pass and twelve
-        healthy patches reported *their* anchors missing. `doctor` could not see
-        it, being the one shape that never reuses an input.
+        mutates in place, so editing our own would leave the input holding a tree
+        that no longer describes its bytes -- and the point is that the input
+        survives a rewrite that fails. It read as someone else's failure once:
+        the fixpoint re-runs every patch from the same source, so one drifted
+        matcher poisoned the second pass and twelve healthy patches reported
+        *their* anchors missing.
         """
         batch = sorted(edits, key=lambda e: (e.start, e.end), reverse=True)
-        if not batch:
-            return self
         data, tree = self.data, self.tree.copy()
         untouched = len(data)
         for edit in batch:
@@ -318,16 +320,14 @@ class Source:
                 old_end_point=self._point(edit.end),
                 new_end_point=_advance(self._point(edit.start), edit.text),
             )
-        result = Source(data, _parser().parse(data, tree))
+        result = _Module(data, self.index, _parser().parse(data, tree), dirty=True)
         found = result.defect()
         # Only a defect this rewrite *introduced* is this rewrite's to answer
-        # for. A bundle that already does not parse fails every splice made to
-        # it, so a build the grammar cannot read would report thirteen healthy
-        # matchers as having produced rubble -- "broken" wearing the clothes of
-        # "absent", which is the one collapse the whole report exists to
-        # prevent. That condition is a fact about the build, so it is asked once
-        # of the pristine source (:meth:`verify`) before any patch runs, and
-        # never inferred here from a splice that merely inherited it.
+        # for. A module that already does not parse (in code, not the tolerated
+        # linkage) fails every splice made to it, so blaming the splice would
+        # dress "this build is unreadable" as "this patch is broken" -- the one
+        # collapse the report exists to prevent. That is a fact about the build,
+        # asked of the pristine module here and reported as itself.
         if found is not None and self.defect() is None:
             raise SyntaxGateError(f"this rewrite left the bundle unparseable: {found}")
         return result
@@ -335,7 +335,7 @@ class Source:
     def _point(self, offset: int) -> tuple[int, int]:
         """Byte offset as (row, column), which ``Tree.edit`` shifts positions by.
 
-        Read against *this* source's bytes, which stays correct as a batch is
+        Read against *this* module's bytes, which stays correct as a batch is
         spliced because the batch runs high offset first: every offset still to
         be edited sits in the part no earlier edit has touched.
         """
@@ -346,28 +346,19 @@ class Source:
         row = bisect_right(self._lines, offset) - 1
         return (row, offset - self._lines[row])
 
-    # ---------------------------------------------------------------- gate
-
     def defect(self) -> Defect | None:
-        """The first place the bundle stops parsing, or ``None`` if it is clean.
+        """The first place this module's *code* stops parsing, or ``None``.
 
-        The last guarantee in front of CONDUCT's first rule, and the only check
-        that reads the bundle as a *language*. Counting rewrites cannot tell a
-        splice that landed from one that landed a prop-name to the left, and the
-        write verifier re-extracts what we wrote and compares it to what we
-        meant to write -- so it agrees, byte for byte, with a bundle that cannot
-        start.
-
-        What it is not is a compiler: tree-sitter recovers from errors and does
-        not implement every ECMAScript early-error rule, so a clean tree means
-        the token stream still assembles, not that the program is legal in every
-        respect. That is the right scope -- structural damage is what splicing
-        causes.
+        Reads past module linkage (`_LINKAGE`): the first ERROR or MISSING node
+        not confined to an import/export clause. The gate reads executable code
+        as a language, and linkage is neither located in nor edited, so a grammar
+        gap there is out of its scope -- while a splice that broke real code
+        lands outside linkage and is still returned.
         """
         if not self.root.has_error:
             return None
-        node = _innermost_error(self.root)
-        if node is None:  # pragma: no cover - has_error with nothing under it
+        node = _first_real_error(self.root)
+        if node is None:  # every error was tolerated linkage
             return None
         at = node.start_byte
         window = self.data[max(0, at - _CONTEXT) : at + _CONTEXT]
@@ -378,14 +369,262 @@ class Source:
             context=window.decode("utf8", "replace"),
         )
 
+
+def _root_of(node: Node) -> Node:
+    """The program node a node belongs to -- how an edit finds its module.
+
+    A node's ``id`` is the address of its C node and is distinct across trees,
+    so the root's id names the module the node came from, and an edit built from
+    it routes to that module and no other.
+    """
+    while node.parent is not None:
+        node = node.parent
+    return node
+
+
+class Source:
+    """The bundle as a language: every JavaScript module, spanned as one.
+
+    Since 2.1.242 the app is dealt across ~1,300 modules; before it, one. This
+    is that surface whichever it is -- ``find`` sweeps every module, ``count``
+    sums across them, ``apply`` routes each edit to the module its node came
+    from. A patch says ``source.find(name)`` and ``source.apply(edits)`` exactly
+    as it did against a single module, because the one-module world *is* the
+    many-module world with one module: nothing here is a case a patch has to
+    know about.
+
+    Immutable, like the modules it holds: ``apply`` returns a new `Source`
+    sharing every module an edit did not touch and replacing only those it did,
+    so the fixpoint runs each pass from the same pristine surface.
+    """
+
+    __slots__ = ("_entry", "_mods")
+
+    def __init__(self, data: bytes, tree: Tree | None = None) -> None:
+        # The single-module surface: a whole bundle handed over as one buffer
+        # (a test, the pre-split monolith, a from-scratch reparse). It is the
+        # many-module surface with one module, and every method below treats it
+        # as exactly that.
+        self._mods: tuple[_Module, ...] = (_Module(data, 0, tree),)
+        self._entry = 0
+
+    @classmethod
+    def over(cls, modules: list[tuple[int, bytes]], entry_index: int) -> Source:
+        """Span the given ``(blob index, bytes)`` modules, naming the entry.
+
+        The entry module is where the manifest lives and what ``status`` reads,
+        so its position is kept; every module is one the container declared to
+        be JavaScript (:meth:`patch_cc.bun.blob.Blob.js_modules`).
+        """
+        self = cls.__new__(cls)
+        self._mods = tuple(_Module(data, index) for index, data in modules)
+        self._entry = next(
+            pos for pos, (index, _) in enumerate(modules) if index == entry_index
+        )
+        return self
+
+    @property
+    def data(self) -> bytes:
+        """The entry module's bytes -- what carries the manifest.
+
+        The manifest is appended to the entry module and read back from it
+        (``read_manifest``/``is_patched``), a byte scan that never parses. For a
+        pre-split build the entry *is* the whole app, so this is exactly the
+        bytes the single-module `Source` used to be.
+        """
+        return self._mods[self._entry].data
+
+    def contents(self) -> dict[int, bytes]:
+        """Every module's current bytes, keyed by blob index -- for the write."""
+        return {m.index: m.data for m in self._mods}
+
+    # ------------------------------------------------------------ locating
+
+    def find(self, name: bytes | str) -> Iterator[Node]:
+        """Every node across every module that *is* this authored name.
+
+        The name is the anchor -- a property name, a `case` label, an API
+        string, a setting -- and the node it spells is what the edit is
+        expressed against. Callers filter by ``node.type`` to say which *kind*
+        of occurrence they meant: a `property_identifier` is a real property, an
+        `identifier` a use of the same name.
+
+        The name has to be the *whole* node, because bytes that merely occur
+        inside a longer name are a different name and no later check sees the
+        difference: `agentType` is not `subagentType`, and rewriting
+        ``ya().spinnerTipsEnabledAt>0`` as a read of `spinnerTipsEnabled` gave
+        ``!1>0`` -- a rewrite that counted, verified and parsed. `node.type` is
+        no guard there either: the longer name is a `property_identifier` too.
+
+        Prose that merely *contains* a name is :meth:`literals`' question.
+        """
+        needle = _bytes(name)
+        for module in self._mods:
+            yield from module.find(needle)
+
+    def literals(self, text: bytes | str) -> Iterator[Node]:
+        """Every string or template literal, across every module, carrying this text.
+
+        The other half of :meth:`find`: a name is a whole node, but prose *has*
+        no node of its own -- the product name inside a sentence, the opening
+        words of a describe-string. Each literal is yielded once however often
+        it says it.
+        """
+        needle = _bytes(text)
+        for module in self._mods:
+            yield from module.literals(needle)
+
+    def module_index(self, node: Node) -> int | None:
+        """The blob index of the module a node belongs to, or ``None``.
+
+        Stable across the reparses `apply` does -- a module keeps its index
+        through every edit -- so it is the key to ask "are these two nodes in the
+        same module?" when the answer has to survive a step editing one of them
+        (a program root's id does not: an edited module is a fresh parse). Only
+        parsed modules are considered, and a node always comes from one.
+        """
+        target = _root_of(node).id
+        for module in self._mods:
+            if module.parsed and module.root.id == target:
+                return module.index
+        return None
+
+    def find_local(self, anchor: Node, name: bytes | str) -> Iterator[Node]:
+        """Every node that *is* this authored name, in ``anchor``'s module alone.
+
+        A minified local is unique only within its module: the same two letters
+        are a different variable in a thousand other chunks. So resolving one --
+        a hoisted `agentType` constant read *through its value* to the declarator
+        that binds it -- searches the module the read lives in, never the whole
+        bundle, where :func:`only` would see a dozen unrelated declarations of
+        the same spelling and rightly refuse to choose. Pre-split, the one module
+        is the whole bundle, so this is exactly :meth:`find`; that the two were
+        the same thing is what let the old bundle-wide resolve pass until the app
+        was dealt across modules.
+        """
+        needle = _bytes(name)
+        target = _root_of(anchor).id
+        for module in self._mods:
+            if module.parsed and module.root.id == target:
+                yield from module.find(needle)
+                return
+
+    def count(self, name: bytes | str) -> int:
+        """Raw occurrences of a literal across the whole bundle.
+
+        Deliberately the *text* count, not a node count: a patch that reports
+        `candidates` off its own matcher cannot distinguish "the shape moved"
+        from "upstream retired the mechanism", and that distinction is the
+        difference between a matcher to repair and a patch to delete. Summed
+        over modules, so a marker a rewrite spliced into one module is found
+        wherever it landed (`live-thinking` credits its core updates this way).
+        """
+        needle = _bytes(name)
+        return sum(module.data.count(needle) for module in self._mods)
+
+    # ------------------------------------------------------------- editing
+
+    def apply(self, edits: Iterable[Edit]) -> Source:
+        """Route each edit to its module, splice, and reparse -- or raise on rubble.
+
+        A patch's batch may span modules (`codex-models` alone touches the enum,
+        the validator, the resolvers, the redirect and the registry, in as many
+        different chunks), and each edit knows its module through the node it was
+        built from: the node's program root names the module, and every edit in
+        that module is applied as one batch through :meth:`_Module.apply` -- the
+        same disjointness check, high-offset-first ordering, incremental reparse
+        and syntax gate a single module always had. One module or a thousand is
+        the same code.
+        """
+        batch = list(edits)
+        if not batch:
+            return self
+        roots = {m.root.id: pos for pos, m in enumerate(self._mods) if m.parsed}
+        grouped: dict[int, list[Edit]] = {}
+        for edit in batch:
+            pos = roots.get(_root_of(edit.anchor).id)
+            if pos is None:
+                # The anchor belongs to no module of *this* Source: a node held
+                # across the apply that already replaced its module, or from
+                # another parse entirely. A patch builds its batch from the source
+                # it is editing and commits it once, so this does not arise in a
+                # run -- but routing a splice by a stale node is the one mistake
+                # that would land it in the wrong module, so it is refused rather
+                # than guessed.
+                raise SyntaxGateError(
+                    "an edit was built from a node that is not in this bundle"
+                )
+            grouped.setdefault(pos, []).append(edit)
+        mods = list(self._mods)
+        for pos, module_edits in grouped.items():
+            mods[pos] = mods[pos].apply(module_edits)
+        return self._with(mods)
+
+    def append_manifest(self, text: bytes | str) -> Source:
+        """Append the manifest comment to the entry module, through the gate.
+
+        The same gated edit as any rewrite, so the bytes that get written are
+        ones no splice -- the manifest's own included -- left unparseable, and
+        the manifest travels with the module ``status`` reads.
+        """
+        entry = self._mods[self._entry]
+        return self.apply([Edit.at(len(entry.data), _bytes(text), within=entry.root)])
+
+    def _with(self, mods: list[_Module]) -> Source:
+        clone = Source.__new__(Source)
+        clone._mods = tuple(mods)
+        clone._entry = self._entry
+        return clone
+
+    # ---------------------------------------------------------------- gate
+
+    def defect(self) -> Defect | None:
+        """The first module whose *code* does not parse, or ``None`` if all do.
+
+        The last guarantee in front of CONDUCT's first rule, and the only check
+        that reads the bundle as a *language*. Counting rewrites cannot tell a
+        splice that landed from one that landed a prop-name to the left, and the
+        write verifier re-extracts what we wrote and compares it to what we meant
+        to write -- so it agrees, byte for byte, with a bundle that cannot start.
+
+        Every module is parsed here, which is what warms the whole surface for
+        the patch run that follows: the trees this builds are the trees `find`
+        reuses. Linkage errors are read past (:meth:`_Module.defect`).
+        """
+        for module in self._mods:
+            found = module.defect()
+            if found is not None:
+                return found
+        return None
+
+    def fresh_defect(self) -> Defect | None:
+        """Re-parse every edited module from scratch and return the first defect.
+
+        The one place a parse from nothing runs, on the exact bytes about to be
+        written and from a tree that shares nothing with the incremental one each
+        edit was checked against. `_Module.apply` keeps that incremental tree in
+        step and reparses at each batch -- fast, and correct on every build in
+        the corpus -- but it is one lineage, trusted end to end; a parse from
+        scratch is the only thing that would catch an incremental-reparse bug
+        before it reaches the user's binary. Only the modules an edit touched are
+        reparsed, so the cost is the edits' own, not the whole surface's.
+        """
+        for module in self._mods:
+            if module.dirty:
+                found = _Module(module.data, module.index).defect()
+                if found is not None:
+                    return found
+        return None
+
     def verify(self) -> None:
-        """Raise unless this bundle parses. Asked of the pristine source.
+        """Raise unless every module parses. Asked of the pristine source.
 
         The first gate rather than the last: :meth:`apply` holds every rewrite
         to introducing no defect, which leaves exactly one way a defective
         bundle could reach a write -- arriving that way. A build using syntax
-        this grammar has never seen is not a patch to repair, so it is named as
-        what it is, once, before the run it would otherwise indict.
+        this grammar has never seen (beyond the module linkage read past on
+        purpose) is not a patch to repair, so it is named as what it is, once,
+        before the run it would otherwise indict.
         """
         found = self.defect()
         if found is not None:
@@ -396,22 +635,36 @@ class Source:
             )
 
 
-def _innermost_error(node: Node) -> Node | None:
-    """The node that carries the defect, found without a full walk.
+def _first_real_error(root: Node) -> Node | None:
+    """The outermost error node that is not confined to module linkage.
 
-    ``has_error`` is set on every ancestor of a defect, so descending through
-    the children that carry it reaches the defect in tree *depth* steps rather
-    than touching the millions of nodes a 25 MB bundle parses into.
+    ``has_error`` is set on every ancestor of a defect, so this descends only
+    through children that carry one -- reaching each error in tree *depth* steps
+    rather than touching the millions of nodes a large module parses into. An
+    error inside an import/export clause (`_LINKAGE`) is read past: the grammar's
+    one gap is module aliasing, which is never code we edit.
     """
-    while True:
+    stack = [root]
+    while stack:
+        node = stack.pop()
         if node.type == "ERROR" or node.is_missing:
-            return node
-        for child in node.children:
-            if child.has_error or child.is_missing:
-                node = child
-                break
-        else:
-            return node if node.has_error else None
+            if not _in_linkage(node):
+                return node
+            continue
+        stack.extend(
+            child for child in node.children if child.has_error or child.is_missing
+        )
+    return None
+
+
+def _in_linkage(node: Node) -> bool:
+    """Is this error confined to an import/export statement's clause?"""
+    current: Node | None = node
+    while current is not None:
+        if current.type in _LINKAGE:
+            return True
+        current = current.parent
+    return False
 
 
 # ----------------------------------------------------------------- walking

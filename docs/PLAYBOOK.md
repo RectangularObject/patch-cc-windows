@@ -152,6 +152,56 @@ gone green, and every one buys a branch against a single build. The counting
 below is the net for drift; the rule above is the only thing standing between a
 repair and the next repair.
 
+## The many-module surface
+
+Through 2.1.241 the bundle was one module — the entrypoint carried the whole app
+— and every matcher searched that one buffer. 2.1.242 code-split it: the
+entrypoint became a ~20 KB argv shim that lazily imports the app across ~1,300
+`chunk-*.js` modules ([INTERNALS](INTERNALS.md#the-21242-split-and-the-patchable-surface)).
+The anchors did not move — they scattered. So `js.Source` **spans every
+JavaScript module the container declares** (`Blob.js_modules`, discovered off the
+entrypoint's own loader), and the one-module world is exactly the many-module
+world with one module: `find`/`literals`/`count` sweep every module, `apply`
+routes each edit to the module its node came from, and a patch says
+`source.find(name)` / `source.apply(edits)` unchanged. This is representation
+change of the crudest kind — the same code in more files — so it *moved* no
+invariant and abolished none; the surface widened, the rules held. Three things
+the move made explicit, each a rule the single-module world could leave unsaid
+because the module was the bundle:
+
+- **A node carries its module; an offset does not.** An `Edit` is built from a
+  node, and the node's program root (`node.id`, distinct across parses) names the
+  module the edit belongs to, so a batch spanning a dozen chunks routes each
+  splice home and reparses only the modules it touched. It is why dedup keys are
+  the node's `id`, never its `start_byte`: a minified offset repeats in a
+  thousand modules, and two different sites at the same local offset are two
+  sites, not one to skip.
+
+- **A minified local is scoped to its module.** Resolving one — a hoisted
+  `agentType:uu` constant read through its value — searches *its own* module
+  (`Source.find_local`), never the bundle, where `uu` binds a string in a dozen
+  unrelated chunks and `js.only` would rightly refuse to choose. Before the split
+  the module *was* the bundle, so a bundle-wide `find` was a module-wide one; the
+  two only came apart when the app was dealt across files. The same lesson the
+  playbook already states for identifiers within a build — "a name is a spelling
+  until its scope is said" — now reaches the module boundary too. A scope search
+  that climbs outward (`live-thinking`'s state and memo resolution) reads the
+  module wrapper by what it *is* — the pre-split monolith's whole-body IIFE is a
+  module of one top-level statement; a split module's `program` is dozens, and
+  its top-level components are real scopes to search — never by a fixed position,
+  which read every split component as the un-searchable wrapper and found nothing.
+
+- **The gate reads code, not linkage.** tree-sitter's JavaScript grammar does not
+  model a reserved word as an import/export alias (`export{x as if}`,
+  `import{if as a}` — legal ES2015, which the split minifier emits when its
+  two-letter alias generator lands on `if`/`in`/`do`), so it plants a localized
+  `ERROR` inside the clause. patch-cc never locates in or edits module linkage —
+  every anchor is executable code — so `Source.defect` reads *past* an error
+  confined to an import/export statement and returns the first one that is not,
+  while a splice that broke real code still lands outside linkage and is still
+  caught. It is the gate's scope stated precisely, not a tolerance bolted on: the
+  eight such modules on 2.1.243 parse clean for every purpose the tool has.
+
 ## Discovery instead of hardcoding
 
 Anything the binary can enumerate for us, it does:
@@ -313,7 +363,9 @@ re-deriving it.
 
 Both numbers above are counts, and a count cannot tell a rewrite that landed
 from a rewrite that landed *one prop-name to the left*. So the bundle is parsed,
-and any `ERROR` or `MISSING` node aborts (`src/patch_cc/js.py`).
+and any `ERROR` or `MISSING` node **outside module linkage** aborts
+(`src/patch_cc/js.py`; the linkage read-past is
+[above](#the-many-module-surface)).
 
 The parse is not a separate pass any more: locating already needs it, and an
 edit costs one incremental reparse — ~75 ms on a 25 MB bundle against ~3 s for a
@@ -495,6 +547,10 @@ that broke a patch along with every note.
 
    On Windows the installed binary is a plain copy, so the path is
    `$env:USERPROFILE\.local\bin\claude.exe`.
+
+   Since 2.1.242 that is every JavaScript module concatenated, each behind a
+   `// ==== patch-cc module <n> ====` header, so `rg` still works over one file
+   and the header says which chunk a hit lives in.
 
 2. Run `patch-cc doctor`. Note which patch dropped to `candidates == 0`, or —
    for `live-thinking` — which sub-step.
@@ -866,11 +922,17 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   than carried over from whichever renderer the first step happened to see
   last: a second component with the same four props donated its local to the
   first one's memo, spliced an identifier that component cannot see, and
-  reported both steps green. The memo itself is found by what it computes (a
-  `useMemo` over a `flatMap` that wraps each streaming block as a message),
-  which is what a claim about the *text* around the block (`.contentBlock]}`)
-  only approximated: one sibling property beside `content` read as the whole
-  computation being gone.
+  reported both steps green. The memo itself is found by what it computes — an
+  arrow whose whole body is a `flatMap` that wraps each streaming block as a
+  message, and the call that takes that arrow — never by the memo hook's name.
+  The hook is one more minified spelling: the monolith reaches it as
+  `<React>.useMemo(...)` (the property name survives a member read), but a
+  code-split module imports it under a local (`import{useMemo as te}` → `te(...)`),
+  so keying on `useMemo` read a build that memoizes exactly the same way as one
+  with no memo at all, and the rewrite reuses the memo's *own* callee rather than
+  re-spelling `.useMemo`. What a claim about the *text* around the block
+  (`.contentBlock]}`) only approximated is the computation itself: one sibling
+  property beside `content` read as the whole thing being gone.
 
   **`display-mode`** defaults the request's thinking display to `"summarized"`;
   without it the API only streams summary text when the `showThinkingSummaries`
