@@ -351,6 +351,20 @@ class Patch:
     #: keys, so the two stores cannot drift and adding a configurable patch is
     #: one declaration rather than eight edits.
     setting: Setting | None = None
+    #: Whether this patch still has a surface on a given bundle: the sentence
+    #: explaining its absence, or ``None`` while the surface is there. Discovery's
+    #: question asked one level up -- the binary in hand says what can be offered
+    #: -- for a patch whose whole target upstream may retire outright (org-label's
+    #: welcome segment left in 2.1.246). The menu dims the row, an explicit
+    #: request is refused at the front door, a cached replay skips it with a
+    #: note, and `doctor` reports it apart from broken: a build without the
+    #: surface is a fact about the build, not a regression in a matcher. The
+    #: field left ``None`` means the surface is every build's.
+    absence: Callable[[Source], str | None] | None = None
+
+    def absent(self, source: Source) -> str | None:
+        """Why this patch has no surface on this bundle -- ``None`` while it has one."""
+        return self.absence(source) if self.absence is not None else None
 
     def run(self, source: Source, options: Options) -> tuple[Source, Outcome]:
         """Run this patch, surviving its own failure.

@@ -105,6 +105,12 @@ class HeaderRow:
 class PatchRow:
     patch: Patch
     on: bool
+    #: Why this build offers no surface for the patch (upstream retired it), or
+    #: ``None`` while it does. A dimmed row -- visible, never selectable: what
+    #: the binary cannot support is shown rather than offered, the same
+    #: discovery rule the agent and model pickers follow, and the row un-dims by
+    #: itself on a build that carries the surface again.
+    absent: str | None = None
 
 
 @dataclass(slots=True)
@@ -172,7 +178,14 @@ class MenuModel:
         model.codex_port = seed.options.codex_port
         for group in GROUP_ORDER:
             for patch in by_group().get(group, []):
-                model.patch_rows[patch.id] = PatchRow(patch, patch.id in seed.patches)
+                # A seed (manifest or cache) may name a patch this build has no
+                # surface for -- a cached org-label replayed onto 2.1.246 -- and
+                # a dimmed row cannot be on: the selection the screen shows is
+                # the selection that runs.
+                why = patch.absent(pristine.source)
+                model.patch_rows[patch.id] = PatchRow(
+                    patch, why is None and patch.id in seed.patches, absent=why
+                )
 
         # A Codex id this run would register is a valid pin too, so a remembered
         # codex override survives instead of snapping back to keep.
@@ -696,9 +709,15 @@ class MenuApp:
             self.cursor = len(rows) - 1
             self._clamp_cursor(-1)
         elif key == "space" and isinstance(row, PatchRow):
-            row.on = not row.on
+            if row.absent is None:
+                row.on = not row.on
+            else:
+                self.flash = row.absent
         elif key == "enter" and isinstance(row, PatchRow):
-            self._activate(row)
+            if row.absent is None:
+                self._activate(row)
+            else:
+                self.flash = row.absent
         elif key in ("s", "a"):
             self._start_apply()
         elif key == "d":
@@ -1407,7 +1426,10 @@ class MenuApp:
                 cursor_line = len(lines)
             line = Text()
             line.append("❯ " if current else "  ", style=_ACCENT)
-            mark, mark_style = ("●", _ACCENT) if row.on else ("○", f"dim {_ACCENT}")
+            if row.absent is not None:
+                mark, mark_style = ("–", "dim")
+            else:
+                mark, mark_style = ("●", _ACCENT) if row.on else ("○", f"dim {_ACCENT}")
             line.append(f"{mark} ", style=mark_style)
             line.append(
                 row.patch.title, style="bold" if current else ("" if row.on else "dim")
@@ -1425,6 +1447,10 @@ class MenuApp:
 
     def _row_note(self, row: PatchRow) -> Text | None:
         """The current configuration, shown on the row itself when enabled."""
+        if row.absent is not None:
+            # The whole sentence waits in `flash` for a key press; the row says
+            # only that there is nothing here to turn on.
+            return Text("not on this build", style="dim")
         if not row.on:
             return None
         model = self.model
@@ -1531,6 +1557,14 @@ class MenuApp:
             )
             lines.append(line)
             lines += _findings(outcome)
+        for patch, _why in result.absent:
+            # Not a verdict: the build has no surface for this patch, so it was
+            # not run. The sentence itself prints with the verdicts below.
+            line = Text()
+            line.append("  - ", style="dim")
+            line.append(f"{patch.id:<22}", style="dim")
+            line.append("not on this build", style="dim")
+            lines.append(line)
         lines.append(Text(""))
         lines.append(
             Text(f"  agents  {', '.join(a.name for a in result.agents)}", style="dim")
