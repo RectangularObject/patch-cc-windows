@@ -1089,6 +1089,49 @@ def is_true(node: Node | None) -> bool:
     )
 
 
+def values(node: Node | None) -> Iterator[Node]:
+    """The values this expression can stand for, by the grammar's own routing.
+
+    A ternary answers with either branch, parentheses and a comma sequence with
+    their last expression, an assignment with the value it assigns, and
+    ``&&``/``||``/``??`` with either side; everything else -- a call, a read, a
+    literal -- is a value of its own. Identity by membership among these is the
+    rule the codex resolvers state for their rejection (2.1.234 wrapped one in
+    a dead recognizer, and the exact spelling read a behaviourally identical
+    build as the resolver being gone), asked here of any value a matcher has an
+    opinion about: 2.1.246 minted ids for streamed blocks and the extras
+    element became ``ce?{...S.contentBlock,id:V}:S.contentBlock`` -- a value
+    that can still *be* the block read, read by the exact-node question as no
+    block at all, with every anchor count standing.
+
+    Kin to, and deliberately not one home with, ``patches.codex``'s null
+    question: null routes *asymmetrically* through ``||``/``??`` -- a null on
+    their left is exactly what both exist to pass over -- so what can arrive
+    and what can arrive null are two tables, not one fact spelled twice.
+    """
+    if node is None:
+        return
+    if node.type == "ternary_expression":
+        for field in ("consequence", "alternative"):
+            yield from values(node.child_by_field_name(field))
+        return
+    if node.type in ("parenthesized_expression", "sequence_expression"):
+        parts = [child for child in children(node) if child.type != "comment"]
+        if parts:
+            yield from values(parts[-1])
+        return
+    if node.type == "assignment_expression":
+        yield from values(node.child_by_field_name("right"))
+        return
+    if node.type == "binary_expression":
+        operator = node.child_by_field_name("operator")
+        if operator is not None and text(operator) in ("&&", "||", "??"):
+            for field in ("left", "right"):
+                yield from values(node.child_by_field_name(field))
+            return
+    yield node
+
+
 def receiver(node: Node | None) -> Node | None:
     """What a member read reads *from* -- ``a.b``'s ``a``.
 

@@ -31,6 +31,18 @@ class AlreadyPatchedError(RuntimeError):
     """
 
 
+def landed_ids(results: list[tuple[Patch, Outcome]]) -> list[str]:
+    """Exactly what the manifest may claim: every patch that is not broken.
+
+    A patch that rewrote something but missed an expectation is not an applied
+    patch; recording it would make ``status`` assert a feature that is not
+    there. One home for the rule: ``apply``'s report and doctor's smoke bake
+    both build their manifests from it, so they cannot drift on what "landed"
+    means.
+    """
+    return [p.id for p, o in results if o.health != "broken"]
+
+
 @dataclass(slots=True)
 class PatchReport:
     version: str | None
@@ -43,13 +55,7 @@ class PatchReport:
 
     @property
     def landed_ids(self) -> list[str]:
-        """Exactly what the manifest may claim: every patch that is not broken.
-
-        A patch that rewrote something but missed an expectation is not an
-        applied patch; recording it would make ``status`` assert a feature that
-        is not there.
-        """
-        return [p.id for p, o in self.results if o.health != "broken"]
+        return landed_ids(self.results)
 
     @property
     def regressions(self) -> list[Patch]:

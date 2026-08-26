@@ -64,7 +64,7 @@ patch-cc                       # then just run it
 | Chrome & branding | Disable spinner tips | No rotating tips on the spinner |
 | | Mark `--version` | Appends `(patched)` — or any marker you choose |
 | | Custom startup name | Defaults to `<your username>'s Code` |
-| | Startup org/email label | Replace the org/email on the welcome screen — or hide it (demo mode keeps the stock line) |
+| | Startup org/email label | Replace the org/email on the welcome screen — or hide it (demo mode keeps the stock line). Upstream stopped drawing the segment in 2.1.246, so newer builds offer this dimmed as *not on this build* |
 
 ## Usage
 
@@ -83,8 +83,8 @@ uvx patch-cc apply --org-label "Ada's Lab"    # ...or show this instead
 uvx patch-cc apply --codex gpt-5.6-sol        # + a Codex model (see below)
 uvx patch-cc apply --from-cache               # replay your last remembered selection
 uvx patch-cc status                           # exactly what is applied
-uvx patch-cc doctor                           # do all patches match this build?
-uvx patch-cc doctor path/to/claude            # ...or match some other binary
+uvx patch-cc doctor                           # do all patches match this build, and does it bake + boot?
+uvx patch-cc doctor path/to/claude            # ...same, for some other binary
 uvx patch-cc list                             # every patch, described
 uvx patch-cc restore                          # put the original back
 ```

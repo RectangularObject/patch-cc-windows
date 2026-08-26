@@ -329,6 +329,37 @@ def _interpolates_org(node: js.Node) -> bool:
     return js.up(node, "template_substitution") is not None
 
 
+def _org_segments(source: Source) -> list[js.Node]:
+    """Every composition of the org name into a line -- this patch's surface.
+
+    One home for a question asked twice: the patch counts its candidates off
+    this, and :func:`_org_absence` asks it to learn whether the build has a
+    surface at all, so the two can never disagree about what counts.
+    """
+    return [node for node in source.find(_ORG) if _interpolates_org(node)]
+
+
+def _org_absence(source: Source) -> str | None:
+    """Why org-label has no work on this build, or ``None`` while it does.
+
+    2.1.246 deleted the welcome-banner variant that composed the segment: the
+    surviving banner draws `model · billing` with no org anywhere, which is the
+    hidden state an empty ``--org-label`` asks for. That is upstream retiring
+    the surface, not a matcher to repair, so it is said apart from broken --
+    and asked of the bundle in hand, never of a version, so a build that draws
+    the segment again un-dims the row with no code change. What this cannot
+    tell apart is a composition respelled out of the locator's sight; the cost
+    of that miss is a visibly dimmed row on a build whose screen still shows
+    the segment, and the corpus sweep is what keeps the locator honest.
+    """
+    if _org_segments(source):
+        return None
+    return (
+        "the welcome screen composes no org segment -- upstream retired it, "
+        "and hiding it is now upstream's own default"
+    )
+
+
 def _appended(line: js.Node, label: str) -> str | None:
     """What ``label`` adds to upstream's no-org line -- nothing, when hiding.
 
@@ -380,9 +411,8 @@ def _org_label(source: Source, options: Options, outcome: Outcome) -> Source:
     edits: list[Edit] = []
     seen: set[int] = set()
 
+    outcome.candidates += len(_org_segments(source))
     for node in source.find(_ORG):
-        if _interpolates_org(node):
-            outcome.candidates += 1
         line = js.up(node, "ternary_expression")
         if line is None or line.id in seen:
             continue
@@ -456,5 +486,6 @@ PATCHES = [
         option="--org-label",
         anchors=(_ORG, _IS_DEMO),
         setting=string_setting("org", "org_label", "org_label", "", always=True),
+        absence=_org_absence,
     ),
 ]

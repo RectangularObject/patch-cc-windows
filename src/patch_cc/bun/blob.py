@@ -2,16 +2,30 @@
 
 Layout of the blob (little-endian throughout)::
 
-    [ data arena: name / contents / sourcemap / bytecode / ... payloads ]
-    [ module table: N records of `struct_size` bytes                    ]
-    [ compileExecArgv payload                                           ]
-    [ 32-byte offsets struct                                            ]
-    [ 15-byte "\\n---- Bun! ----\\n" trailer                              ]
+    [ data arena: name / contents / sourcemap / bytecode / ... payloads      ]
+    [ module table: N records of `struct_size` bytes                         ]
+    [ tail: flag-gated records, compileExecArgv, padding                     ]
+    [ 32-byte offsets struct                                                 ]
+    [ 15-byte "\\n---- Bun! ----\\n" trailer                                   ]
 
 Every pointer in the blob is a ``(u32 offset, u32 length)`` pair relative to the
-start of the blob, and they live in exactly two places: the module table and the
-offsets struct. That is what makes rewriting tractable -- move a payload, then
-fix up the pointers that describe it.
+start of the blob, and they live in exactly three places: the module table, the
+offsets struct, and the record chain that Bun >=1.4.1 gates behind ``flags``
+bits and chains directly after the module table (``StandaloneModuleGraph.rs``,
+``from_bytes``/``to_bytes``). That is what makes rewriting tractable -- move a
+payload, then fix up the pointers that describe it.
+
+Two layout invariants ride on the *positions* of payloads, not just their
+pointers, and :func:`rebuild` preserves both by keeping every payload's
+original inter-payload gap and its offset phase modulo 128:
+
+- Bytecode payloads (module bytecode, builtin bytecode, the shared bytecode
+  string table) sit at ``offset % 128 == 120``, so they are 128-byte aligned
+  once the container's 8-byte size prefix is in front
+  (``append_bytecode_aligned``). Bun 1.4.1 deserializes them in place and
+  misalignment is a runtime assert or segfault; older Bun quietly tolerated it.
+- ``count_z`` payloads (names, contents) carry a NUL terminator in the gap
+  after them.
 """
 
 from __future__ import annotations
@@ -23,6 +37,11 @@ from .errors import BunError
 
 TRAILER = b"\n---- Bun! ----\n"
 OFFSETS_SIZE = 32
+
+#: Bytecode payloads are laid out so the *file* offset (blob offset plus the
+#: container's size prefix) is 128-byte aligned; preserving each payload's blob
+#: offset modulo this keeps that and every weaker (8/16-byte) phase intact.
+ALIGN = 128
 
 #: Index of the ``loader`` byte in a module record's four trailing flags
 #: (``encoding, loader, module_format, side``). It is how Bun decides whether a
@@ -40,6 +59,20 @@ FIELDS_NEW = (
 )
 FIELDS_OLD = FIELDS_NEW[:4]
 
+#: The flag-gated records Bun chains directly after the module table, in flag
+#: order (``StandaloneModuleGraph.rs``). Bits 0-3 gate runtime behaviour
+#: (autoload of env/bunfig/tsconfig/package.json) and bit 4 declares the
+#: source-text payloads contiguous; none of those carries a record. Bits above
+#: :data:`KNOWN_FLAGS` would gate records whose size and pointers this code
+#: cannot know, so :func:`parse` refuses them rather than silently dropping
+#: what they describe.
+FLAG_HAS_SOURCE_HASHES = 1 << 5  # [u32; modules] WTF hash of each source, 0 = none
+FLAG_HAS_BUILTIN_BYTECODE = 1 << 6  # u32 count, then count x { u32 id, ptr pair }
+FLAG_HAS_BYTECODE_STRING_TABLE = 1 << 7  # one ptr pair: shared bytecode strings
+FLAG_HAS_STARTUP_MODULE_COUNT = 1 << 8  # u32: leading modules loaded at startup
+FLAG_HAS_MODULE_INFO_STRING_TABLE = 1 << 9  # one ptr pair: module_info strings
+KNOWN_FLAGS = (1 << 10) - 1
+
 
 class BlobError(BunError):
     """The .bun payload did not look like a Bun module graph."""
@@ -53,6 +86,20 @@ class Module:
 
 
 @dataclass(slots=True)
+class ArenaRecord:
+    """A record-chain pointer into the arena: a payload no module owns.
+
+    ``ptr_at`` is where the ``(u32 offset, u32 length)`` pair itself sits in
+    the blob -- inside the tail -- so :func:`rebuild` can re-point it after the
+    arena moves. ``rng`` is what it points at.
+    """
+
+    label: str
+    ptr_at: int
+    rng: tuple[int, int]
+
+
+@dataclass(slots=True)
 class Blob:
     data: bytes
     struct_size: int
@@ -62,14 +109,35 @@ class Blob:
     entry_point_id: int
     flags: int
     offsets_at: int
+    #: Blob offset of the per-module ``u32`` source-hash array, or ``None`` when
+    #: this build carries none. The hash is JSC's SourceCodeKey hash of the
+    #: module's contents, so an edited module's entry must be re-zeroed -- 0 is
+    #: upstream's own "none, compute it" value -- or JSC would key the patched
+    #: source under the pristine text's hash.
+    source_hashes_at: int | None
+    #: Arena payloads owned by the record chain rather than a module -- the
+    #: shared bytecode string table every chunk's bytecode indexes, and friends.
+    arena_records: list[ArenaRecord]
 
     @property
     def fields(self) -> tuple[str, ...]:
         return FIELDS_NEW if self.struct_size == 52 else FIELDS_OLD
 
+    @property
+    def table_end(self) -> int:
+        return self.modules_ptr[0] + self.modules_ptr[1]
+
     def payload(self, rng: tuple[int, int]) -> bytes:
         off, length = rng
         return self.data[off : off + length]
+
+    def source_hashes(self) -> tuple[int, ...] | None:
+        """The per-module source-hash words, in module-table order."""
+        if self.source_hashes_at is None:
+            return None
+        return struct.unpack_from(
+            f"<{len(self.modules)}I", self.data, self.source_hashes_at
+        )
 
     def entry_module(self) -> Module:
         """The module Bun runs -- as the container itself declares it.
@@ -104,9 +172,9 @@ class Blob:
         Read off the artifact, exactly as :meth:`entry_module` reads the
         entrypoint -- never hardcoded to a value, and never by name -- so a build
         that renumbers the loader still answers correctly. The assets (native
-        addons, the bundled ``mermaid``/``hljs`` minified files, the HTML
-        template) carry other loaders and are excluded: they are opaque bytes to
-        Bun and would not parse as our JavaScript.
+        addons, the bundled ``mermaid``/``hljs`` minified files, the embedded
+        markdown/HTML templates) carry other loaders and are excluded: they are
+        opaque bytes to Bun and would not parse as our JavaScript.
 
         Pre-split, this is the one-element list ``[entry_module()]`` -- the
         monolith -- so the single-module world is exactly the many-module world
@@ -122,7 +190,8 @@ class Blob:
         ``FIELDS_OLD`` is the first four of ``FIELDS_NEW``. Before 2.1.242 only
         the entrypoint carried any; the code-split builds carry it on every
         chunk, so the figure ``status`` reports and the write reclaims is the sum,
-        not one module's.
+        not one module's. The shared bytecode string table is not counted: every
+        untouched module's bytecode indexes it, so it is never droppable.
         """
         return sum(m.ranges["bytecode"][1] for m in self.modules)
 
@@ -153,6 +222,64 @@ def _detect_struct_size(modules_len: int) -> int:
     return 52
 
 
+def _parse_records(
+    data: bytes, flags: int, table_end: int, offsets_at: int, module_count: int
+) -> tuple[int | None, list[ArenaRecord]]:
+    """Walk the flag-gated record chain between the module table and offsets.
+
+    Mirrors ``StandaloneModuleGraph::from_bytes`` record for record, in flag
+    order. A build with none of the record flags (every Bun before 1.4.1) walks
+    zero records through the same code. Raises on flag bits above
+    :data:`KNOWN_FLAGS`: an unknown bit gates a record of unknown size, and a
+    rewrite that cannot re-point what it cannot parse would ship a blob whose
+    loader reads garbage -- the exact corruption this walk exists to prevent.
+    """
+    unknown = flags & ~KNOWN_FLAGS
+    if unknown:
+        raise BlobError(
+            f"offsets flags {flags:#x} carry record bits {unknown:#x} this code "
+            "does not know; rewriting would corrupt the records they gate"
+        )
+
+    at = table_end
+
+    def take(n: int, what: str) -> int:
+        nonlocal at
+        if at + n > offsets_at:
+            raise BlobError(f"the {what} record runs past the offsets struct")
+        pos = at
+        at += n
+        return pos
+
+    hashes_at = None
+    records: list[ArenaRecord] = []
+    if flags & FLAG_HAS_SOURCE_HASHES:
+        hashes_at = take(module_count * 4, "source-hash")
+    if flags & FLAG_HAS_BUILTIN_BYTECODE:
+        (count,) = struct.unpack_from("<I", data, take(4, "builtin-bytecode count"))
+        for index in range(count):
+            pos = take(12, "builtin-bytecode")
+            rng = struct.unpack_from("<II", data, pos + 4)
+            records.append(ArenaRecord(f"builtin bytecode {index}", pos + 4, rng))
+    if flags & FLAG_HAS_BYTECODE_STRING_TABLE:
+        pos = take(8, "bytecode string-table")
+        records.append(
+            ArenaRecord(
+                "bytecode string table", pos, struct.unpack_from("<II", data, pos)
+            )
+        )
+    if flags & FLAG_HAS_STARTUP_MODULE_COUNT:
+        take(4, "startup module count")  # inline value; travels with the tail copy
+    if flags & FLAG_HAS_MODULE_INFO_STRING_TABLE:
+        pos = take(8, "module-info string-table")
+        records.append(
+            ArenaRecord(
+                "module-info string table", pos, struct.unpack_from("<II", data, pos)
+            )
+        )
+    return hashes_at, records
+
+
 def parse(data: bytes) -> Blob:
     """Parse a raw Bun blob (already unwrapped from its container section)."""
     if len(data) < OFFSETS_SIZE + len(TRAILER):
@@ -180,16 +307,19 @@ def parse(data: bytes) -> Blob:
             field: struct.unpack_from("<II", data, base + i * 8)
             for i, field in enumerate(fields)
         }
-        # Every pair points into the blob; one that runs past it means either a
-        # corrupt table or a stride guessed wrong (a 36-byte table read as 52
-        # scatters its ranges). Either way this is not a graph to write back, so
-        # it raises here rather than surfacing as garbage payloads downstream --
-        # which is also what settles the both-strides-divide case for free.
+        # Every pair points into the arena before the table; one that runs past
+        # it means either a corrupt table or a stride guessed wrong (a 36-byte
+        # table read as 52 scatters its ranges). Either way this is not a graph
+        # to write back -- rebuild's arena/table/tail arithmetic would corrupt
+        # it -- so it raises here rather than surfacing as garbage payloads
+        # downstream, which is also what settles the both-strides-divide case
+        # for free.
         for off, length in ranges.values():
-            if off + length > len(data):
+            if length and off + length > table_off:
                 raise BlobError(
                     f"module {index} names a payload [{off}:{off + length}] past "
-                    f"the {len(data)}-byte blob; the record layout does not fit"
+                    f"the module table at {table_off}; the record layout does "
+                    "not fit"
                 )
         trailing = data[base + len(fields) * 8 : base + len(fields) * 8 + 4]
         modules.append(Module(index=index, ranges=ranges, trailing=trailing))
@@ -207,6 +337,26 @@ def parse(data: bytes) -> Blob:
             f"{len(modules)}-module table"
         )
 
+    table_end = table_off + table_len
+    hashes_at, arena_records = _parse_records(
+        data, flags, table_end, offsets_at, len(modules)
+    )
+    for record in arena_records:
+        off, length = record.rng
+        if length and off + length > table_off:
+            raise BlobError(
+                f"the {record.label} payload [{off}:{off + length}] sits past "
+                f"the module table at {table_off}; not a layout this code knows"
+            )
+    # The tail is copied verbatim and re-anchored by rebuild, so everything the
+    # offsets struct locates inside it must actually be inside it.
+    argv_off, argv_len = argv_ptr
+    if argv_off < table_end or argv_off + argv_len > offsets_at:
+        raise BlobError(
+            f"compileExecArgv [{argv_off}:{argv_off + argv_len}] lies outside "
+            f"the tail [{table_end}:{offsets_at}]; not a layout this code knows"
+        )
+
     return Blob(
         data=data,
         struct_size=struct_size,
@@ -216,6 +366,8 @@ def parse(data: bytes) -> Blob:
         entry_point_id=entry_point_id,
         flags=flags,
         offsets_at=offsets_at,
+        source_hashes_at=hashes_at,
+        arena_records=arena_records,
     )
 
 
@@ -226,9 +378,19 @@ def rebuild(
 
     ``sources`` maps a module index to its new ``contents``; every other
     module's bytes are re-emitted unchanged. Payloads keep their original file
-    order so the result stays as close to the input layout as possible. One
-    edited module or a thousand is the same code -- the pre-split monolith is
-    just ``{entry_index: new_bytes}``.
+    order, their inter-payload gaps (Bun's NUL terminators and alignment
+    padding), and their offset phase modulo :data:`ALIGN` -- so a rebuild with
+    no changes reproduces the blob byte for byte, and one with changes moves
+    payloads only by whole alignment steps, keeping the 128-byte bytecode
+    alignment Bun 1.4.1 segfaults without. One edited module or a thousand is
+    the same code -- the pre-split monolith is just ``{entry_index: new_bytes}``.
+
+    The record chain and everything else between the module table and the
+    offsets struct is copied verbatim, then patched in place: arena pointers
+    (the shared bytecode string table and friends) are re-pointed at their
+    moved payloads, and each edited module's source-hash word is zeroed --
+    upstream's own "none" -- because the hash keys JSC's source cache and the
+    pristine text's hash must not describe our bytes.
 
     ``drop_bytecode`` removes the precompiled Bun bytecode of exactly the
     modules whose source changed. Editing a module's source invalidates its
@@ -243,47 +405,60 @@ def rebuild(
     fields = blob.fields
     changed = set(sources)
 
-    # Every payload, in the order it appears in the source arena.
-    placed: list[
-        tuple[int, int, int, str]
-    ] = []  # (offset, length, module_index, field)
+    # Every payload, in the order it appears in the source arena -- the modules'
+    # six ranges plus the payloads the record chain owns (keyed by label; module
+    # keys are ints, so the namespaces cannot collide).
+    placed: list[tuple[int, int, int | str, str]] = []  # (offset, length, key, field)
     for module in blob.modules:
         for field in fields:
             off, length = module.ranges[field]
             if length:
                 placed.append((off, length, module.index, field))
-    placed.sort()
+    for record in blob.arena_records:
+        if record.rng[1]:
+            placed.append((*record.rng, record.label, "record"))
+    # Position alone orders the arena; keys stay out of the sort so an exact
+    # (offset, length) tie -- two pointers aliasing one payload, which no Bun
+    # builder emits today -- keeps insertion order instead of comparing an int
+    # key to a str one. Such an alias would be emitted once per pointer below:
+    # a larger blob, every pointer still valid, identity deliberately not held.
+    placed.sort(key=lambda entry: entry[:2])
 
     out = bytearray()
-    new_ranges: dict[tuple[int, str], tuple[int, int]] = {}
+    new_ranges: dict[tuple[int | str, str], tuple[int, int]] = {}
     prev_end = 0
-    for off, length, mod_index, field in placed:
-        edited = mod_index in changed
-        if edited and field == "bytecode" and drop_bytecode:
-            new_ranges[(mod_index, field)] = (0, 0)
+    for off, length, key, field in placed:
+        if field == "bytecode" and drop_bytecode and key in changed:
+            new_ranges[(key, field)] = (0, 0)
             prev_end = off + length
             continue
 
         payload = (
-            sources[mod_index]
-            if (edited and field == "contents")
+            sources[key]  # type: ignore[index]
+            if (field == "contents" and key in changed)
             else blob.data[off : off + length]
         )
-        # Preserve the 1-byte separators Bun emits between payloads.
-        if prev_end and off > prev_end:
+        # The bytes Bun put between payloads: NUL terminators, alignment padding.
+        if off > prev_end:
             out += b"\0" * (off - prev_end)
-        new_ranges[(mod_index, field)] = (len(out), len(payload))
+        # Then re-pad to the payload's original offset phase, so earlier edits
+        # (grown contents, dropped bytecode) never break an alignment downstream.
+        out += b"\0" * ((off - len(out)) % ALIGN)
+        new_ranges[(key, field)] = (len(out), len(payload))
         out += payload
         prev_end = off + length
 
-    out += b"\0"
+    # The gap Bun left between the last payload and the module table.
+    out += b"\0" * (blob.modules_ptr[0] - prev_end)
     table_off = len(out)
     table_len = len(blob.modules) * blob.struct_size
     out += bytearray(table_len)
 
-    argv = blob.payload(blob.argv_ptr)
-    argv_off = len(out)
-    out += argv + b"\0"
+    # Everything between the table and the offsets struct -- the record chain,
+    # compileExecArgv, padding -- verbatim; pointers are patched in place below.
+    tail_at = len(out)
+    out += blob.data[blob.table_end : blob.offsets_at]
+    shift = tail_at - blob.table_end  # old tail position -> new, one delta
 
     offsets_at = len(out)
     out += bytearray(OFFSETS_SIZE)
@@ -297,10 +472,21 @@ def rebuild(
         tail = base + len(fields) * 8
         out[tail : tail + 4] = module.trailing
 
+    for record in blob.arena_records:
+        if record.rng[1]:
+            struct.pack_into(
+                "<II", out, record.ptr_at + shift, *new_ranges[(record.label, "record")]
+            )
+    if blob.source_hashes_at is not None:
+        for index in changed:
+            struct.pack_into("<I", out, blob.source_hashes_at + shift + index * 4, 0)
+
     struct.pack_into("<Q", out, offsets_at, offsets_at)
     struct.pack_into("<II", out, offsets_at + 8, table_off, table_len)
     struct.pack_into("<I", out, offsets_at + 16, blob.entry_point_id)
-    struct.pack_into("<II", out, offsets_at + 20, argv_off, len(argv))
+    struct.pack_into(
+        "<II", out, offsets_at + 20, blob.argv_ptr[0] + shift, blob.argv_ptr[1]
+    )
     struct.pack_into("<I", out, offsets_at + 28, blob.flags)
 
     if drop_bytecode:
