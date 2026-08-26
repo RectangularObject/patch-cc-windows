@@ -9,7 +9,7 @@ from rich.console import Console
 from .patches.base import Options, Outcome, Patch
 
 if TYPE_CHECKING:
-    from .doctor import DryRun
+    from .doctor import DryRun, Smoke
 
 console = Console()
 
@@ -42,15 +42,18 @@ def findings(outcome: Outcome) -> list[tuple[str, str]]:
     return lines + [("dim", note) for note in notes]
 
 
-def verdicts(result: DryRun) -> list[tuple[str, str]]:
+def verdicts(result: DryRun, smoke: Smoke | None = None) -> list[tuple[str, str]]:
     """The summary under a dry run's per-patch list, as ``(style, text)`` lines.
 
     One source for *what a dry run concludes*, the level up from :func:`findings`
     (which words one patch): the parse defect, the broken patches with the anchor
     counts that point at what moved, the drift note for a build that matched but
-    could not rewrite, and the all-clear. Both the CLI and the menu draw these,
+    could not rewrite, the baked binary's own run when one was made
+    (:func:`patch_cc.doctor.smoke` -- the menu passes none, its question is
+    matcher health), and the all-clear. Both the CLI and the menu draw these,
     so neither can reach a verdict the other does not -- the exit code is
-    :attr:`DryRun.clean`, read once and rendered here once.
+    :attr:`DryRun.clean` plus the smoke verdict, read once and rendered here
+    once.
     """
     lines: list[tuple[str, str]] = []
     _grammar_hint = (
@@ -76,8 +79,31 @@ def verdicts(result: DryRun) -> list[tuple[str, str]]:
         )
     if not result.broken and result.defect is None and result.unhealthy:
         lines.append(("yellow", f"{len(result.unhealthy)} patch(es) {_drift}"))
+    for patch, why in result.absent:
+        lines.append(("dim", f"{patch.id}: {why}"))
+    if smoke is not None and smoke.ok:
+        lines.append(("dim", smoke.detail))
     if result.clean:
-        lines.append(("green", "all patches still match this build, and it parses."))
+        matched = "all patches still match this build"
+        if result.absent:
+            matched += f" ({len(result.absent)} not on it)"
+        tail = (
+            ", it parses, and the baked binary runs."
+            if smoke is not None and smoke.ok
+            else ", and it parses."
+        )
+        lines.append(("green", matched + tail))
+    if smoke is not None and not smoke.ok:
+        # After the matcher verdict on purpose: matching and running are
+        # different truths, and 2.1.246 is the build where they split -- every
+        # matcher green, the written container dead on launch.
+        lines.append(
+            (
+                "yellow",
+                "the baked binary does not run; the container write is what broke:",
+            )
+        )
+        lines.append(("red", f"  {smoke.detail}"))
     return lines
 
 

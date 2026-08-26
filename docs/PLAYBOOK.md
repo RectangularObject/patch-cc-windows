@@ -309,6 +309,20 @@ isolation was cheaper and could not see the one ordering this project calls
 load-bearing — `codex-models` registering the ids `subagent-models` then pins —
 nor anything at all about the bundle the run produced, which it discarded.
 
+The composed result is then **baked and executed**: doctor writes it into a
+temp binary through the same `container.write` as a real apply — staging,
+round-trip verification, the container checks — and runs `<binary> --version`,
+expecting the version-marker suffix in the output (our own edit's print, so the
+check proves patched code *executes*, not merely that the binary boots around
+it). Matching and running are different truths with different failure owners:
+matchers break in the patches, the run breaks in the container layer, and
+2.1.246 is the build where they split — every matcher green, every module
+round-tripping byte-perfect, and the written binary `SIGSEGV`ing in Bun's graph
+loader because what the rewrite had destroyed (the Bun 1.4.1 record chain and
+the shared bytecode string table, docs/INTERNALS.md) lives in bytes no module
+owns. The temp binary is always removed; the backup under test is never
+written to.
+
 Three readings of the two numbers, kept distinct:
 
 | symptom | meaning |
@@ -608,6 +622,12 @@ that broke a patch along with every note.
    enumerated with its hashes in [corpus.md](corpus.md) — so both sides are
    recomputed from the binaries themselves.
 
+   Each build's report ends with its baked binary's own `--version` output (the
+   smoke run above), so the sweep also proves every corpus build still *bakes
+   and boots* — the half matcher counts cannot see, and the half 2.1.246 broke
+   while every count held. A moved runtime line is as much a finding as a moved
+   count.
+
 ## Patch reference
 
 Grouped by source module. The menu's three groups (Output & display, Models &
@@ -848,28 +868,37 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
     *initialised* to is deliberately not asked: `useState(null)` is every
     build's spelling and `useState(void 0)` would be the same state, while the
     setter is the identity that matters.
-  - **The state has two homes, and the handed setter names both.** Through
-    2.1.235 the scope that hands `onStreamingThinking` declared the state
-    itself, and the state is the array pattern binding the handed setter —
-    `useState`'s pair. 2.1.236 moved it into an external stream store
-    (`subscribe`/`getSnapshot`/`_publish` — the `useSyncExternalStore` shape)
-    and hands `<store>.setStreamingThinking` instead; the same scope reads the
-    store back by destructuring the hook call it hands the store to
-    (`{streamingToolUses:…}=useX(<store>)`), so the state is that pattern's own
-    `streamingThinking` binding — upstream's the day it takes one, the goal
-    achieved, and until then ours, inserted at the front of the pattern. The
-    pattern is proven the snapshot read by the store expression itself: the
-    call's *only* argument is the very expression the setter was read off, one
-    answer or none (`js.only`). Sole argument is deliberate — a second is a
-    selector whose result is no longer the snapshot, and extending a pattern of
-    unknowable provenance binds `undefined` with every count green. The
-    insertion also pays for a witness the way `thinking-summaries` does: the
-    field it binds must still be named by the bundle's own objects (the store's
-    snapshot initialiser, its publish call), so a store that renames the field
-    reads as the step reporting the store rather than threading `undefined`.
-    Two things come free with the store: its setter takes functional updaters —
-    React's own contract, which the reducer splices already speak — and it
-    hides a finished block itself after 30 s, upstream's own linger.
+  - **The state has two homes, and each is proven by the only name it has.**
+    Through 2.1.235 the scope that hands `onStreamingThinking` declared the
+    state itself, and the state is the array pattern binding the handed setter
+    — `useState`'s pair, which nothing else names. 2.1.236 moved it into an
+    external stream store (`subscribe`/`getSnapshot`/`_publish` — the
+    `useSyncExternalStore` shape) that a component reads back by destructuring
+    a hook call (`{streamingToolUses:…}=useX(<store>)`), so the state is that
+    pattern's own `streamingThinking` binding — upstream's the day it takes
+    one, the goal achieved, and until then ours, inserted at the front of the
+    pattern. The pattern names *itself*: it binds the store's own
+    `streamingToolUses` field — the name the store publishes and the
+    transcript signature already rests on — and that membership is its whole
+    identity, provided its value is a call taking exactly one argument, one
+    answer or none (`js.only`). It was once proven by the handing instead —
+    "the call's only argument is the very expression the setter was read off"
+    — and 2.1.246 moved the handing into the engine
+    (`this.stream.setStreamingThinking`), out of every component, without
+    moving the state: four renders that plainly draw the conversation read as
+    having none in scope, with `onStreamingThinking:` still twice in the
+    bundle. The handed setter was `agentDefinitions` again — a neighbour
+    standing in for the thing itself, one more fact upstream had to keep.
+    Sole argument stays deliberate — a second is a selector whose result is
+    no longer the snapshot, and extending a pattern of unknowable provenance
+    binds `undefined` with every count green. The insertion also pays for a
+    witness the way `thinking-summaries` does: the field it binds must still
+    be named by the bundle's own objects (the store's snapshot initialiser,
+    its publish call), so a store that renames the field reads as the step
+    reporting the store rather than threading `undefined`. Two things come
+    free with the store: its setter takes functional updaters — React's own
+    contract, which the reducer splices already speak — and it hides a
+    finished block itself after 30 s, upstream's own linger.
 
   A render was once selected by *position* — the observation that the real sites
   fall after the state's `useState` declaration. That is worth recording as a
@@ -922,7 +951,19 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   with no memo at all, and the rewrite reuses the memo's *own* callee rather than
   re-spelling `.useMemo`. What a claim about the *text* around the block
   (`.contentBlock]}`) only approximated is the computation itself: one sibling
-  property beside `content` read as the whole thing being gone.
+  property beside `content` read as the whole thing being gone. The wrapped
+  block is asked by membership among the element's *possible values*
+  (`js.values` — the same value routing the codex resolvers read), never asked
+  to be the read: 2.1.246 minted stable ids for streamed blocks
+  (`ce?{...S.contentBlock,id:V}:S.contentBlock`), and the exact-node question
+  read the same wrap one choice deeper as no wrap at all — nine required steps
+  to zero, every anchor count standing. The rewrite reuses upstream's callback
+  and dependencies verbatim — the callback invoked per entry with the same
+  three arguments `flatMap` hands it, each dependency spread rather than
+  transcribed — because a rebuilt copy is a copy free to shed whatever
+  upstream adds next: the re-spell this replaced would have silently dropped
+  the 2.1.246 minting, and with it went the uuid-stamp identity that re-spell
+  had to prove and the reuse no longer asks.
 
   **`display-mode`** defaults the request's thinking display to `"summarized"`;
   without it the API only streams summary text when the `showThinkingSummaries`
@@ -1312,6 +1353,24 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   landed. Only this line is
   touched: the `/status` Organization/Email rows, the login screen, and the
   org's startup message (`"Message from <org>:"`) still show the real account.
+
+  **2.1.246 retired the surface.** Upstream deleted the welcome-banner variant
+  that composed the segment; the surviving banner draws `model · billing` with
+  no org anywhere — the hidden state an empty `--org-label` asks for, now
+  upstream's own default. That is a semantic change, not a matcher to repair
+  (the `help-title` precedent), and it is *absence*, reported apart from broken
+  (CONDUCT): the patch declares its surface (`Patch.absence`, answered by the
+  same `_org_segments` its candidates count off, so the two cannot disagree),
+  and every surface derives its answer from the bundle in hand — the menu shows
+  the row dimmed (`not on this build`, unselectable), an explicit `--org-label`
+  is refused at the front door with the same sentence, a cached replay skips it
+  with a note, and `doctor` prints a `-` row apart from ✓/✗ and stays green.
+  Nothing is keyed on a version, so a build that composes the segment again
+  un-dims the row with no code change. What absence cannot tell apart is a
+  composition respelled out of the locator's sight — that build would read as
+  absent, visibly dimmed on a screen that still draws the segment — and the
+  sweep over the corpus, where thirty-four builds carry the surface, is what
+  keeps the locator honest.
 
 ## Removed patches
 

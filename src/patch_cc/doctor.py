@@ -17,13 +17,18 @@ overrides are exercised for real instead of being exempted.
 
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 
 from . import js
-from .bun import Bundle
+from .bun import Bundle, container
+from .bun.errors import BunError
 from .codex import EFFORT_LADDER
 from .codex.models import CodexModel
-from .patcher import read_manifest
+from .patcher import build_manifest, landed_ids, read_manifest
 from .patches import ALL_PATCHES, Options, Outcome, Patch
 from .patches.agents import INHERIT, BuiltinAgent, discover_agents, discover_models
 
@@ -70,11 +75,23 @@ class DryRun:
     #: override patch would offer.
     agents: list[BuiltinAgent] = field(default_factory=list)
     models: list[str] = field(default_factory=list)
+    #: Patches with no surface on this build -- upstream retired the target --
+    #: each with the sentence saying so (:meth:`patch_cc.patches.Patch.absent`).
+    #: Kept apart from ``results`` because absence is a fact about the build,
+    #: reported apart from broken (docs/CONDUCT.md): an absent patch is not run
+    #: at all, exactly as the menu does not offer it, so it can neither pass nor
+    #: fail and never decides :attr:`clean`.
+    absent: list[tuple[Patch, str]] = field(default_factory=list)
     #: Where this build's *pristine* bundle stopped parsing, when it did --
     #: which `apply` refuses to patch at all. A rewrite that produces rubble is
     #: already reported as the patch that produced it, so this is the one
     #: parse failure no patch can be blamed for and none would survive.
     defect: js.Defect | None = None
+    #: The composed result of the run and the configuration that drove it --
+    #: what :func:`smoke` bakes, held so the binary it executes is the very
+    #: composition the verdicts above describe rather than a second one.
+    patched: js.Source | None = None
+    options: Options | None = None
 
     @property
     def broken(self) -> list[Patch]:
@@ -187,9 +204,99 @@ def dryrun(bundle: Bundle) -> DryRun:
 
     current = source
     for patch in ALL_PATCHES:
+        if (why := patch.absent(source)) is not None:
+            result.absent.append((patch, why))
+            continue
         current, outcome = patch.run(current, options)
         result.results.append((patch, outcome))
         if patch.anchors:
             result.anchors[patch.id] = {a: source.count(a) for a in patch.anchors}
 
+    result.patched = current
+    result.options = options
     return result
+
+
+@dataclass(slots=True)
+class Smoke:
+    """What happened when the baked binary was actually executed."""
+
+    ok: bool
+    detail: str
+
+
+def smoke(bundle: Bundle, dry: DryRun, timeout: float = 60.0) -> Smoke:
+    """Bake the dry run's composition into a real binary and run ``--version``.
+
+    The matchers prove the patches still *find* their shapes; this proves the
+    written container still *carries* them -- rebuilt, spliced back into the
+    executable, loaded by Bun and run. Those are different checks: on 2.1.246
+    every module round-tripped byte-perfect while the written binary segfaulted
+    at launch, because what the rewrite lost -- the record chain and the shared
+    bytecode string table -- lives in bytes no module owns and no per-module
+    comparison can miss loudly. ``--version`` is the cheapest run that loads the
+    whole graph, and with ``version-marker`` landed its suffix line is our own
+    edit's output, so the check proves the patched code executes rather than
+    merely boots around it.
+
+    The bake goes through :func:`patch_cc.bun.container.write` -- the same
+    staging, verification and (on macOS) codesign as a real apply -- into a
+    temp file that is always removed.
+    """
+    if dry.patched is None or dry.options is None:
+        return Smoke(False, "nothing composed to bake")
+    landed = landed_ids(dry.results)
+    patched = dry.patched.append_manifest(build_manifest(landed, dry.options))
+
+    fd, tmp = tempfile.mkstemp(prefix="patch-cc-smoke-")
+    os.close(fd)
+    try:
+        try:
+            container.write(bundle, patched, tmp)
+        except BunError as exc:
+            return Smoke(False, f"bake refused: {exc}")
+        try:
+            proc = subprocess.run(
+                [tmp, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return Smoke(
+                False, f"baked binary hung: --version did not return in {timeout:.0f}s"
+            )
+        except OSError as exc:
+            # A temp dir mounted noexec, ENOMEM -- the run could not even start.
+            # Still a smoke verdict, not a traceback: the question was "does the
+            # baked binary run", and the honest answer is how far it got.
+            return Smoke(False, f"baked binary could not be executed: {exc}")
+        if proc.returncode != 0:
+            reason = f"exit {proc.returncode}"
+            if proc.returncode < 0:
+                try:
+                    reason = f"signal {signal.Signals(-proc.returncode).name}"
+                except ValueError:
+                    reason = f"signal {-proc.returncode}"
+            noise = (proc.stderr or proc.stdout).strip().splitlines()
+            cause = next((l for l in noise if "panic" in l), noise[-1] if noise else "")
+            return Smoke(
+                False,
+                f"baked binary died on --version ({reason})"
+                + (f": {cause.strip()}" if cause else ""),
+            )
+        output = " · ".join(l for l in proc.stdout.strip().splitlines() if l)
+        marker = dry.options.version_suffix
+        if "version-marker" in landed and marker not in proc.stdout:
+            return Smoke(
+                False,
+                f"baked binary ran but never printed {marker!r} -- version-marker "
+                f"landed yet its edit did not execute: {output!r}",
+            )
+        return Smoke(True, f"baked binary runs: {output}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass

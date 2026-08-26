@@ -21,10 +21,11 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The whole published span `2.1.210` → `2.1.243` — 2.1.230 was never published —
-one pristine binary per version, 33 in all. It straddles the **2.1.242 code
-split** (INTERNALS.md): `2.1.242`/`2.1.243` are the first many-module builds, and
-they jump ~35 MB over `2.1.241` for it. Several pairs share a byte count
+The whole published span `2.1.210` → `2.1.246` — 2.1.230 and 2.1.244 were never
+published — one pristine binary per version, 35 in all. It straddles the
+**2.1.242 code split** (INTERNALS.md): `2.1.242`/`2.1.243` are the first
+many-module builds, and they jump ~35 MB over `2.1.241` for it. Several pairs
+share a byte count
 (`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`, `2.1.239`–`2.1.241`, `2.1.242`/`2.1.243`)
 and are still distinct binaries, which is why the identity column is the hash (of
 the whole file, `sha256sum <version>.orig`) and never the size:
@@ -64,10 +65,12 @@ the whole file, `sha256sum <version>.orig`) and never the size:
 | `2.1.241` | 343 MB | `0771bd866cff82b76581fc0499f6529e1a36845078f144f8c81dccb3bc7037b8` |
 | `2.1.242` | 378 MB | `528ef039aa7d64d7b3fbc06925132755a516b4dcaad784cf0b51fe03167360d4` |
 | `2.1.243` | 378 MB | `4b0dafeedd0b469c41988e200036fd773e7553ba960349c9f02a82c6d1f2ba27` |
+| `2.1.245` | 392 MB | `16ad2b94deaf7b29abed966d981c9991a47af0420f5be8ed4a3f83bea9f678bc` |
+| `2.1.246` | 248 MB | `1a0a662dc1bb938eaec38545abce9a4a69113d7d7f7c5e1a553ea276617b906a` |
 
 This set covers the span the playbook's tree-move measurements were taken over
-(`2.1.210` → `2.1.233`) and the 2.1.242 split, so both are re-checkable here
-rather than historical.
+(`2.1.210` → `2.1.233`), the 2.1.242 split, and the 2.1.246 stream-store
+migration, so each is re-checkable here rather than historical.
 
 ## Rebuild or extend it
 
@@ -93,5 +96,11 @@ done; }
 sweep
 ```
 
-`doctor` is read-only — it runs the matchers and parses their output, and never
-writes a binary — so the sweep is safe to run against every backup at any time.
+`doctor` never writes to the backup it reads — it runs the matchers, parses
+their output, then bakes the composed result into a *temp* binary and executes
+`<binary> --version` (the smoke run, [PLAYBOOK.md](PLAYBOOK.md#how-resilience-is-detected)),
+removing the temp afterwards — so the sweep is safe to run against every backup
+at any time, and proves each build bakes and boots, not just that it matches.
+Each bake transiently writes a binary-sized temp file (a few hundred MB) to the
+system temp dir — RAM, where that is tmpfs — one at a time; `TMPDIR` steers it
+elsewhere.

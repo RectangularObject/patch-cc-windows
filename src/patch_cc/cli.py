@@ -291,6 +291,16 @@ def _requested(args, source: Source) -> tuple[list[str], Options]:
             raise SystemExit(2)
         options.codex_models = _codex_selection(codex_ids, source)
 
+    # A surface upstream has retired is refused at the front door, the way a
+    # colliding Codex id is (docs/CONDUCT.md -- explicit invocations are
+    # hermetic): every such patch here was named, by id or by its flag, since no
+    # default-set patch carries an absence question, and an explicit request the
+    # build cannot honour must not become a quiet no-op.
+    for patch in patcher.selected_patches(selected):
+        if (why := patch.absent(source)) is not None:
+            err(f"{patch.id}: {why}")
+            raise SystemExit(2)
+
     return selected, options
 
 
@@ -402,6 +412,15 @@ def _from_cache(args, source: Source) -> tuple[list[str], Options]:
             "cached selection named patch id(s) this build no longer has, skipped: "
             + ", ".join(selection.dropped_patches)
         )
+
+    for patch in patcher.selected_patches(selected):
+        if (why := patch.absent(source)) is not None:
+            # The sibling of the warning above: the id still exists, this build
+            # has no surface for it (upstream retired the target). Said, then
+            # skipped -- a replay degrades loudly, never quietly -- where the
+            # same request typed as a flag is refused outright (`_requested`).
+            warn(f"cached {patch.id} skipped -- {why}")
+            selected.remove(patch.id)
 
     # Codex rides the remembered selection like every other choice, so a replay
     # bakes exactly what was saved. Ids left behind by a selection that did *not*
@@ -625,6 +644,9 @@ def cmd_doctor(args) -> int:
         return 1
     test_bundle, label = target
     result = doctor.dryrun(test_bundle)
+    # An unparseable bundle is refused by `apply`, so there is nothing honest to
+    # bake; the defect line below already owns that verdict.
+    run = doctor.smoke(test_bundle, result) if result.defect is None else None
 
     heading(f"Patch health against {label}")
     for patch, outcome in result.results:
@@ -634,6 +656,10 @@ def cmd_doctor(args) -> int:
             f"cand={outcome.candidates} applied={outcome.applied}"
         )
         _print_findings(outcome)
+    for patch, _why in result.absent:
+        # Not a verdict: the build has no surface for this patch, so it was not
+        # run. The sentence itself prints with the closing verdicts (`verdicts`).
+        console.print(f"  [dim]- {patch.id:20s} not on this build[/dim]")
 
     agents = (
         ", ".join(f"{a.name}={a.effective_model}" for a in result.agents)
@@ -642,20 +668,20 @@ def cmd_doctor(args) -> int:
     console.print(f"\n  [dim]agents:  {agents}[/dim]")
     console.print(f"  [dim]models:  {', '.join(result.models)}[/dim]")
 
-    # One verdict, one exit code (`ui.verdicts` / `DryRun.clean`), so this and
-    # the menu cannot disagree -- including the parse defect, which is not a
-    # per-patch verdict (no matcher caused it, `apply` refuses the binary
-    # outright) but does decide the exit. Green lines get the ✓, cautions the !,
-    # detail is indented under them.
+    # One verdict, one exit code (`ui.verdicts` / `DryRun.clean` plus the smoke
+    # run), so this and the menu cannot disagree -- including the parse defect,
+    # which is not a per-patch verdict (no matcher caused it, `apply` refuses
+    # the binary outright) but does decide the exit. Green lines get the ✓,
+    # cautions the !, detail is indented under them.
     console.print()
-    for style, text in verdicts(result):
+    for style, text in verdicts(result, run):
         if style == "green":
             ok(text)
         elif style == "yellow":
             warn(text)
         else:
             console.print(f"    [{style}]{text}[/{style}]")
-    return 0 if result.clean else 1
+    return 0 if result.clean and (run is None or run.ok) else 1
 
 
 def cmd_list(args) -> int:
