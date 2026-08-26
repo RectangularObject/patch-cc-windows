@@ -23,23 +23,75 @@ treats every module the container declares to be JavaScript as one surface.
 .bun section
 └── [u64 size prefix]           (u32 on Bun < 1.3.4)
     └── Bun blob
-        ├── payload arena       name / contents / sourcemap / bytecode / ... bytes
+        ├── payload arena       name / contents / sourcemap / bytecode / ... bytes,
+        │                       plus the record chain's own payloads (Bun >= 1.4.1)
         ├── module table        N records × 52 bytes (36 on old Bun)
+        ├── record chain        flag-gated records (Bun >= 1.4.1), see below
         ├── compileExecArgv
         ├── offsets struct       32 bytes: byteCount, modulesPtr, entryId, argvPtr, flags
         └── "\n---- Bun! ----\n"  15-byte trailer
 ```
 
 Every pointer is a `(u32 offset, u32 length)` pair relative to the blob start,
-and pointers live in only two places: the module table and the offsets struct.
-That is what makes rewriting tractable — move a payload, fix the handful of
-pointers that describe it.
+and pointers live in exactly three places: the module table, the offsets
+struct, and the record chain. That is what makes rewriting tractable — move a
+payload, fix the handful of pointers that describe it.
+
+Two invariants ride on payload *positions* rather than pointers, and `rebuild`
+preserves both by keeping every payload's inter-payload gap and its offset
+phase modulo 128 — so a rebuild with no edits reproduces the blob byte for
+byte, and one with edits moves payloads only in whole alignment steps:
+
+- Bytecode payloads (module bytecode, and the record chain's bytecode blobs)
+  sit at blob `offset % 128 == 120`, which is 128-byte alignment once the
+  section's 8-byte size prefix is in front. Bun ≥ 1.4.1 deserializes bytecode
+  in place and calls misalignment "a runtime assertion error or segfault"
+  (`append_bytecode_aligned`); older Bun quietly tolerated the phase drift the
+  rewriter used to introduce.
+- `count_z` payloads (names, contents) carry a NUL terminator in the gap
+  after them.
 
 A module record (new 52-byte format) is six such pairs — `name`, `contents`,
 `sourcemap`, `bytecode`, `moduleInfo`, `bytecodeOriginPath` — followed by four
 `u8` flags (`encoding`, `loader`, `moduleFormat`, `side`).
 
 Code: `src/patch_cc/bun/blob.py`.
+
+## The record chain (Bun ≥ 1.4.1)
+
+2.1.246 moved to Bun 1.4.1, whose `StandaloneModuleGraph.rs` chains optional
+records directly after the module table, each announced by a new `flags` bit
+and read back in flag order:
+
+| bit | record |
+|---|---|
+| 5 | `[u32; modules]` — each module's WTF hash of its source text (0 = none) |
+| 6 | `u32 count`, then `count` × `{u32 id, ptr}` — internal-module bytecode |
+| 7 | one pointer: the **shared bytecode string table** |
+| 8 | `u32` — how many leading modules load before the first `import()` |
+| 9 | one pointer: the string table `moduleInfo` bodies index |
+
+The pointers point back into the arena: the shared string table (~9.9 MB on
+2.1.246) is the string data **every chunk's bytecode references by ordinal**,
+so it is load-bearing for every module we did *not* touch. The hash is JSC's
+SourceCodeKey hash, how a launch that runs from bytecode avoids paging in
+source text just to hash it.
+
+patch-cc parses the chain record for record (`_parse_records` — a build with
+none of the bits, which is every Bun before 1.4.1, walks zero records through
+the same code), carries the pointed-at payloads through `rebuild` like any
+module payload, copies the whole tail between table and offsets struct
+verbatim, and re-points the pointers in place. Two details matter:
+
+- An **edited** module's hash word is zeroed — upstream's own "none, compute
+  it" value — because the pristine text's hash must not key our bytes in JSC's
+  source cache.
+- **Unknown** record bits are refused at parse: a record of unknown size
+  cannot be walked past nor re-pointed, and rewriting around it is exactly how
+  a graph gets corrupted. 2.1.246 against patch-cc ≤ 0.4.0 is the lesson: the
+  chain-blind rewriter dropped the records and zero-filled the string table
+  while every *module* round-tripped byte-perfect — matcher-green, dead at
+  launch, `SIGSEGV` from inside Bun's graph loader.
 
 ## The 2.1.242 split, and the patchable surface
 
@@ -86,9 +138,11 @@ detects the mismatch and recompiles that module from source at launch. So keepin
 a stale copy buys nothing — the recompile is paid either way — and dropping it
 reclaims the space and guarantees our edits are what runs. patch-cc drops the
 bytecode of exactly the modules it edited (`rebuild` over `changed_modules`) and
-leaves every untouched module its bytecode and its fast start. On Linux, where
-the ELF section is rewritten in place, the binary is smaller by exactly the
-edited modules' bytecode.
+leaves every untouched module its bytecode and its fast start — which is why
+the shared bytecode string table those modules' bytecode indexes
+([the record chain](#the-record-chain-bun--141)) is never droppable. On Linux,
+where the ELF section is rewritten in place, the binary is smaller by exactly
+the edited modules' bytecode.
 
 Measured on 2.1.243, the full patch set:
 
@@ -114,10 +168,12 @@ re-laying `__LINKEDIT`, which is not done yet.
 
 Every write asserts each **edited** module carries `bytecode == 0` in the binary
 it produced (`container.verify`, beside the round-trip check), and `patch-cc
-status` reports the total for an installed one. `doctor` cannot: a dry run is
-handed a *clean* bundle, which still has all its bytecode by definition. If a
-future Bun build makes bytecode authoritative over source, that assert is the
-tripwire — every edit would silently no-op otherwise.
+status` reports the total for an installed one. `doctor`'s dry run cannot — a
+clean bundle still has all its bytecode by definition — but its smoke bake
+writes a temp binary through the same `container.write` and then *executes* it,
+so the sweep exercises the assert, and the loader itself, on every corpus
+build. If a future Bun build makes bytecode authoritative over source, that
+assert is the tripwire — every edit would silently no-op otherwise.
 
 ## Writing it back without ballooning
 
@@ -196,8 +252,14 @@ rather than from a store of their own.
   and dropped rather than aborting the run. See
   [PLAYBOOK.md](PLAYBOOK.md#the-syntax-gate).
 - Every write is verified: patch-cc re-extracts the JS from the binary it just
-  wrote and asserts every module equals what it meant to write, and that each
-  module it edited carries no leftover bytecode to run instead of the edit.
+  wrote and asserts every module equals what it meant to write, that each
+  module it edited carries no leftover bytecode to run instead of the edit, and
+  that the graph around the modules survived — the record chain kept its
+  length and flags, its arena payloads (the shared bytecode string table above
+  all) round-trip byte-identical, and every source-hash word is the pristine
+  one, except an edited module's, which must be zero. The chain checks exist
+  because 2.1.246 failed *only* there: every module compared equal while the
+  written binary was dead.
 - Patching a binary that is already marked, when no pristine backup exists, is
   refused outright — there is nothing clean to start from, and our edits change
   lengths, so a second pass would corrupt rather than update. `restore` or a

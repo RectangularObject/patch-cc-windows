@@ -130,6 +130,7 @@ def write(
         verify(
             tmp,
             contents,
+            pristine=bundle.blob,
             edited=set(changed),
             original_size=bundle.binary_size,
             dropped_bytecode=dropped if drop_bytecode else 0,
@@ -149,6 +150,7 @@ def verify(
     path: str,
     expected: dict[int, bytes],
     *,
+    pristine: blobmod.Blob,
     edited: set[int],
     original_size: int | None = None,
     dropped_bytecode: int = 0,
@@ -156,11 +158,13 @@ def verify(
 ) -> None:
     """Re-extract from a written binary and assert it round-trips exactly.
 
-    ``expected`` is every module's intended bytes by blob index; ``edited`` are
-    the modules whose source changed, which must run source rather than stale
-    bytecode. ``original_size`` and ``dropped_bytecode`` describe the *pristine*
-    binary and switch on the size half of the tripwire below; ``kind`` scopes it
-    to the container that reclaims space.
+    ``expected`` is every module's intended bytes by blob index; ``pristine``
+    is the blob the write started from, which everything the module comparison
+    cannot see is checked against; ``edited`` are the modules whose source
+    changed, which must run source rather than stale bytecode. ``original_size``
+    and ``dropped_bytecode`` describe the *pristine* binary and switch on the
+    size half of the tripwire below; ``kind`` scopes it to the container that
+    reclaims space.
     """
     try:
         written = read(path)
@@ -173,6 +177,54 @@ def verify(
                 "patched binary did not round-trip: extracted module "
                 f"{index} differs from what we wrote"
             )
+    # The graph structure around the modules, read back off the written file.
+    # The payloads the record chain owns -- the shared bytecode string table
+    # above all -- are what every untouched module's bytecode indexes, so bytes
+    # lost or shifted here are a segfault at launch that no per-module
+    # comparison would catch: that is exactly how 2.1.246 bricked while every
+    # module compared equal.
+    out = written.blob
+    if out.flags != pristine.flags:
+        raise ContainerError(
+            f"patched binary carries flags {out.flags:#x} where the pristine "
+            f"blob carried {pristine.flags:#x}"
+        )
+    if out.offsets_at - out.table_end != pristine.offsets_at - pristine.table_end:
+        raise ContainerError(
+            "patched binary's record-chain tail changed length; records or "
+            "compileExecArgv were lost in the rewrite"
+        )
+    theirs = {r.label: r.rng for r in out.arena_records}
+    for record in pristine.arena_records:
+        if record.label not in theirs:
+            raise ContainerError(f"patched binary lost the {record.label} record")
+        if out.payload(theirs[record.label]) != pristine.payload(record.rng):
+            raise ContainerError(
+                f"patched binary's {record.label} does not round-trip; every "
+                "untouched module's bytecode indexes it"
+            )
+        if theirs[record.label][0] % blobmod.ALIGN != record.rng[0] % blobmod.ALIGN:
+            raise ContainerError(
+                f"patched binary's {record.label} moved off its alignment "
+                "phase; Bun deserializes it in place and would refuse or crash"
+            )
+    want_hashes = pristine.source_hashes()
+    got_hashes = out.source_hashes()
+    if (want_hashes is None) != (got_hashes is None):
+        raise ContainerError("patched binary lost the source-hash record")
+    if want_hashes is not None and got_hashes is not None:
+        for index, (want_hash, got_hash) in enumerate(zip(want_hashes, got_hashes)):
+            expected_hash = 0 if index in edited else want_hash
+            if got_hash != expected_hash:
+                raise ContainerError(
+                    f"module {index}'s source-hash word is {got_hash:#x} where "
+                    f"{expected_hash:#x} was meant; JSC would key "
+                    + (
+                        "our edited source under the pristine text's hash"
+                        if index in edited
+                        else "this module's source under the wrong hash"
+                    )
+                )
     # Read back off the written file, not asserted in memory. Bun runs a
     # module's bytecode in preference to its source, so any left on a module we
     # edited would run the *unpatched* code while every byte comparison above
@@ -187,6 +239,22 @@ def verify(
                 f"patched binary still carries {left:,} bytes of bytecode on "
                 f"edited module {index}, which would run instead of our edits"
             )
+    # Every *kept* bytecode payload must also still sit on its pristine
+    # alignment phase (`blobmod.ALIGN`, docs/INTERNALS.md): Bun 1.4.1
+    # deserializes bytecode in place and misalignment is a launch-time crash
+    # that every byte comparison above would wave through -- the payloads are
+    # identical, just parked one byte off. `rebuild` preserves the phase by
+    # construction; this is the tripwire for the rebuild edit that stops it.
+    for module in pristine.modules:
+        off, length = module.ranges["bytecode"]
+        if length and module.index not in edited and module.index in by_index:
+            got_off = by_index[module.index].ranges["bytecode"][0]
+            if got_off % blobmod.ALIGN != off % blobmod.ALIGN:
+                raise ContainerError(
+                    f"module {module.index}'s bytecode moved off its alignment "
+                    "phase; Bun deserializes it in place and would refuse or "
+                    "crash"
+                )
     # The size half of the tripwire: dropping the edited modules' bytecode should
     # leave the file smaller by about that much. The ELF path rewrites in place
     # and reclaims it (measured: reclaimed == bytecode to within the manifest's
