@@ -138,13 +138,18 @@ def _delta(event: str, setter: str, helper: str) -> str:
 _CONVERSATION = ("conversationId", "messages")
 _STREAMING = "streamingThinking"
 _SETTER = "onStreamingThinking"
+#: The stream store's own name for the tool-use half of its snapshot -- what
+#: its `_publish` calls write and what every consumer destructures. It is the
+#: one name two identities rest on: the transcript renderer's signature, and
+#: the snapshot pattern `_state_in_scope` proves the store's read by.
+_TOOL_USES = "streamingToolUses"
 #: What the transcript renderer's signature *is*: the conversation it draws and
 #: the streaming tool-uses the extras memo computes over. A third conjunct
 #: (`showAllInTranscript`) stood here as find-anchor, identity and insertion
 #: point in one -- the exact triple role `agentDefinitions` held in
 #: `prop-threading` when 2.1.235 retired it -- and discriminates nothing on any
 #: build in the corpus: the pair already names the same one renderer.
-_TRANSCRIPT_SIGNATURE = ("messages", "streamingToolUses")
+_TRANSCRIPT_SIGNATURE = ("messages", _TOOL_USES)
 #: Our local for the threaded state, wherever one has to be minted: the
 #: renderer signatures `transcript-signature` extends, and the store-snapshot
 #: pattern `prop-threading` extends on builds that keep the state in a store.
@@ -245,78 +250,76 @@ def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
     two conversation renders sit in *different* top-level components, only one
     of which declares the state, and threading a single bundle-wide answer into
     both put an out-of-scope identifier into a shipped binary. It parses, so no
-    gate could see it; it throws when that component renders.
+    gate could see it; it throws when that component renders. The binding
+    threaded has to be one this render can *see* (:func:`js.visible`), which a
+    nested function's is not and a block's own is not either.
 
-    The state is identified by its setter: the scope that holds live thinking
-    is the scope that hands ``onStreamingThinking`` to the reducer. The setter
-    is asked of the whole subtree on purpose -- a scope may hand it from inside
-    a callback, and that says nothing about where the state lives -- while the
-    binding threaded has to be one this render can *see* (:func:`js.visible`),
-    which a nested function's is not and a block's own is not either.
+    The state has two upstream shapes, and each is proven by the only name it
+    has:
 
-    What the handed setter *is* has two upstream spellings, and each names the
-    state its own way:
-
-    - **A bare identifier** -- a ``useState`` setter, every build through
-      2.1.235. The state is the array pattern that binds it: the pair whose
-      second name is the setter this scope hands the reducer *is* the live
-      thinking state, whatever produced it (``useState(null)`` and
-      ``useState(void 0)`` are the same state, so the initialiser is never
-      asked).
-    - **A member read on a store** -- 2.1.236 moved the state into an external
-      stream store (``subscribe``/``getSnapshot``/``_publish``) and hands the
-      reducer ``<store>.setStreamingThinking``. The scope reads that store back
-      by destructuring the hook call it hands the same store to
-      (``{streamingToolUses:…}=useX(<store>)``), so the state is that pattern's
-      own ``streamingThinking`` binding: upstream's, the day it takes one --
-      the goal achieved, same as every other judged-on-achievement step -- and
-      until then ours, inserted into the pattern. The pattern is proven the
-      snapshot read by the store expression itself: the call's *only* argument
-      is the very expression the setter was read off, with one answer or none
-      (:func:`js.only`). Sole argument is deliberate -- a second argument is a
-      selector whose result is no longer the snapshot, and extending a pattern
-      of unknowable provenance binds ``undefined`` with every count green, so
-      that shape is refused loudly instead.
+    - **A ``useState`` pair** -- every build through 2.1.235. Nothing names the
+      pair itself (``useState(null)`` and ``useState(void 0)`` are the same
+      state, so the initialiser is never asked); what names it is its *setter*,
+      handed to the reducer as ``onStreamingThinking:`` in this very scope. The
+      state is the array pattern whose second binding is a handed setter. The
+      handing is asked of the whole subtree on purpose -- a scope may hand it
+      from inside a callback, and that says nothing about where the state
+      lives.
+    - **A store snapshot** -- 2.1.236 moved the state into an external stream
+      store (``subscribe``/``getSnapshot``/``_publish``), which a component
+      reads back by destructuring a hook call
+      (``{streamingToolUses:…}=useX(<store>)``). That pattern *does* name
+      itself: it binds the store's own ``streamingToolUses`` field -- the name
+      the store publishes and the transcript signature already rests on -- and
+      that membership is its identity, the same question every props bag here
+      answers. Which scope hands the setter is deliberately no part of it:
+      through 2.1.245 the same component handed ``<store>.setStreamingThinking``
+      to the reducer, and 2.1.246 moved the handing into the engine
+      (``this.stream.setStreamingThinking``) without moving the state -- an
+      identity resting on the handing read four renders that plainly draw the
+      conversation as having none in scope. The handed setter was
+      `agentDefinitions` again: a neighbour standing in for the thing itself,
+      one more fact upstream had to keep. The state is the pattern's own
+      ``streamingThinking`` binding: upstream's, the day it takes one -- the
+      goal achieved, same as every other judged-on-achievement step -- and
+      until then ours, inserted into the pattern. The pattern is proven a
+      *produced* snapshot by its value being a call with exactly one argument;
+      sole argument is deliberate -- a second is a selector whose result is no
+      longer the snapshot, and extending a pattern of unknowable provenance
+      binds ``undefined`` with every count green, so that shape is refused
+      loudly instead (one answer or none, :func:`js.only`).
     """
     scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
     while scope is not None and not _outermost(scope):
-        handed = [
-            value
+        setters = {
+            js.text(js.binding(value))
             for node in js.every(
                 scope,
                 lambda n: n.type == "property_identifier" and js.text(n) == _SETTER,
             )
             if (pair := js.named(node)) is not None
             and (value := pair.child_by_field_name("value")) is not None
-        ]
-        setters = {js.text(js.binding(value)) for value in handed}
+        }
+        snapshots: dict[int, js.Node] = {}
         for declarator in js.every(scope, js.of_type("variable_declarator")):
             name = declarator.child_by_field_name("name")
-            if name is None or name.type != "array_pattern":
+            if name is None or not js.visible(declarator, site):
                 continue
-            if not js.visible(declarator, site):
+            if name.type == "array_pattern":
+                bound = [js.text(child) for child in name.named_children]
+                if len(bound) == 2 and bound[1] in setters:
+                    return bound[0], None
                 continue
-            bound = [js.text(child) for child in name.named_children]
-            if len(bound) == 2 and bound[1] in setters:
-                return bound[0], None
-        snapshots: dict[int, js.Node] = {}
-        for setter in (v for v in handed if v.type == "member_expression"):
-            store = js.text(js.receiver(setter))
-            for declarator in js.every(scope, js.of_type("variable_declarator")):
-                name = declarator.child_by_field_name("name")
-                value = declarator.child_by_field_name("value")
-                if name is None or name.type != "object_pattern":
-                    continue
-                if not js.children(name) or value is None:
-                    continue
-                if value.type != "call_expression":
-                    continue
-                taken = js.arguments(value)
-                if len(taken) != 1 or js.text(taken[0]) != store:
-                    continue
-                if not js.visible(declarator, site):
-                    continue
-                snapshots[declarator.id] = name
+            value = declarator.child_by_field_name("value")
+            if name.type != "object_pattern" or not js.children(name):
+                continue
+            if value is None or value.type != "call_expression":
+                continue
+            if len(js.arguments(value)) != 1:
+                continue
+            if _TOOL_USES not in js.props(name):
+                continue
+            snapshots[declarator.id] = name
         pattern = js.only(
             list(snapshots.values()), "snapshot reads of the live-thinking store"
         )
@@ -675,7 +678,6 @@ def _step_transcript_signature(source: Source, outcome: Outcome) -> Source:
 
 _CONTENT_BLOCK = "contentBlock"
 _CONTENT = "content"
-_UUID = "uuid"
 _FLAT_MAP = "flatMap"
 
 
@@ -699,13 +701,22 @@ def _wraps_block(call: js.Node | None) -> bool:
     -- asked as the object and the read it is. Asked as the text
     ``.contentBlock]}`` it was a claim about how the array *closes*, so one
     sibling property beside `content` read as the whole computation being gone
-    and took live thinking with it.
+    and took live thinking with it. The element is asked by membership among
+    its possible values (:func:`js.values`), never asked to *be* the read:
+    2.1.246 minted stable ids for streamed blocks and the element became
+    ``ce?{...S.contentBlock,id:V}:S.contentBlock`` -- the same wrap behind an
+    id choice, which the exact-node question read as no wrap at all and took
+    nine required steps to zero, with every anchor count standing.
     """
     arguments = js.arguments(call)
     if call is None or len(arguments) != 1 or arguments[0].type != "object":
         return False
     content = js.props(arguments[0]).get(_CONTENT)
-    return any(js.reads(element, _CONTENT_BLOCK) for element in js.elements(content))
+    return any(
+        js.reads(value, _CONTENT_BLOCK)
+        for element in js.elements(content)
+        for value in js.values(element)
+    )
 
 
 def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
@@ -713,10 +724,10 @@ def _flatmap_extras(source: Source) -> tuple[js.Node, js.Node] | None:
 
     Identified by what it computes: a memo hook over a ``flatMap`` that builds
     one virtual message per streaming content block. Everything the replacement
-    needs -- the memo's own callee, the array it maps, the helper that builds a
-    message, the one that stamps its uuid, the one that normalises a list -- is
-    read out of that computation rather than matched by name, because every one
-    of those names is minified. The memo hook is one of them: the monolith
+    needs -- the memo's own callee, the array it maps, the callback it runs,
+    the builder the reducer's own splices will need, the normaliser the
+    thinking half re-spells -- is read out of that computation rather than
+    matched by name, because every one of those names is minified. The memo hook is one of them: the monolith
     reaches it as ``<React>.useMemo(...)`` (the property name survives), but a
     code-split module imports it under a local (``import{useMemo as te}`` ->
     ``te(...)``), so keying on ``useMemo`` read a build that memoizes exactly the
@@ -843,16 +854,16 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
     memo_fn = js.text(memo.child_by_field_name("function"))
     tool_uses = js.text(js.receiver(flat.child_by_field_name("function")))
     callback = js.arguments(flat)[0]
-    taken = js.positional(callback)
-    if var is None or not taken:
+    if var is None:
         step.note("the streaming-extras memo is out of reach of the live state")
         return source
-    entry = js.text(js.binding(taken[0]))
     block = js.body(callback)
 
     # What the callback builds, not what it declares first: an unrelated `let`
     # ahead of this one answered for it and the step raised on a number where a
-    # call was expected.
+    # call was expected. The rewrite below never re-spells this call -- the
+    # callback carries it -- but the reducer's own splices build virtual
+    # messages with the same helper, and this is where it is discovered.
     built = js.only(
         js.every(
             block,
@@ -875,31 +886,20 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
         step.note("the virtual-message builder call has no callee")
         return source
     helper = js.text(helper_node)
-    stamp = js.first(
-        block,
-        lambda n: (
-            n.type == "assignment_expression"
-            and js.reads(n.child_by_field_name("left"), _UUID)
-            and js.text(js.receiver(n.child_by_field_name("left"))) == message
-        ),
-        scoped=True,
-    )
     # The call that turns the built message into a renderable list -- named by
     # what it is handed, since every helper name here is minified.
     # The call handed exactly `[<message>]` -- asked as the array it is (one
     # element, the built-message local), not as the text `[X]`, which asserted
-    # the minifier put no space inside the brackets.
+    # the minifier put no space inside the brackets. The thinking half below
+    # re-spells this one call, so it is the one name still read out.
     normalize = js.first(
         block,
         lambda n: n.type == "call_expression" and _handed_only(n, message),
         scoped=True,
     )
-    if stamp is None or normalize is None:
-        step.note("the built message is not stamped and normalised as it was")
+    if normalize is None:
+        step.note("the built message is not normalised as it was")
         return source
-    uuid_helper = js.text(
-        (stamp.child_by_field_name("right") or stamp).child_by_field_name("function")
-    )
     normalize_fn = js.text(normalize.child_by_field_name("function"))
 
     found.create_message_helper = helper
@@ -907,23 +907,34 @@ def _step_inline_extras(source: Source, found: Discovery, outcome: Outcome) -> S
     found.helper_module = source.module_index(helper_node)
     step.candidates += 1
     step.applied += 1
+    # The per-entry computation is upstream's callback *reused verbatim* --
+    # invoked with the same three arguments `flatMap` hands it -- never
+    # rebuilt from the names discovered above: the rebuilt copy spelled the
+    # uuid stamp as it stood, and 2.1.246 grew id-minting inside the callback
+    # (`{id,minted}` per block, the stamp now a choice), which a re-spell
+    # would have silently shed. What upstream does per entry is upstream's;
+    # this memo only owes the interleave. The dependencies are reused the
+    # same way, each spread rather than transcribed -- an array literal and a
+    # hoisted variable spread alike -- with the live state appended so the
+    # memo recomputes as thinking streams.
+    wrap = js.text(callback)
+    deps = "".join(f"...{js.text(argument)}," for argument in js.arguments(memo)[1:])
     return source.apply(
         [
             Edit.replace(
                 memo,
                 f"{memo_fn}(()=>{{"
-                f"let __cc_streamingToolUseExtras={tool_uses}.map(({entry})=>{{"
-                f"let {message}={helper}({{content:[{entry}.{_CONTENT_BLOCK}]}});"
-                f"return {message}.{_UUID}={uuid_helper}({entry}.{_CONTENT_BLOCK}.id,0),"
-                f"{{index:{entry}.index??9007199254740991,"
-                f"messages:{normalize_fn}([{message}])}}}}),"
+                f"let __cc_streamingToolUseExtras={tool_uses}.map("
+                f"(__cc_entry,__cc_index,__cc_entries)=>({{"
+                f"index:__cc_entry.index??9007199254740991,"
+                f"messages:({wrap})(__cc_entry,__cc_index,__cc_entries)}})),"
                 f"__cc_streamingThinkingExtras=({var}?.messages??[])"
                 f".map((__cc_entry,__cc_index)=>({{"
                 f"index:__cc_entry.index??9007199254740991+__cc_index,"
                 f"messages:{normalize_fn}([__cc_entry.message??__cc_entry])}}));"
                 f"return[...__cc_streamingToolUseExtras,...__cc_streamingThinkingExtras]"
                 f".sort((__cc_a,__cc_b)=>__cc_a.index===__cc_b.index?0:__cc_a.index-__cc_b.index)"
-                f".flatMap((__cc_entry)=>__cc_entry.messages)}},[{tool_uses},{var}])",
+                f".flatMap((__cc_entry)=>__cc_entry.messages)}},[{deps}{var}])",
             )
         ]
     )
