@@ -151,9 +151,14 @@ _TOOL_USES = "streamingToolUses"
 #: build in the corpus: the pair already names the same one renderer.
 _TRANSCRIPT_SIGNATURE = ("messages", _TOOL_USES)
 #: Our local for the threaded state, wherever one has to be minted: the
-#: renderer signatures `transcript-signature` extends, and the store-snapshot
-#: pattern `prop-threading` extends on builds that keep the state in a store.
+#: renderer signatures `transcript-signature` extends, and the live wrapper's
+#: own subscription on builds that keep the state in a store.
 _INJECTED = "__cc_streamingThinking"
+#: The store handle the live wrapper reads, one prop of ours beside upstream's.
+_STORE_PROP = "__cc_stream"
+#: The component a store-era render is rerouted through: the subscription the
+#: build makes for tool uses, made once more for thinking.
+_WRAPPER = "__cc_LiveConversation"
 
 
 def _outermost(scope: js.Node) -> bool:
@@ -239,55 +244,242 @@ def _bound_in_scope(site: js.Node, prop: str) -> str | None:
     return None
 
 
-def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
-    """The live-thinking state at this render: the name to thread, and the
-    snapshot pattern to extend first when the state has to be read out of a
-    store rather than a binding upstream already made.
+def _bound_names(pattern: js.Node | None) -> set[str]:
+    """Every name a binding pattern binds -- and none it merely references.
 
-    Resolved from the site outwards, so what is threaded is a variable actually
-    in scope where it is threaded -- the one thing the old matcher named as
-    owed and could not discharge without a parse. It mattered: on 2.1.232 the
+    A pattern's *keys* rename, its *defaults* are read, and only what lands on
+    the binding side is a name the scope owns; walking every identifier in the
+    subtree would claim both halves and refuse wraps over names nobody binds.
+    """
+    if pattern is None:
+        return set()
+    if pattern.type in ("identifier", "shorthand_property_identifier_pattern"):
+        return {js.text(pattern)}
+    if pattern.type == "pair_pattern":
+        return _bound_names(pattern.child_by_field_name("value"))
+    if pattern.type in ("assignment_pattern", "object_assignment_pattern"):
+        return _bound_names(pattern.child_by_field_name("left"))
+    if pattern.type in (
+        "object_pattern",
+        "array_pattern",
+        "formal_parameters",
+        "rest_pattern",
+    ):
+        found: set[str] = set()
+        for child in js.children(pattern):
+            found |= _bound_names(child)
+        return found
+    return set()
+
+
+def _binds(scope: js.Node, name: str) -> bool:
+    """Does this scope bind that spelling, by any binding form it has?
+
+    One home for the question two callers ask -- :func:`_unshadowed` to refuse
+    a wrap, :func:`_module_function` to stop a resolve -- because a binding
+    form the list misses is a hole in both at once. The forms are the
+    grammar's own: the scope's parameters, its declarators, and the
+    declarations that bind by existing -- a function's name, a class's, a
+    catch clause's parameter. The first version listed parameters, declarators
+    and function declarations, and independent review demonstrated the gap the
+    same day: a catch parameter and a class name are bindings too, and a
+    wrapper re-spelling either would parse, verify, and throw at first render.
+    """
+    for holder in (
+        scope.child_by_field_name("parameters"),
+        scope.child_by_field_name("parameter"),
+    ):
+        if name in _bound_names(holder):
+            return True
+    for declarator in js.every(scope, js.of_type("variable_declarator"), scoped=True):
+        if name in _bound_names(declarator.child_by_field_name("name")):
+            return True
+    for declaration in js.every(
+        scope,
+        js.of_type(
+            "function_declaration",
+            "generator_function_declaration",
+            "class_declaration",
+        ),
+        scoped=True,
+    ):
+        bound = declaration.child_by_field_name("name")
+        if bound is not None and js.text(bound) == name:
+            return True
+    for clause in js.every(scope, js.of_type("catch_clause"), scoped=True):
+        if name in _bound_names(clause.child_by_field_name("parameter")):
+            return True
+    return False
+
+
+def _module_function(source: Source, local: js.Node) -> js.Node | None:
+    """The function this spelling means *at this use*, resolved lexically.
+
+    A selector is usually hoisted (``function wv(sL){return
+    sL.streamingToolUses}``) and its call site carries only the minified name,
+    which is a spelling until its scope is said: in the monolith the same two
+    letters bind functions in a hundred unrelated scopes. So the walk out from
+    the use asks each scope in turn, and the innermost binding decides: a
+    function bound there is the answer, and any *other* binding of the name
+    blocks the resolve -- the engine would resolve the spelling to that
+    binding, not to a function further out, and the first version skipped
+    non-function bindings while claiming the engine's answer. Only when no
+    enclosing scope binds the name at all does the single module-scope
+    function answer from afar; anything still ambiguous answers ``None``.
+    This is a predicate's resolver, not a locator: an unresolvable name here
+    just means "not a provable selector", and the loudness belongs to the
+    step whose production then fails to resolve.
+    """
+    name = js.text(local)
+    owned: dict[int, js.Node] = {}
+    module_scope: dict[int, js.Node] = {}
+    for node in source.find_local(local, name):
+        parent = node.parent
+        if parent is None:
+            continue
+        fn = None
+        if (
+            parent.type == "function_declaration"
+            and parent.child_by_field_name("name") == node
+        ):
+            fn = parent
+        elif (
+            parent.type == "variable_declarator"
+            and parent.child_by_field_name("name") == node
+            and (value := parent.child_by_field_name("value")) is not None
+            and value.type in js.FUNCTIONS
+        ):
+            fn = value
+        if fn is None:
+            continue
+        owner = js.climb(fn.parent, lambda n: n.type in js.FUNCTIONS)
+        if owner is None or _outermost(owner):
+            module_scope[fn.id] = fn
+        else:
+            owned[owner.id] = fn
+    scope = js.climb(local, lambda n: n.type in js.FUNCTIONS)
+    while scope is not None and not _outermost(scope):
+        if scope.id in owned:
+            return owned[scope.id]
+        if _binds(scope, name):
+            return None
+        scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+    found = list(module_scope.values())
+    return found[0] if len(found) == 1 else None
+
+
+def _selects(source: Source, argument: js.Node, field: str) -> bool:
+    """Is this argument a *selector* for that snapshot field?
+
+    A selector is a function answering the field read off its own parameter --
+    2.1.247's ``function wv(sL){return sL.streamingToolUses}``, handed to the
+    store hook beside the store. The field name is the identity, in the one
+    grammar position a per-field read gives it; whether the function is inline
+    or hoisted behind a name is spelling (:func:`_module_function`), and the
+    answer routes through :func:`js.values` like every other answer here.
+    """
+    fn = argument
+    if argument.type == "identifier":
+        resolved = _module_function(source, argument)
+        if resolved is None:
+            return False
+        fn = resolved
+    if fn.type not in js.FUNCTIONS:
+        return False
+    taken = [js.binding(parameter) for parameter in js.positional(fn)]
+    if len(taken) != 1:
+        return False
+    param = js.text(taken[0])
+    block = js.body(fn)
+    if block is None:
+        return False
+    answers = (
+        [block]
+        if block.type != "statement_block"
+        else [
+            expression
+            for statement in js.every(fn, js.of_type("return_statement"), scoped=True)
+            for expression in js.children(statement)
+        ]
+    )
+    return any(
+        js.reads(value, field) and js.text(js.receiver(value)) == param
+        for answer in answers
+        for value in js.values(answer)
+    )
+
+
+@dataclass(slots=True)
+class _PairState:
+    """The component-owned state (through 2.1.235): thread its value."""
+
+    state: str
+
+
+@dataclass(slots=True)
+class _StoreRead:
+    """A store-era production: wrap the render with a subscription through it.
+
+    ``selected`` records whether the spelling itself demonstrated the hook
+    taking a selector -- what licenses :func:`_wrap` to skip its arity check.
+    """
+
+    production: js.Node
+    store: js.Node
+    selected: bool
+
+
+def _state_in_scope(source: Source, site: js.Node) -> _PairState | _StoreRead | None:
+    """The live-thinking state at this render: how this build's own scope
+    reaches the live stream data, resolved from the site outwards.
+
+    Outwards, so what is spliced is valid where it is spliced: on 2.1.232 the
     two conversation renders sit in *different* top-level components, only one
-    of which declares the state, and threading a single bundle-wide answer into
-    both put an out-of-scope identifier into a shipped binary. It parses, so no
-    gate could see it; it throws when that component renders. The binding
-    threaded has to be one this render can *see* (:func:`js.visible`), which a
-    nested function's is not and a block's own is not either.
+    of which declares the state, and a single bundle-wide answer put an
+    out-of-scope identifier into a shipped binary -- it parses, so no gate
+    could see it, and it throws when that component renders. A binding used
+    here has to be one this render can *see* (:func:`js.visible`).
 
-    The state has two upstream shapes, and each is proven by the only name it
-    has:
+    The state has two semantic homes, and each is identified by the only name
+    it has:
 
-    - **A ``useState`` pair** -- every build through 2.1.235. Nothing names the
-      pair itself (``useState(null)`` and ``useState(void 0)`` are the same
-      state, so the initialiser is never asked); what names it is its *setter*,
-      handed to the reducer as ``onStreamingThinking:`` in this very scope. The
-      state is the array pattern whose second binding is a handed setter. The
-      handing is asked of the whole subtree on purpose -- a scope may hand it
-      from inside a callback, and that says nothing about where the state
-      lives.
-    - **A store snapshot** -- 2.1.236 moved the state into an external stream
-      store (``subscribe``/``getSnapshot``/``_publish``), which a component
-      reads back by destructuring a hook call
-      (``{streamingToolUses:…}=useX(<store>)``). That pattern *does* name
-      itself: it binds the store's own ``streamingToolUses`` field -- the name
-      the store publishes and the transcript signature already rests on -- and
-      that membership is its identity, the same question every props bag here
-      answers. Which scope hands the setter is deliberately no part of it:
-      through 2.1.245 the same component handed ``<store>.setStreamingThinking``
-      to the reducer, and 2.1.246 moved the handing into the engine
-      (``this.stream.setStreamingThinking``) without moving the state -- an
-      identity resting on the handing read four renders that plainly draw the
-      conversation as having none in scope. The handed setter was
-      `agentDefinitions` again: a neighbour standing in for the thing itself,
-      one more fact upstream had to keep. The state is the pattern's own
-      ``streamingThinking`` binding: upstream's, the day it takes one -- the
-      goal achieved, same as every other judged-on-achievement step -- and
-      until then ours, inserted into the pattern. The pattern is proven a
-      *produced* snapshot by its value being a call with exactly one argument;
-      sole argument is deliberate -- a second is a selector whose result is no
-      longer the snapshot, and extending a pattern of unknowable provenance
-      binds ``undefined`` with every count green, so that shape is refused
-      loudly instead (one answer or none, :func:`js.only`).
+    - **The component's own pair** -- every build through 2.1.235. Nothing
+      names the pair itself (``useState(null)`` and ``useState(void 0)`` are
+      the same state, so the initialiser is never asked); what names it is its
+      *setter*, handed to the reducer as ``onStreamingThinking:`` in this very
+      scope. The state is the array pattern whose second binding is a handed
+      setter, and the handing is asked of the whole subtree on purpose -- a
+      scope may hand it from inside a callback, and that says nothing about
+      where the state lives. Answered as a :class:`_PairState`: the state is
+      a binding of this scope, and threading its value is the whole rewrite.
+    - **The stream store** -- 2.1.236 on. Here the question this function used
+      to ask -- *which idiom holds the state* -- is retired, because it broke
+      on every answer it ever gave: the whole-snapshot destructure it knew
+      (``{streamingToolUses:…}=useX(<store>)``, 2.1.236-2.1.246) was retired
+      by 2.1.247's per-field selector reads (``et(<store>,wv)``), the handing
+      it once rested on moved into the engine on 2.1.246, and each repair
+      bought exactly one build. Those are spellings of React's data-access
+      fashion, the busiest surface upstream owns, and a matcher enumerating
+      them is a whitelist against a fashion. What survives every spelling is
+      the **twin**: live tool-uses ride the same store, and that feature ships
+      working, so somewhere in this scope upstream reads ``streamingToolUses``
+      off the store -- as a snapshot pattern's own key, or through a selector
+      handed to the hook beside the store. That read is the **production**,
+      answered as a :class:`_StoreRead`: the hook and the store, upstream's
+      own, read out of whatever spelling this build uses and reused verbatim
+      by :func:`_wrap` -- the same
+      reuse-their-expression rule `org-label` and the extras memo follow,
+      because what is copied cannot drift from what it was copied from.
+
+    A production is a declarator this site can see whose value is one call
+    among its possible values (:func:`js.values` -- 2.1.247 arrived with a
+    ``??`` fallback on the read, and the exact-node question would have read
+    it as no call at all), taking the store alone (the destructure spelling:
+    the pattern names the field as its own key, sole argument since a second
+    would make the pattern something other than the snapshot) or the store
+    beside exactly one selector for the field (the selector spelling). One
+    answer or none per scope (:func:`js.only`): two reads of the store is a
+    cardinality change to be told about, not a first to win.
     """
     scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
     while scope is not None and not _outermost(scope):
@@ -300,7 +492,7 @@ def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
             if (pair := js.named(node)) is not None
             and (value := pair.child_by_field_name("value")) is not None
         }
-        snapshots: dict[int, js.Node] = {}
+        productions: dict[int, _StoreRead] = {}
         for declarator in js.every(scope, js.of_type("variable_declarator")):
             name = declarator.child_by_field_name("name")
             if name is None or not js.visible(declarator, site):
@@ -308,49 +500,209 @@ def _state_in_scope(site: js.Node) -> tuple[str, js.Node | None] | None:
             if name.type == "array_pattern":
                 bound = [js.text(child) for child in name.named_children]
                 if len(bound) == 2 and bound[1] in setters:
-                    return bound[0], None
+                    return _PairState(bound[0])
                 continue
-            value = declarator.child_by_field_name("value")
-            if name.type != "object_pattern" or not js.children(name):
+            calls = [
+                v
+                for v in js.values(declarator.child_by_field_name("value"))
+                if v.type == "call_expression"
+            ]
+            if len(calls) != 1:
                 continue
-            if value is None or value.type != "call_expression":
-                continue
-            if len(js.arguments(value)) != 1:
-                continue
-            if _TOOL_USES not in js.props(name):
-                continue
-            snapshots[declarator.id] = name
-        pattern = js.only(
-            list(snapshots.values()), "snapshot reads of the live-thinking store"
-        )
-        if pattern is not None:
-            carried = js.props(pattern)
-            if _STREAMING in carried:
-                return js.text(js.binding(carried[_STREAMING])), None
-            return _INJECTED, pattern
+            production = calls[0]
+            args = js.arguments(production)
+            if name.type == "object_pattern" and js.children(name):
+                if _TOOL_USES not in js.props(name) or len(args) != 1:
+                    continue
+                productions[declarator.id] = _StoreRead(production, args[0], False)
+            elif name.type == "identifier" and len(args) == 2:
+                chosen = [a for a in args if _selects(source, a, _TOOL_USES)]
+                if len(chosen) == 1:
+                    store = args[0] if chosen[0] == args[1] else args[1]
+                    productions[declarator.id] = _StoreRead(production, store, True)
+        found = js.only(list(productions.values()), "reads of the live stream store")
+        if found is not None:
+            return found
         scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
     return None
+
+
+def _module_statement(node: js.Node) -> js.Node:
+    """The module-scope statement this node is part of -- where a declaration
+    meant for the whole module goes.
+
+    Module scope is a fact about the build, not a fixed depth: a split
+    module's ``program`` is the scope, and the monolith's is the wrapper
+    IIFE's own body (:func:`_outermost` -- inserting before the IIFE itself
+    would put the declaration outside every binding it needs).
+    """
+    statement = node
+    while statement.parent is not None:
+        parent = statement.parent
+        if parent.type == "program":
+            return statement
+        if parent.type == "statement_block":
+            owner = js.climb(parent, lambda n: n.type in js.FUNCTIONS)
+            if owner is not None and _outermost(owner):
+                return statement
+        statement = parent
+    return statement
+
+
+def _root(expression: js.Node) -> js.Node | None:
+    """The identifier an expression resolves through -- ``X`` in
+    ``X.createElement`` -- or nothing when there is no lone name to check."""
+    node: js.Node | None = expression
+    while node is not None and node.type in (
+        "member_expression",
+        "subscript_expression",
+        "parenthesized_expression",
+    ):
+        node = node.child_by_field_name("object") or next(iter(js.children(node)), None)
+    return node if node is not None and node.type == "identifier" else None
+
+
+def _unshadowed(name: str, site: js.Node, *, above: js.Node | None = None) -> bool:
+    """Does this spelling keep its meaning from the site up to ``above``?
+
+    The live wrapper is a module-scope function that re-spells names it read
+    off the render -- the JSX callee, the component, the hook -- and a
+    component-scope binding of the same spelling between the two would make
+    the wrapper name something else entirely: it parses, verifies, and throws
+    when the wrapper first renders, the 2.1.232 class of damage. So the name
+    is walked from the site outwards, and any scope that binds it
+    (:func:`_binds`, every binding form at once) refuses the wrap loudly
+    rather than shipping it. With no ``above`` the walk runs to module scope,
+    for a name the wrapper re-spells there; the store expression's spellings
+    name ``above`` instead -- the scope upstream wrote them in -- because a
+    spelling copied *down* into the bag only has to mean at the bag what it
+    meant where it was copied from.
+    """
+    scope = js.climb(site, lambda n: n.type in js.FUNCTIONS)
+    while scope is not None and not _outermost(scope):
+        if above is not None and scope.id == above.id:
+            return True
+        if _binds(scope, name):
+            return False
+        scope = js.climb(scope.parent, lambda n: n.type in js.FUNCTIONS)
+    return True
+
+
+def _wrap(
+    source: Source, bag: js.Node, resolved: _StoreRead, serial: int
+) -> list[Edit] | str:
+    """Reroute this render through a component of ours that subscribes itself.
+
+    Threading the state's *value* into the props bag was sound while the
+    resolved render was live-computed, and 2.1.247 retired that render: the
+    surviving one is react-compiler cached behind a fixed slot-test chain
+    (``if(Yr[15]!==ph||…)Du=r(Ih,{…})``), and a prop the compiler never saw is
+    a prop no slot tests -- the element is reused, the child bails out on
+    identity, and a perfectly threaded value renders exactly once. The
+    compiler's cache is a representation this patch refuses to model; what
+    needs no modelling is React's own contract that a component re-renders
+    from its own subscription. So the render is rerouted through a wrapper
+    that makes the subscription this scope stopped making: it reads the store
+    through the *production's own hook* -- whose optional selector parameter
+    is upstream's since the store era began (2.1.236's hook and 2.1.247's are
+    the same two-parameter function, measured) -- with a selector of ours in
+    upstream's own per-field shape, and hands the component the state under
+    the prop every other step already speaks. The transcript renderer's own
+    memo comparator compares unknown props by identity (and has since
+    2.1.210), so a fresh value re-renders it and a quiet one does not, cached
+    parent or not.
+
+    Everything the wrapper spells is read off the site -- the JSX callee, the
+    component, the hook -- so the one thing owed is that those names mean at
+    module scope what they mean at the render (:func:`_unshadowed`); a
+    shadowed name refuses the wrap loudly, and the answer is the *reason*, so
+    the step's note names what refused rather than one sentence covering
+    three facts. The store expression is not module-scope and never has to
+    be: it rides into the props bag (``__cc_stream:``), evaluated exactly
+    where the old threading evaluated its state, its spellings walked the
+    same way but bounded at the scope upstream wrote them in, and the bag
+    being cached is harmless for it -- the store's identity is as fresh as
+    the conversation the cache already tests. A bag that is not a JSX props
+    argument (the render call's second argument) is refused the same way:
+    rerouting a call this step misread would be rubble, not a wrap.
+
+    Where the destructure spelling leaves the selector undemonstrated, an
+    in-module hook is held to it -- resolved and required to declare a second
+    parameter -- because a hook that ignores the argument would thread the
+    whole snapshot as the state with every count green, the one silent
+    failure this rewrite could otherwise add. A hook defined elsewhere is
+    accepted on the measurement above: following the import hop would mean
+    cross-module function resolution built for a build that has never
+    shipped, and that residue -- a future destructure build importing a
+    selectorless hook -- is accepted here by name rather than guessed at.
+    """
+    handed = bag.parent
+    render = handed.parent if handed is not None else None
+    if render is None:
+        return "the conversation bag is not a component call's props"
+    args = js.arguments(render)
+    if len(args) < 2 or args[1] != bag:
+        return "the conversation bag is not a component call's props"
+    component = args[0]
+    jsx = render.child_by_field_name("function")
+    hook = resolved.production.child_by_field_name("function")
+    if jsx is None or hook is None:
+        return "the conversation bag is not a component call's props"
+    for expression in (jsx, component, hook):
+        root = _root(expression)
+        if root is None or not _unshadowed(js.text(root), bag):
+            return "a name the live wrapper needs is not the render's to use"
+    origin = js.climb(resolved.production, lambda n: n.type in js.FUNCTIONS)
+    references = {
+        js.text(node) for node in js.every(resolved.store, js.of_type("identifier"))
+    }
+    if resolved.store.type == "identifier":
+        references.add(js.text(resolved.store))
+    if origin is not None and any(
+        not _unshadowed(reference, bag, above=origin) for reference in references
+    ):
+        return "the store's spelling does not reach the render"
+    if not resolved.selected and hook.type == "identifier":
+        defined = _module_function(source, hook)
+        if defined is not None and len(js.positional(defined)) < 2:
+            return "the store hook takes no selector on this build"
+    name = _WRAPPER if serial == 0 else f"{_WRAPPER}{serial + 1}"
+    declaration = (
+        f"function {name}(__cc_props){{"
+        f"let {_INJECTED}={js.text(hook)}(__cc_props.{_STORE_PROP},"
+        f"(__cc_snapshot)=>__cc_snapshot.{_STREAMING});"
+        f"return {js.text(jsx)}({js.text(component)},"
+        f"{{...__cc_props,{_STREAMING}:{_INJECTED}}})}}"
+    )
+    return [
+        Edit.before(_module_statement(render), declaration),
+        Edit.replace(component, name),
+        Edit.before(
+            js.entry(js.props(bag)[_CONVERSATION[0]]),
+            f"{_STORE_PROP}:{js.text(resolved.store)},",
+        ),
+    ]
 
 
 def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
     """Pass the live-thinking state into the renderers that need it."""
     step = outcome.step("prop-threading")
-    edits = []
+    edits: list[Edit] = []
     renders = _conversation_renders(source)
-    # The durable witness behind a snapshot insertion: the field it binds is
-    # one the bundle's own objects still name (the store's snapshot initialiser
-    # and its publish call, on 2.1.236). Extending the pattern is a rewrite the
-    # matcher can only vouch for itself, and a store that renames the field
-    # would leave it threading `undefined` with every count green -- the same
+    # The durable witness behind a store read: the field the wrapper selects
+    # is one the bundle's own objects still name (the store's snapshot
+    # initialiser and its publish call -- `streamingThinking:null`, upstream's
+    # own since 2.1.236). A store that renames the field would leave the
+    # wrapper subscribing to `undefined` with every count green -- the same
     # hole `thinking-summaries` pays a header-name count for.
     field_named = any(
         (pair := js.named(node)) is not None and pair.type == "pair"
         for node in source.find(_STREAMING)
     )
-    extended: set[int] = set()
+    wrapped = 0
     unreached = 0
     for bag in renders:
-        resolved = _state_in_scope(bag)
+        resolved = _state_in_scope(source, bag)
         if resolved is None:
             # By design on every build we hold: the resume view, the transcript
             # overlay and the message picker draw conversations too, in scopes
@@ -360,26 +712,33 @@ def _step_prop_threading(source: Source, outcome: Outcome) -> Source:
             # 2.1.232 out-of-scope threading).
             unreached += 1
             continue
-        state, pattern = resolved
-        if pattern is not None and not field_named:
-            step.note(f"the stream store no longer names a {_STREAMING} field")
-            continue
-        step.candidates += 1
-        step.applied += 1
         carried = js.props(bag)
         if _STREAMING in carried:
             # Upstream already threads it into this render; the goal achieved.
+            step.candidates += 1
+            step.applied += 1
             continue
-        if pattern is not None and pattern.id not in extended:
-            # Two renders in one scope read one snapshot: the pattern gains the
-            # field once, at the front, which is valid whatever it ends with.
-            extended.add(pattern.id)
+        if isinstance(resolved, _PairState):
+            step.candidates += 1
+            step.applied += 1
             edits.append(
-                Edit.before(pattern.named_children[0], f"{_STREAMING}:{state},")
+                Edit.before(
+                    js.entry(carried[_CONVERSATION[0]]),
+                    f"{_STREAMING}:{resolved.state},",
+                )
             )
-        edits.append(
-            Edit.before(js.entry(carried[_CONVERSATION[0]]), f"{_STREAMING}:{state},")
-        )
+            continue
+        if not field_named:
+            step.note(f"the stream store no longer names a {_STREAMING} field")
+            continue
+        step.candidates += 1
+        wrap = _wrap(source, bag, resolved, wrapped)
+        if isinstance(wrap, str):
+            step.note(wrap)
+            continue
+        step.applied += 1
+        wrapped += 1
+        edits += wrap
     # Printed every run, green ones included: an early warning held back until
     # something breaks arrives too late to be one.
     step.note(
