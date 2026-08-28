@@ -834,12 +834,15 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
 
 - **`live-thinking`** — the fourteen-step patch above.
 
-  **`prop-threading`** inserts `streamingThinking:<state>,` before the
-  `conversationId` property of every props bag *handed to a component* — an
-  argument — that also carries `messages`. Being an argument is part of the
-  identity: a module-level literal, a return-value payload, or a config object
-  may legitimately carry the pair, and none of them is a render. Three things
-  do the work, and each replaced something that had broken:
+  **`prop-threading`** hands the live-thinking state to every conversation
+  render — a props bag *handed to a component* (an argument) that carries
+  `conversationId` and `messages`. Being an argument is part of the identity:
+  a module-level literal, a return-value payload, or a config object may
+  legitimately carry the pair, and none of them is a render. On a build whose
+  component owns the state it inserts `streamingThinking:<state>,` before the
+  bag's `conversationId`; on a store build it reroutes the render through a
+  wrapper component of ours that subscribes itself (below). Three things do
+  the work, and each replaced something that had broken:
 
   - **Identity is membership — of the essential props alone.** The props that
     make a render a conversation render, asked of one object rather than of a
@@ -878,37 +881,96 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
     *initialised* to is deliberately not asked: `useState(null)` is every
     build's spelling and `useState(void 0)` would be the same state, while the
     setter is the identity that matters.
-  - **The state has two homes, and each is proven by the only name it has.**
-    Through 2.1.235 the scope that hands `onStreamingThinking` declared the
-    state itself, and the state is the array pattern binding the handed setter
-    — `useState`'s pair, which nothing else names. 2.1.236 moved it into an
+  - **The state has two semantic homes, and each is identified by the only
+    name it has.** Through 2.1.235 the scope that hands `onStreamingThinking`
+    declared the state itself, and the state is the array pattern binding the
+    handed setter — `useState`'s pair, which nothing else names; its value is
+    threaded into the bag as it stands. 2.1.236 moved the state into an
     external stream store (`subscribe`/`getSnapshot`/`_publish` — the
-    `useSyncExternalStore` shape) that a component reads back by destructuring
-    a hook call (`{streamingToolUses:…}=useX(<store>)`), so the state is that
-    pattern's own `streamingThinking` binding — upstream's the day it takes
-    one, the goal achieved, and until then ours, inserted at the front of the
-    pattern. The pattern names *itself*: it binds the store's own
-    `streamingToolUses` field — the name the store publishes and the
-    transcript signature already rests on — and that membership is its whole
-    identity, provided its value is a call taking exactly one argument, one
-    answer or none (`js.only`). It was once proven by the handing instead —
-    "the call's only argument is the very expression the setter was read off"
-    — and 2.1.246 moved the handing into the engine
-    (`this.stream.setStreamingThinking`), out of every component, without
-    moving the state: four renders that plainly draw the conversation read as
-    having none in scope, with `onStreamingThinking:` still twice in the
-    bundle. The handed setter was `agentDefinitions` again — a neighbour
-    standing in for the thing itself, one more fact upstream had to keep.
-    Sole argument stays deliberate — a second is a selector whose result is
-    no longer the snapshot, and extending a pattern of unknowable provenance
-    binds `undefined` with every count green. The insertion also pays for a
-    witness the way `thinking-summaries` does: the field it binds must still
-    be named by the bundle's own objects (the store's snapshot initialiser,
-    its publish call), so a store that renames the field reads as the step
-    reporting the store rather than threading `undefined`. Two things come
-    free with the store: its setter takes functional updaters — React's own
-    contract, which the reducer splices already speak — and it hides a
-    finished block itself after 30 s, upstream's own linger.
+    `useSyncExternalStore` shape), and there the question this step used to
+    ask — *which idiom holds the state* — is retired, because it broke on
+    every answer it ever gave. Each answer was a spelling of React's
+    data-access fashion, the busiest surface upstream owns: the handing ("the
+    call's only argument is the very expression the setter was read off")
+    died on 2.1.246, when the handing moved into the engine
+    (`this.stream.setStreamingThinking`) with the state unmoved and
+    `onStreamingThinking:` still twice in the bundle; the whole-snapshot
+    destructure that replaced it (`{streamingToolUses:…}=useX(<store>)`, the
+    pattern naming the store's own field) died on 2.1.247, which reads the
+    store through per-field selectors instead (`et(<store>,wv)` with
+    `wv=(s)=>s.streamingToolUses`) — same store, same fields, a third
+    spelling, and a fourth break in this one question while the other
+    thirteen steps rode through both restructures untouched. A matcher
+    enumerating idioms is a whitelist against a fashion, each branch buying
+    exactly one build.
+
+    What survives every spelling is the **twin**. Live thinking is the
+    sibling of live tool-uses — same store, same snapshot, same renderer —
+    and the tool-use half is a feature upstream ships working, so every build
+    must carry, in the render's own reach, a read of `streamingToolUses` off
+    the store. That read is the *production*, found as whichever of the field
+    name's two grammar positions this build spells — a snapshot pattern's own
+    key (the hook call its sole argument, since a second would make the
+    pattern something other than the snapshot), or a selector beside the
+    store (a function answering the field off its own parameter, inline or
+    hoisted behind a module-local name) — one answer or none per scope
+    (`js.only`), behind whatever `??` fallback the read wears (`js.values`;
+    2.1.247 arrived wearing one). The production is then *reused verbatim* —
+    the reuse-their-expression rule `org-label` and the extras memo already
+    follow — so the state is read the way this build reads its twin, with one
+    field name swapped, and upstream can only break the claim by breaking
+    their own feature. That is the anchor-selection rule this step's whole
+    history teaches: prefer claims upstream cannot drop without paying for
+    them — the dispatch strings, the store's field names, the twin's dataflow
+    — over claims only this patch needs; a neighbour prop, a handing site and
+    a storage idiom were all the second kind, and every break above was one
+    of them.
+
+  - **On a store build the rewrite is a subscription, not a value.**
+    Threading the state's value was sound while the resolved render was
+    live-computed, and 2.1.247 retired that render too: the surviving
+    conversation render is react-compiler cached behind a fixed slot-test
+    chain (`if(Yr[15]!==ph||…)Du=r(Ih,{…})`), and a prop the compiler never
+    saw is a prop no slot tests — the element is reused, the child bails on
+    identity, and a perfectly threaded value renders exactly once.
+    Parse-green and frozen, a failure class `doctor` cannot see. So the
+    render is rerouted through a module-scope wrapper component
+    (`__cc_LiveConversation`) spliced beside it: the bag gains
+    `__cc_stream:<store>,` (the production's own store argument, whose
+    identity is as fresh as the conversation the cache already tests), the
+    render's component argument becomes the wrapper, and the wrapper
+    subscribes itself through the production's own hook with a selector of
+    ours in upstream's per-field shape, handing the component
+    `streamingThinking:` beside the spread props. The hook's optional
+    selector parameter is upstream's since the store era began — 2.1.236's
+    hook and 2.1.247's are the same two-parameter function, measured — and
+    where the destructure spelling leaves it undemonstrated, an in-module
+    hook is held to it (resolved, and required to declare a second
+    parameter), because a hook that ignored the argument would thread the
+    whole snapshot with every count green; an *imported* hook is accepted on
+    the measurement, a residue accepted by name rather than a cross-module
+    resolver built for a build that has never shipped. The transcript
+    renderer's own memo comparator compares unknown props by
+    identity (since 2.1.210), so a fresh value re-renders it and a quiet one
+    does not, cached parent or not: a component re-rendering from its own
+    subscription is the one contract in this chain no minifier or compiler
+    rewrites. Every name the wrapper re-spells — the JSX callee, the
+    component, the hook — is read off the site and owed module-scope meaning
+    (`_unshadowed`): any binding of the spelling on the way — a parameter, a
+    declarator, a function's or class's declared name, a catch clause's
+    parameter — would make the wrapper name something else that parses,
+    verifies, and throws at first render, so it refuses the wrap loudly
+    instead, and the store expression's own spellings are walked the same
+    way, bounded at the scope upstream wrote them in. The witness is
+    unchanged, paid the way `thinking-summaries` pays
+    it: the field the wrapper selects must still be named by the bundle's own
+    objects (the store's snapshot initialiser, its publish call —
+    `streamingThinking:null`, upstream's own since 2.1.236), so a store that
+    renames the field reads as the step reporting the store rather than
+    subscribing to `undefined`. Two things still come free with the store:
+    its setter takes functional updaters — React's own contract, which the
+    reducer splices already speak — and it hides a finished block itself
+    after 30 s, upstream's own linger.
 
   A render was once selected by *position* — the observation that the real sites
   fall after the state's `useState` declaration. That is worth recording as a

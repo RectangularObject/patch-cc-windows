@@ -21,8 +21,8 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The whole published span `2.1.210` → `2.1.246` — 2.1.230 and 2.1.244 were never
-published — one pristine binary per version, 35 in all. It straddles the
+The whole published span `2.1.210` → `2.1.247` — 2.1.230 and 2.1.244 were never
+published — one pristine binary per version, 36 in all. It straddles the
 **2.1.242 code split** (INTERNALS.md): `2.1.242`/`2.1.243` are the first
 many-module builds, and they jump ~35 MB over `2.1.241` for it. Several pairs
 share a byte count
@@ -67,10 +67,12 @@ the whole file, `sha256sum <version>.orig`) and never the size:
 | `2.1.243` | 378 MB | `4b0dafeedd0b469c41988e200036fd773e7553ba960349c9f02a82c6d1f2ba27` |
 | `2.1.245` | 392 MB | `16ad2b94deaf7b29abed966d981c9991a47af0420f5be8ed4a3f83bea9f678bc` |
 | `2.1.246` | 248 MB | `1a0a662dc1bb938eaec38545abce9a4a69113d7d7f7c5e1a553ea276617b906a` |
+| `2.1.247` | 239 MB | `5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15` |
 
 This set covers the span the playbook's tree-move measurements were taken over
-(`2.1.210` → `2.1.233`), the 2.1.242 split, and the 2.1.246 stream-store
-migration, so each is re-checkable here rather than historical.
+(`2.1.210` → `2.1.233`), the 2.1.242 split, the 2.1.246 stream-store
+migration, and the 2.1.247 selector reads it was read back through, so each is
+re-checkable here rather than historical.
 
 ## Rebuild or extend it
 
