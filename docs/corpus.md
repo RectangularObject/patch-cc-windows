@@ -21,12 +21,13 @@ matches means the file changed under you, not that a number moved.
 
 ## On disk now
 
-The whole published span `2.1.210` → `2.1.247` — 2.1.230 and 2.1.244 were never
-published — one pristine binary per version, 36 in all. It straddles the
-**2.1.242 code split** (INTERNALS.md): `2.1.242`/`2.1.243` are the first
-many-module builds, and they jump ~35 MB over `2.1.241` for it. Several pairs
-share a byte count
-(`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`, `2.1.239`–`2.1.241`, `2.1.242`/`2.1.243`)
+The whole published span `2.1.210` → `2.1.257` — 2.1.230, 2.1.244, 2.1.249 and
+2.1.253–2.1.256 are not on the release channel — one pristine binary per
+version, 41 in all. It straddles the **2.1.242 code split** (INTERNALS.md):
+`2.1.242`/`2.1.243` are the first many-module builds, and they jump ~35 MB over
+`2.1.241` for it. Several pairs share a byte count
+(`2.1.225`/`2.1.226`, `2.1.229`/`2.1.231`, `2.1.239`–`2.1.241`, `2.1.242`/`2.1.243`,
+`2.1.248`/`2.1.250`, `2.1.251`/`2.1.252`)
 and are still distinct binaries, which is why the identity column is the hash (of
 the whole file, `sha256sum <version>.orig`) and never the size:
 
@@ -68,11 +69,17 @@ the whole file, `sha256sum <version>.orig`) and never the size:
 | `2.1.245` | 392 MB | `16ad2b94deaf7b29abed966d981c9991a47af0420f5be8ed4a3f83bea9f678bc` |
 | `2.1.246` | 248 MB | `1a0a662dc1bb938eaec38545abce9a4a69113d7d7f7c5e1a553ea276617b906a` |
 | `2.1.247` | 239 MB | `5fb321bf417ffc5cd4e3f36e7c9c7e029bf47aaa36d5621db979fcc5e6eabe15` |
+| `2.1.248` | 214 MB | `3edee3cb054bd6823674fd60d5c0e442825b28ee8fbf815af2d16bf0de072e16` |
+| `2.1.250` | 214 MB | `2be252a00ac56e704d7fbf7e5e9ef1243584093334a861945238a0c27e84bdac` |
+| `2.1.251` | 205 MB | `fd5f10ff0eb58daec04900466b143ea98aab50abf208a422bc008eaec13f61f7` |
+| `2.1.252` | 205 MB | `a715a45105e593fc9808d035d77781f88480b9897975a9df41837f0c591bd4b3` |
+| `2.1.257` | 206 MB | `9a64bda9d8722a1fa05bef9a5961d07e0331b99597eda9e2f6a732f3a0ff7f05` |
 
 This set covers the span the playbook's tree-move measurements were taken over
 (`2.1.210` → `2.1.233`), the 2.1.242 split, the 2.1.246 stream-store
-migration, and the 2.1.247 selector reads it was read back through, so each is
-re-checkable here rather than historical.
+migration, the 2.1.247 selector reads it was read back through, and the
+2.1.257 compiled transcript renderer that retired live thinking's render half,
+so each is re-checkable here rather than historical.
 
 ## Rebuild or extend it
 

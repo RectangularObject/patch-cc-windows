@@ -763,14 +763,15 @@ def visible(declarator: Node, site: Node) -> bool:
 
     The question every spliced identifier owes an answer to, and the one kind
     of damage no gate here catches: an out-of-scope name parses, verifies, and
-    throws when its line runs. `prop-threading` resolves scope from the render
-    outwards for exactly that reason -- but outwards is only half of lexical,
-    and the half a subtree walk gets wrong. A declaration inside a nested
-    function is invisible outside it; so is one inside a plain block, which is
-    the half stopping at function edges still gets wrong. Give the 2.1.232
-    component that declares no live-thinking state a block-local ``useState``
-    and the search reported 2/2, spliced a name from inside the block into a
-    render outside it, and took the note that was the only signal with it.
+    throws when its line runs. Live thinking's retired render half resolved
+    scope from the render outwards for exactly that reason -- but outwards is
+    only half of lexical, and the half a subtree walk gets wrong. A declaration
+    inside a nested function is invisible outside it; so is one inside a plain
+    block, which is the half stopping at function edges still gets wrong. Give
+    the 2.1.232 component that declared no live-thinking state a block-local
+    ``useState`` and the search reported 2/2, spliced a name from inside the
+    block into a render outside it, and took the note that was the only signal
+    with it.
 
     Position is asked for exactly one shape and no other: a *direct* read of a
     block-scoped binding, in the same execution scope, *before* the declaration
@@ -955,7 +956,7 @@ def props(node: Node | None) -> dict[str, Node]:
     This is the primitive that retires "a set is not a sequence". Property
     order, adjacency, and which properties sit *between* the ones a matcher
     cares about are all facts about a particular build; membership is the fact
-    about the site. `prop-threading` once carried two regexes for one props bag
+    about the site. Live thinking once carried two regexes for one props bag
     purely because two call sites listed the same properties in different
     orders, and a single inserted property killed both at once.
 
