@@ -59,8 +59,20 @@ shape that already absorbs every case, found rather than bolted on.
   not guesswork: declare it (`Outcome.declare`) so a green tick cannot cover a dead
   feature. A step nobody declared is a step that cannot report its own death:
   `branding` carried none, so a name badge that stopped being a bold render was
-  a green run, an unchanged banner, and a manifest asserting the new name. See
-  [PLAYBOOK.md](PLAYBOOK.md).
+  a green run, an unchanged banner, and a manifest asserting the new name. And a
+  step answers for its own identity alone, never for a name another step
+  discovered: `live-thinking`'s reducer once skipped itself for want of a helper
+  the memo step had found, and eight required steps read *found nothing* over
+  one memo that had merely moved (2.1.257). See [PLAYBOOK.md](PLAYBOOK.md).
+
+- **Ride what upstream ships working.** When the binary already does for one
+  kind of thing what a patch wants for another — live tool uses, for live
+  thinking — put the patch's data on that path instead of building a twin of
+  it. Every step of a parallel implementation is a claim only the patch needs,
+  and upstream owes it nothing; the path upstream ships is one it cannot break
+  without paying for it. `live-thinking`'s render half broke five times on
+  React idioms before it was cut to three insertions on the tool-use list
+  ([PLAYBOOK.md](PLAYBOOK.md#live-thinking--streamingpy)).
 
 - **Port faithfully.** When you change a patch, verify its output against a real
   bundle — byte-identical where behaviour must not change. `doctor` over the

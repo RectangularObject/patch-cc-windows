@@ -67,20 +67,22 @@ now answers what a regex had to assert.
 Three properties fall out rather than being enforced. **Boundaries are never
 computed**: delimiting an object literal in minified JS means telling a regex
 literal from division, and a hand-rolled scanner that guesses returns a `}` that
-is merely wrong. **Scope is knowable**: `prop-threading` resolves the state
-variable from the render site outwards, which is how it found that on 2.1.232 the
-two conversation renders sit in different top-level components and only one of
-them declares the state — the old matcher threaded one bundle-wide answer into
-both and put an out-of-scope identifier into every patched binary. It parses, so
-no gate could see it; it throws when that component renders. Outwards is only
-half of lexical, and the other half is `visible`: a declaration inside a nested
+is merely wrong. **Scope is knowable**: a name spliced into a site has to be one that site can
+*see*, and the grammar answers that (`visible`) where position and subtree
+walks only guessed. Live thinking's retired render half paid for the lesson:
+on 2.1.232 its two conversation renders sat in different top-level components
+and only one declared the state — a bundle-wide answer threaded into both put
+an out-of-scope identifier into every patched binary. It parses, so no gate
+could see it; it throws when that component renders. Outwards is only half of
+lexical, and the other half is the block: a declaration inside a nested
 function is invisible to the render outside it, and so is one inside a plain
 block — `let` and `const` are the block's, `var` the function's, and the grammar
-says which. Give the 2.1.232 component that declares no state a block-local
-`useState` and the unscoped search threads that binding into the render, reports
-2/2, and silences the note that was the only sign a render had been skipped. A
-*use* keeps the whole subtree — a scope may hand its setter to the reducer from
-inside a callback, and that says nothing about where the state lives.
+says which. Give that component a block-local `useState` and the unscoped
+search threaded the binding into the render, reported 2/2, and silenced the
+note that was the only sign a render had been skipped. The reducer's options
+bag asks the same question today: the pattern every arm reads has to be
+visible to the whole body, not one a nested function takes apart under a name
+the arms cannot see.
 
 **Cardinality is part of the invariant.** A name locates a set; a rewrite needs
 one node. So the two are asked differently: a *registration* — an id into every
@@ -116,6 +118,11 @@ The tree removes the *mechanical* fragility. It does not decide these:
   that branch verbatim rather than constructing a flush call; `org-label` builds
   its line from upstream's own no-org string, so nothing here spells the
   separator. What you copy cannot drift from what you copied it from.
+- **Ride what upstream ships working** ([CONDUCT](CONDUCT.md)). Here it decides
+  how many claims a patch makes: data put on a path upstream already runs owes
+  the bundle one identity, the point where that path is fed, where a twin of
+  the path owes one per step, each a claim only the patch needs.
+  `live-thinking` is the worked case ([below](#live-thinking--streamingpy)).
 - **Match an identity by the weakest claim that still proves it; hold a rewrite
   to the exact node.** The two jobs pull in opposite directions.
   `thinking-inline`'s null-guard neutralises only a `return` that answers
@@ -184,12 +191,7 @@ because the module was the bundle:
   the module *was* the bundle, so a bundle-wide `find` was a module-wide one; the
   two only came apart when the app was dealt across files. The same lesson the
   playbook already states for identifiers within a build — "a name is a spelling
-  until its scope is said" — now reaches the module boundary too. A scope search
-  that climbs outward (`live-thinking`'s state and memo resolution) reads the
-  module wrapper by what it *is* — the pre-split monolith's whole-body IIFE is a
-  module of one top-level statement; a split module's `program` is dozens, and
-  its top-level components are real scopes to search — never by a fixed position,
-  which read every split component as the un-searchable wrapper and found nothing.
+  until its scope is said" — now reaches the module boundary too.
 
 - **The gate reads code, not linkage.** tree-sitter's JavaScript grammar does not
   model a reserved word as an import/export alias (`export{x as if}`,
@@ -351,12 +353,10 @@ Where the two numbers come from one place, they move together and the second
 row above cannot fire; it is worth knowing which patches those are, because for
 them `candidates` is a restatement rather than a witness. The row earns its keep
 exactly where a patch pays for a witness the rewrite does not produce: the two
-above, `codex-models`' registrations (a name already present is landed without
-an edit), and `live-thinking`'s two core updates, which are credited off the
-markers found in the bundle the run produced rather than off any matcher. A
-witness that disagrees with its own rewrite reads as `candidates == 0, applied
-== 1` — a state the table has no meaning for, and a defect in the witness rather
-than in the build (see `org-label`).
+above, and `codex-models`' registrations (a name already present is landed
+without an edit). A witness that disagrees with its own rewrite reads as
+`candidates == 0, applied == 1` — a state the table has no meaning for, and a
+defect in the witness rather than in the build (see `org-label`).
 
 `doctor` prints the documented anchor counts for any broken patch, so a `0`
 next to an anchor points straight at what moved.
@@ -428,7 +428,7 @@ implement every ECMAScript early-error rule, so a green gate means the token
 stream still assembles into a tree — not that the program is legal in every
 respect. That is the right scope: structural damage is what splicing causes. It
 is also why an *out-of-scope identifier* is not its business — that one parses —
-and why `prop-threading` resolves scope itself.
+and why a splice that names a binding proves it visible itself (`js.visible`).
 
 ### Expectations — why a green tick means something
 
@@ -452,7 +452,7 @@ on counts alone and printed a red cross and "all patches still match" in the
 same report. Adding a sub-step means deciding which row of the table it is in;
 that decision is the whole safety net.
 
-Three rules keep the net from having holes:
+Four rules keep the net from having holes:
 
 - **A step nobody declared cannot report its own death.** `branding` was the
   one multi-step patch here with no expectation anywhere, and its `badge` step
@@ -466,9 +466,16 @@ Three rules keep the net from having holes:
   built from many literal edits lands as soon as *one* of them applies, so an
   incidental edit can vouch for the essential ones. `live-thinking` learned this
   the hard way: a reducer whose setter threading applied while every event arm
-  had drifted reported hits and streamed nothing. The two edits that *are* the
-  feature are now checked by the markers their builders emit
-  (`streaming._CORE_UPDATES`), which no amount of neighbouring churn can fake.
+  had drifted reported hits and streamed nothing. Every edit that *is* the
+  feature is now its own required step, counted at its own dispatch point, and
+  there is no incidental edit left to vouch for it.
+- **A step answers for its own identity, never for another step's discovery.**
+  `live-thinking`'s reducer step once refused to run without a helper name the
+  extras step had read out of a memo callback; when 2.1.257 compiled that memo
+  into cache slots, the reducer — whose own identity resolved untouched — and
+  six dispatch points reported *found nothing*, and the report pointed eight
+  steps away from the one shape that had moved. Nothing a step needs may come
+  from another step having matched.
 - **Declare an expectation before the work, not inside it.** A step created only
   by its own success cannot report its own absence. This is the API's shape,
   not a discipline: `Outcome.declare` is the only way a step comes to exist
@@ -494,55 +501,47 @@ first is how a manifest starts lying. The manifest is held to the same rule:
 
 ## Sub-steps, and why `live-thinking` has them
 
-Most patches are one rewrite. `live-thinking` is fourteen named sub-steps,
-because upstream has reshaped the stream reducer at least three times and a
-single hit count cannot tell "all landed" from "half silently drifted".
+Most patches are one rewrite. `live-thinking` is five named sub-steps, because
+a single hit count cannot tell "all landed" from "half silently drifted", and
+each records its own `candidates`/`applied`:
 
-Each sub-step records its own `candidates`/`applied`:
+- **`display-mode`** — the request asks the API for summarised thinking text;
+  without it the stream carries signatures and no words.
+- **`reducer`** — the stream reducer is found together with the options bag it
+  is handed the live tool-use setter in, and our binding of that setter is
+  added to the bag.
+- **One step per dispatch point** — `thinking-start` (a thinking block opens an
+  entry on the live tool-use list), `thinking-append` (a delta grows it) and
+  `thinking-stop` (the block closes and the entry goes, as its real message
+  lands). A build that folds an arm away reads as that point's absence *by
+  name*, never as a bare count drop inside an aggregate. Each point is found by
+  the API string it dispatches on and never by the read that reaches it:
+  spelling a whole `===` test once cost a reset on one character —
+  `e.event.type` gaining a `?.` left the live block never marked finished,
+  shimmering after every turn, with the step reporting *absent* and the patch
+  green.
 
-- **The chain from stream event to rendered row**, all required —
-  `prop-threading` (the state reaches the renders), `display-mode` (the API is
-  asked for summaries), `transcript-signature` (the renderer receives the
-  state), `inline-extras` (it is drawn in order), `reducer` (the stream handler
-  is found and threaded). Without any one of them live thinking is dead however
-  many other steps land.
-- **One step per dispatch point** — `request-start`, `message-stop`,
-  `text-clear`, `message-delta-clear`, `thinking-start`, `thinking-append`. A
-  build that folds an arm away reads as that point's absence *by name*, never as
-  a bare count drop inside an aggregate. Each point is found by the API string
-  it dispatches on and never by the read that reaches it: the two wrapped in a
-  test match the `===` against `"message_stop"`, wherever the value came from.
-  Spelling the whole test cost `message-stop` on one character — `e.event.type`
-  gaining a `?.` left the live block never marked finished, shimmering after
-  every turn, with the step reporting *absent* and the patch green.
-- **The two updates that are the feature** — `block-start` and
-  `thinking-delta`, required, and not matchers at all but *proof*: each is
-  credited only when its marker is found in the bundle the run produced. A
-  reducer whose setter threading applied while every arm had drifted once
-  reported hits and streamed nothing.
-- **`final-summary`**, optional: redacted thinking in the closing summary is a
-  refinement, not the feature. Its guard is whichever enclosing `if` *tests the
-  block* — 2.1.236 nested an experiment gate between the test and the summary
-  it guards, and "the nearest `if`" read a shape that had merely moved as one
-  that was gone. The climb is bounded by the function that declares the block,
-  because a receiver's name is only a spelling until its scope is said.
+All five are required. There is no optional step and no shape some builds
+merely lack: the feature is those five edits or nothing, and every one is
+asked of the bundle on its own — no step depends on a name another step
+discovered ([Expectations](#expectations--why-a-green-tick-means-something)).
 
 An *optional* sub-step that finds nothing is reported as absent, not broken —
 it is just a shape this build doesn't have. A sub-step that finds a shape but
 fails to rewrite it (`candidates > 0, applied == 0`) shows up in
 `missed_steps()`.
 
-The reducer used to be a **variant group** of two heads (`reducer-options` for
-2.1.138+, `reducer-legacy` before it) plus four legacy cleanups (`memo-cache`,
-`memo-removal`, `linger`, `bottom-row`). All six matched nothing on any build in
-the corpus and are gone; see [Removed](#removed-patches). The group mark went
-with them — no step declares one, so `expect` is a `bool`. The reducer is now
-one step because there is one shape to find: a function that dispatches on all
-three stream events, whose options bag is reached from the parameter it is
-destructured from rather than matched. The setter is taken out of that bag
-under upstream's own name into one
-of ours, unconditionally: two patterns naming one property both read it, so
-"upstream already binds it" is not a case to handle.
+This patch once had fourteen steps, and ten of them are gone — its render half
+and its state machine, retired at the 2.1.257 break and recorded under
+[Removed](#live-thinkings-render-half-and-state-machine). The reducer itself was
+once a **variant group** of two heads plus four legacy cleanups, all six
+matching nothing on any build in the corpus; the group mark went with them, so
+`expect` is a `bool`. The reducer is one step because there is one shape to
+find: a function that dispatches on the thinking events and is handed the
+tool-use setter, its options bag reached from the parameter it is destructured
+from rather than matched. The setter is bound out of that bag under upstream's
+own property name into one of ours, unconditionally: two patterns naming one
+property both read it, so "upstream already binds it" is not a case to handle.
 
 Notes print on every run, green ones included — an early warning held back
 until something breaks arrives too late to be one. Absences are the noisy half
@@ -832,220 +831,125 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
 
 ### Live thinking — `streaming.py`
 
-- **`live-thinking`** — the fourteen-step patch above.
+- **`live-thinking`** — stream thinking as it is generated, inline and in order
+  with the tool calls around it. Five required steps
+  ([Sub-steps](#sub-steps-and-why-live-thinking-has-them)) and one idea: a
+  thinking block **rides the live tool-use list**.
 
-  **`prop-threading`** hands the live-thinking state to every conversation
-  render — a props bag *handed to a component* (an argument) that carries
-  `conversationId` and `messages`. Being an argument is part of the identity:
-  a module-level literal, a return-value payload, or a config object may
-  legitimately carry the pair, and none of them is a render. On a build whose
-  component owns the state it inserts `streamingThinking:<state>,` before the
-  bag's `conversationId`; on a store build it reroutes the render through a
-  wrapper component of ours that subscribes itself (below). Three things do
-  the work, and each replaced something that had broken:
+  Claude Code already streams tool-use blocks live. The stream reducer keeps a
+  list of `{index, contentBlock}` entries — opened when a `tool_use` block
+  starts, replaced as its input streams in, cleared when a message starts or
+  ends — and hands it to the store through the `onStreamingToolUses` callback
+  in its options bag. Downstream, the transcript renderer wraps every entry
+  into a virtual assistant message and draws it after the real ones, in list
+  order. That list is the **twin** of live thinking: same store, same
+  snapshot, same renderer, same memo, and a feature upstream ships working. So
+  the patch puts thinking on it — opened, grown, and taken off again at the
+  reducer's own arms — and does nothing else.
 
-  - **Identity is membership — of the essential props alone.** The props that
-    make a render a conversation render, asked of one object rather than of a
-    span of text. Four matchers once modelled this — a brace-free
-    `createElement` call, an ordered prompt renderer, and two regexes differing
-    only in the order two call sites listed the same props. 2.1.229 killed the
-    ordered pair at once by inserting `onRateLimitAutoQueueContinue:` between
-    two of them. The membership then carried `agentDefinitions` as a third
-    conjunct — witness and insertion point in one — and 2.1.235 retired that
-    prop from the bag: an identity resting on a *neighbour* read a build that
-    plainly drew four conversation renders as drawing none, with every anchor
-    count standing (`agentDefinitions` still occurs 97 times — as other
-    components' prop). The conversation pair is what the render *is*; the
-    neighbour was one more thing upstream had to keep, and upstream owes the
-    matcher nothing. Same class as the resolver default on 2.1.234: the
-    identity must be the weakest claim that still proves it, and every conjunct
-    past that is a break waiting on a harmless refactor.
-  - **The insertion point is a prop boundary**, so nothing computes where a
-    literal ends. Being an `object` and not an `object_pattern` is what
-    separates a prop being *passed* from one being *received*; the regex spelled
-    that as a call-opening it had to match, and inserting into a pattern would
-    have rebound a local.
-  - **Scope is resolved per site.** The state variable is found from the render
-    outwards — the enclosing scope that hands `onStreamingThinking` to the
-    reducer is the one that owns the state — and the declaration it lands on
-    has to be one that render can *see* (`js.visible`). This is the claim the
-    old matcher named as owed and could not discharge, and it was not idle: on
-    2.1.232 the
-    two conversation renders sit in *different* top-level components, only one
-    of which declares the state. Threading one bundle-wide answer into both put
-    an out-of-scope identifier into every patched binary — it parses, so no gate
-    could see it, and it throws when that component renders. The second site is
-    now skipped with a note instead. Making it work would mean threading the
-    prop through the intermediate component too, which is a change nobody has
-    asked for; it renders nothing today either way. What the state was
-    *initialised* to is deliberately not asked: `useState(null)` is every
-    build's spelling and `useState(void 0)` would be the same state, while the
-    setter is the identity that matters.
-  - **The state has two semantic homes, and each is identified by the only
-    name it has.** Through 2.1.235 the scope that hands `onStreamingThinking`
-    declared the state itself, and the state is the array pattern binding the
-    handed setter — `useState`'s pair, which nothing else names; its value is
-    threaded into the bag as it stands. 2.1.236 moved the state into an
-    external stream store (`subscribe`/`getSnapshot`/`_publish` — the
-    `useSyncExternalStore` shape), and there the question this step used to
-    ask — *which idiom holds the state* — is retired, because it broke on
-    every answer it ever gave. Each answer was a spelling of React's
-    data-access fashion, the busiest surface upstream owns: the handing ("the
-    call's only argument is the very expression the setter was read off")
-    died on 2.1.246, when the handing moved into the engine
-    (`this.stream.setStreamingThinking`) with the state unmoved and
-    `onStreamingThinking:` still twice in the bundle; the whole-snapshot
-    destructure that replaced it (`{streamingToolUses:…}=useX(<store>)`, the
-    pattern naming the store's own field) died on 2.1.247, which reads the
-    store through per-field selectors instead (`et(<store>,wv)` with
-    `wv=(s)=>s.streamingToolUses`) — same store, same fields, a third
-    spelling, and a fourth break in this one question while the other
-    thirteen steps rode through both restructures untouched. A matcher
-    enumerating idioms is a whitelist against a fashion, each branch buying
-    exactly one build.
+  - **`reducer`** finds the function that dispatches on `thinking_delta` and
+    `content_block_start` (asked of the scope itself — *containing* a dispatch
+    is not performing one; on 2.1.210 the engine loop and `submitMessage` each
+    held the whole reducer inside them) **and** is handed `onStreamingToolUses`
+    in a pattern destructured from one of its parameters and visible to its
+    whole body. The SDK's own stream classes switch on the same strings and are
+    handed no setter, which is what keeps them out. One reducer or none
+    (`js.only`). The edit is one binding, `onStreamingToolUses:__cc_…,` at the
+    front of that pattern: a second entry naming one property is valid and
+    reads the same value, so upstream's own local is never read — a minified
+    spelling any nested block could shadow — and "upstream already binds it"
+    is not a case.
+  - **`thinking-start`** inserts, at the `case"thinking":case"redacted_thinking":`
+    dispatch point of the switch that discriminates on `.content_block.type`
+    (`_switch_on` — a decoy arm of the same label in the *delta* switch once
+    drew the update to itself), one call of that setter: open an entry
+    `{index, contentBlock}` for this block, replacing one already open at the
+    index rather than appending twice. The block goes on the list exactly as
+    the API sent it, with **no id of ours**. The transcript's content renderer
+    is memoised, and a row it holds no live tool-use id for counts as static —
+    drawn once and never again, however the message behind it changes — so an
+    entry that opens with an empty block is drawn empty, and a stable id pins
+    that empty row for the whole turn (measured on 2.1.257: text arriving in
+    the store, screen unmoved). Without an id the renderer mints one per entry
+    *object*, so every replaced entry is a fresh row drawn with its full text:
+    upstream's own path for an id-less streamed block.
+  - **`thinking-append`** inserts, at `case"thinking_delta":` in the switch on
+    `.delta.type`, one call that replaces the entry at this index with a block
+    carrying the appended text — exactly how the twin's input accumulator
+    streams a tool call's JSON into its entry, and what makes the renderer mint
+    the replacement a fresh row. A delta without text (the API also sends
+    token estimates under this event) or for an index with no open entry
+    leaves the list as it was, so nothing is published and nothing redraws.
+  - **`thinking-stop`** inserts, at `case"content_block_stop":` in the switch
+    on `.event.type`, one call that drops the thinking entry at this index.
+    The block's real message lands in the same instant as its stop event, and
+    upstream clears the list only when the whole message ends: a tool-use
+    entry is dropped by the stabiliser the moment the landed message carries
+    its id, but a thinking block carries none, so a live entry left standing
+    drew beside the landed block for as long as the answer streamed. A
+    tool-use entry at the same index is left exactly as the twin leaves it,
+    and a list with nothing to drop is returned as it was.
+  - **`display-mode`** defaults the request's thinking display to
+    `"summarized"`; without it the API only streams summary text when the
+    `showThinkingSummaries` setting is on. Two shapes used to be spelled out —
+    the inline env check and the 2.1.216 form that hoists it behind
+    feature-helper calls. They are one edit: the display value gains a
+    default, and whatever guards reach it are untouched because they are never
+    matched. The env-var *name* is the witness; whatever reads it is never
+    described, so a hoisted `process.env` (the same migration that killed
+    `org-label` on 2.1.228) costs nothing here.
 
-    What survives every spelling is the **twin**. Live thinking is the
-    sibling of live tool-uses — same store, same snapshot, same renderer —
-    and the tool-use half is a feature upstream ships working, so every build
-    must carry, in the render's own reach, a read of `streamingToolUses` off
-    the store. That read is the *production*, found as whichever of the field
-    name's two grammar positions this build spells — a snapshot pattern's own
-    key (the hook call its sole argument, since a second would make the
-    pattern something other than the snapshot), or a selector beside the
-    store (a function answering the field off its own parameter, inline or
-    hoisted behind a module-local name) — one answer or none per scope
-    (`js.only`), behind whatever `??` fallback the read wears (`js.values`;
-    2.1.247 arrived wearing one). The production is then *reused verbatim* —
-    the reuse-their-expression rule `org-label` and the extras memo already
-    follow — so the state is read the way this build reads its twin, with one
-    field name swapped, and upstream can only break the claim by breaking
-    their own feature. That is the anchor-selection rule this step's whole
-    history teaches: prefer claims upstream cannot drop without paying for
-    them — the dispatch strings, the store's field names, the twin's dataflow
-    — over claims only this patch needs; a neighbour prop, a handing site and
-    a storage idiom were all the second kind, and every break above was one
-    of them.
+  **What is deliberately not done.** No state of ours: upstream's store carries
+  a `streamingThinking` slot with a setter and a thirty-second linger, written
+  with a finished summary when the assistant message lands and read back only
+  to salvage a cancelled turn — no render reads it, and threading it into one
+  is the whole surface that broke five times. No render path: nothing is
+  threaded into the conversation render or the transcript renderer's
+  signature, and no memo is rewritten. No resets beyond the block's own stop:
+  upstream clears the list when a message starts or ends, and when the real
+  message lands its thinking block renders in place through `thinking-inline`.
+  No cross-module name: the setter is bound in the reducer's own pattern, so
+  nothing discovered in one module is spelled in another.
 
-  - **On a store build the rewrite is a subscription, not a value.**
-    Threading the state's value was sound while the resolved render was
-    live-computed, and 2.1.247 retired that render too: the surviving
-    conversation render is react-compiler cached behind a fixed slot-test
-    chain (`if(Yr[15]!==ph||…)Du=r(Ih,{…})`), and a prop the compiler never
-    saw is a prop no slot tests — the element is reused, the child bails on
-    identity, and a perfectly threaded value renders exactly once.
-    Parse-green and frozen, a failure class `doctor` cannot see. So the
-    render is rerouted through a module-scope wrapper component
-    (`__cc_LiveConversation`) spliced beside it: the bag gains
-    `__cc_stream:<store>,` (the production's own store argument, whose
-    identity is as fresh as the conversation the cache already tests), the
-    render's component argument becomes the wrapper, and the wrapper
-    subscribes itself through the production's own hook with a selector of
-    ours in upstream's per-field shape, handing the component
-    `streamingThinking:` beside the spread props. The hook's optional
-    selector parameter is upstream's since the store era began — 2.1.236's
-    hook and 2.1.247's are the same two-parameter function, measured — and
-    where the destructure spelling leaves it undemonstrated, an in-module
-    hook is held to it (resolved, and required to declare a second
-    parameter), because a hook that ignored the argument would thread the
-    whole snapshot with every count green; an *imported* hook is accepted on
-    the measurement, a residue accepted by name rather than a cross-module
-    resolver built for a build that has never shipped. The transcript
-    renderer's own memo comparator compares unknown props by
-    identity (since 2.1.210), so a fresh value re-renders it and a quiet one
-    does not, cached parent or not: a component re-rendering from its own
-    subscription is the one contract in this chain no minifier or compiler
-    rewrites. Every name the wrapper re-spells — the JSX callee, the
-    component, the hook — is read off the site and owed module-scope meaning
-    (`_unshadowed`): any binding of the spelling on the way — a parameter, a
-    declarator, a function's or class's declared name, a catch clause's
-    parameter — would make the wrapper name something else that parses,
-    verifies, and throws at first render, so it refuses the wrap loudly
-    instead, and the store expression's own spellings are walked the same
-    way, bounded at the scope upstream wrote them in. The witness is
-    unchanged, paid the way `thinking-summaries` pays
-    it: the field the wrapper selects must still be named by the bundle's own
-    objects (the store's snapshot initialiser, its publish call —
-    `streamingThinking:null`, upstream's own since 2.1.236), so a store that
-    renames the field reads as the step reporting the store rather than
-    subscribing to `undefined`. Two things still come free with the store:
-    its setter takes functional updaters — React's own contract, which the
-    reducer splices already speak — and it hides a finished block itself
-    after 30 s, upstream's own linger.
+  **What the twin guarantees, measured on the corpus.** The list's stabiliser
+  drops an entry only when its id has already landed as a message or repeats
+  another's; an entry of ours passes through. The transcript's content
+  renderer is memoised and treats a row without a live tool-use id as static,
+  drawn once — which is why a replaced entry has to become a fresh row (the
+  minted id) rather than a changed one. The interleaver appends the wrapped
+  entries after the real messages in list order, so a thinking block streamed
+  before a tool call draws above it. The reducer's own tool-use arm replaces
+  entries by index and its input accumulator replaces an entry's block per
+  delta — the two idioms this patch copies. Two consumers read the list for
+  something other than drawing it: the streaming-text preview hold, in its
+  `"focus"` mode (the default is `"none"`), keeps the preview back while the
+  list is non-empty, so there a live thinking entry holds it only while its
+  block is open, which ends before the text after it streams; and the tool-use
+  arm's size cap applies to tool blocks only, so thinking text is never
+  truncated.
 
-  A render was once selected by *position* — the observation that the real sites
-  fall after the state's `useState` declaration. That is worth recording as a
-  mistake, because it looked like a scope proof and was not one in either
-  direction: bundle module order is the bundler's, not a fact about a render,
-  and a closure written before a `let` may legally read it once invoked.
+  **Alive by eye:** ask something that takes thought and watch the thinking
+  block grow above the answer, then settle into the finished block when the
+  message lands — no shimmer, no duplicate, no gap. It renders inline because
+  `thinking-inline` routes thinking out of the collapsed activity group; with
+  only this patch selected the live block is drawn where that group draws.
+  Diagnose an empty live block from a transcript, not by eye — the column of
+  lengths under `thinking-summaries` is the same check.
 
-  **The reducer** is the function that *dispatches* on all three of
-  `stream_request_start`, `thinking_delta` and `content_block_start` **and** is
-  handed the stream callbacks to answer them with — where
-  dispatching is a `switch` arm labelled with the event or the `===` test that
-  routes it, whichever this build spells, since upstream uses both at once.
-  Both halves are needed, and dispatching is asked of the scope itself
-  (`scoped=True`): *containing* three dispatches is not performing them, and on
-  2.1.210 the engine loop and `submitMessage` each contain the whole reducer, so
-  the right function was picked by nothing better than sitting earlier in the
-  bundle. Its options bag is reached from the declarator that destructures one
-  of its positional parameters, so the head is never matched —
-  2.1.226 broke the old head matcher purely by appending a declarator to its
-  `let`. Every state update is an insertion at a dispatch point: after a run of
-  `case` labels (`js.dispatch`), or by wrapping the dispatch test itself
-  (`(test&&((update),!0))`, which preserves the test's value exactly and so
-  survives any surrounding composition). The arm bodies are never matched.
-
-  **`transcript-signature` and `inline-extras`** are one hand-off and two
-  steps: the first threads `streamingThinking` into every renderer whose
-  signature carries `messages` and `streamingToolUses`, inserting before the
-  latter — an insertion point inside the identity, for `prop-threading`'s
-  reason. The signature was a trio until `showAllInTranscript` was measured to
-  discriminate nothing on any build in the corpus: a third conjunct that was
-  find-anchor, identity and insertion point in one, the exact triple role
-  `agentDefinitions` held when 2.1.235 retired it. Deriving the renderer from
-  its consumer instead — the scope that binds what the extras memo computes
-  over — was measured and rejected: the memo's receiver is a react-compiler
-  memoized *local* on every current build, with real dataflow between it and
-  the signature, and a dataflow pass is a tool this project deliberately does
-  not build. The second step rewrites that renderer's
-  extras memo to draw the live block in order. What the memo reads is resolved
-  in **its own scope** — the prop its enclosing function was handed — rather
-  than carried over from whichever renderer the first step happened to see
-  last: a second component with the same four props donated its local to the
-  first one's memo, spliced an identifier that component cannot see, and
-  reported both steps green. The memo itself is found by what it computes — an
-  arrow whose whole body is a `flatMap` that wraps each streaming block as a
-  message, and the call that takes that arrow — never by the memo hook's name.
-  The hook is one more minified spelling: the monolith reaches it as
-  `<React>.useMemo(...)` (the property name survives a member read), but a
-  code-split module imports it under a local (`import{useMemo as te}` → `te(...)`),
-  so keying on `useMemo` read a build that memoizes exactly the same way as one
-  with no memo at all, and the rewrite reuses the memo's *own* callee rather than
-  re-spelling `.useMemo`. What a claim about the *text* around the block
-  (`.contentBlock]}`) only approximated is the computation itself: one sibling
-  property beside `content` read as the whole thing being gone. The wrapped
-  block is asked by membership among the element's *possible values*
-  (`js.values` — the same value routing the codex resolvers read), never asked
-  to be the read: 2.1.246 minted stable ids for streamed blocks
-  (`ce?{...S.contentBlock,id:V}:S.contentBlock`), and the exact-node question
-  read the same wrap one choice deeper as no wrap at all — nine required steps
-  to zero, every anchor count standing. The rewrite reuses upstream's callback
-  and dependencies verbatim — the callback invoked per entry with the same
-  three arguments `flatMap` hands it, each dependency spread rather than
-  transcribed — because a rebuilt copy is a copy free to shed whatever
-  upstream adds next: the re-spell this replaced would have silently dropped
-  the 2.1.246 minting, and with it went the uuid-stamp identity that re-spell
-  had to prove and the reuse no longer asks.
-
-  **`display-mode`** defaults the request's thinking display to `"summarized"`;
-  without it the API only streams summary text when the `showThinkingSummaries`
-  setting is on. Two shapes used to be spelled out — the inline env check and
-  the 2.1.216 form that hoists it into its own variable behind extra
-  feature-helper calls. They are one edit: the display value gains a default,
-  and whatever guards reach it are untouched because they are never matched.
-  The env-var *name* is the witness; whatever reads it is never described, so a
-  hoisted `process.env` (the same migration that killed `org-label` on 2.1.228)
-  costs nothing here.
+  **History, and the rule it left.** The render half of this patch broke five
+  times between 2.1.235 and 2.1.257, each on a spelling of React's data-access
+  or memoization fashion, and each repair bought one build: a neighbour prop
+  (2.1.235), a `useState` pair (2.1.236), a handing site (2.1.246), a snapshot
+  destructure (2.1.247), and a memo call the React compiler turned into cache
+  slots (2.1.257 — not the compiler arriving, which had cached the
+  conversation render since 2.1.247, but this component joining it). The
+  reducer half, anchored on the API's event strings, has not moved since it
+  became an insertion at dispatch points. Prefer claims upstream cannot drop
+  without paying for them — a dispatch string, a store's field name, the twin's
+  own list — over claims only this patch needs, which is what CONDUCT's *ride
+  what upstream ships working* asks. What was cut, and why each piece was a
+  claim of the second kind, is under
+  [Removed](#live-thinkings-render-half-and-state-machine).
 
 ### Subagents — `agents.py`
 
@@ -1455,6 +1359,58 @@ Kept here so nobody reintroduces them without knowing why they left:
 - **`redacted-thinking`** — untestable against the real API (no way to elicit
   a `redacted_thinking` block), and the native-only tool keeps its surface to
   what can be verified.
+
+### Live thinking's render half and state machine
+
+Retired at 2.1.257, when the React compiler reached the transcript renderer
+and the memo `inline-extras` rested on became cache slots. The break was one
+identity, but the design was the failure: every step below re-implemented, for
+thinking, something the binary already does for live tool uses, and each
+rested on a claim only this patch needed. What replaced them is three
+insertions on the tool-use list ([the entry](#live-thinking--streamingpy)).
+
+- **`prop-threading`** — threaded the live state into the conversation render:
+  first a component-owned `useState` pair found through the setter it handed
+  the reducer, then a store read found as a whole-snapshot destructure, then
+  as a per-field selector beside the store, then a wrapper component
+  (`__cc_LiveConversation`) subscribing itself because the render had become
+  compiler-cached. Four breaks (2.1.235, 2.1.236, 2.1.246, 2.1.247), each a
+  spelling of React's data-access fashion.
+- **`transcript-signature`** — threaded the state into the renderer whose
+  signature carries `messages` and `streamingToolUses`. It survived the
+  compiler moving that destructure into the body only because it asked
+  membership of a pattern, not of a parameter list.
+- **`inline-extras`** — rewrote the memo that wraps streaming tool-use entries
+  into virtual messages, to interleave the thinking state's messages by index.
+  Its identity was an arrow whose whole body is a `flatMap`, taken as the first
+  argument of a call: four nested claims about memoization, all false once the
+  callback was hoisted into a cache slot and the `flatMap` became a bare
+  assignment. The computation itself sat on 2.1.257 exactly where it sat on
+  2.1.252 — once, in the same component.
+- **`request-start`, `message-stop`, `text-clear`, `message-delta-clear`** —
+  resets of the live state at four dispatch points, owed only because the
+  state was ours. Upstream clears the twin's list when a message starts or
+  ends.
+- **`block-start`, `thinking-delta`** — proof steps credited off markers found
+  in the produced bundle rather than off a matcher, against an aggregate count
+  that could let incidental edits vouch for essential ones. Every essential
+  edit is now its own required step, so there is nothing left to vouch for.
+- **`final-summary`** — widened upstream's finished-thinking summary to
+  redacted blocks. Nothing renders that summary once the state is not ours.
+- **`Discovery`** and the cross-module resolution behind it — the builder that
+  made a virtual message was read out of the memo callback in one module,
+  resolved through an export hop into the reducer's, and spelled into every
+  reducer splice. The reducer step refused to run without it, which is how one
+  moved memo read as eight required steps found nothing. Upstream's own code
+  wraps the list's entries now; no builder is named anywhere.
+
+The sweep over the 41-build corpus after the cut, diffed against the sweep
+before it: `live-thinking` reads `cand=5 applied=5` on every build where it read
+fifteen or fourteen steps before, 2.1.257 goes from a failing exit to green,
+every baked binary still boots, and no other patch's count, note or runtime
+line moved. Watched live on a baked 2.1.257: the block appears a few seconds
+into the think, grows in place while the spinner still reads thinking, and
+hands over to the landed block with no duplicate and no gap.
 
 ### Sub-steps removed with the move to the tree
 
