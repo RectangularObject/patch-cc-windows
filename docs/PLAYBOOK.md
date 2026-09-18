@@ -215,7 +215,7 @@ Anything the binary can enumerate for us, it does:
   three entries when 2.1.229 renamed the module out from under it
   (`…/src/entrypoints/cli.js` → `…/cli`) and the tool stopped opening binaries
   at all — with the answer already parsed, already carried on the dataclass, and
-  already written back unchanged by `rebuild`. A list that only ever grows is
+  already written back unchanged by `rewrite`. A list that only ever grows is
   answering the wrong question. An id past the end of the module table is a
   corrupt blob and raises; there is deliberately no fallback to guessing by
   name, because a container that cannot say which module it runs is not one to
@@ -605,7 +605,9 @@ that broke a patch along with every note.
 
 6. Sweep the fix over the versions you still have. `doctor` takes a path, and
    every binary patch-cc has ever touched left a pristine copy in
-   `~/.local/share/patch-cc/backups/`:
+   `~/.local/share/patch-cc/backups/` — which is only the builds *this machine*
+   patched, so `uv run scripts/corpus.py sync` first to make that the published
+   set ([corpus.md](corpus.md)):
 
    ```bash
    sweep() { for b in ~/.local/share/patch-cc/backups/*.orig; do
@@ -634,8 +636,10 @@ that broke a patch along with every note.
    version backs up under its own name. Where it is a fixed path — every Windows
    install, and any Homebrew or npm one — there is one backup and an update
    replaces it, because it has to describe the version installed *now* (see the
-   pristine-source rule in [INTERNALS.md](INTERNALS.md#safety)). Keep older
-   binaries by hand there, or download them: `doctor` is happy with any path.
+   pristine-source rule in [INTERNALS.md](INTERNALS.md#safety)). So there the
+   accreted set is one build, and `scripts/corpus.py` is not an optional
+   completion of the corpus but the whole of it: it fetches every published
+   build under its own version name, and `doctor` is happy with any path.
 
 ## Patch reference
 
