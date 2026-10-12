@@ -136,9 +136,9 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
     """Exercise every configurable patch using values derived from the bundle.
 
     A synthetic external model exercises registration, shortcuts, context,
-    effort limits (it lacks `max`) and routing without a network read. Subagent
-    targets remain native aliases so their matcher health can be compared
-    independently.
+    effort limits and the picker cap (it lacks `max`) and routing without a
+    network read. Subagent targets remain native aliases so their matcher
+    health can be compared independently.
     """
     custom = [
         CustomModel(

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import replace
 
 from .. import js
 from ..custom_models import (
+    EFFORT_LADDER,
     KEY_ENV,
     ConfigurationError,
     CustomModel,
@@ -38,6 +40,8 @@ _BUILD_URL = "buildURL"
 _DEFAULT_BASE_URL = "defaultBaseURL"
 _MAX_CONTEXT = "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
 _CAPABILITIES = "CLAUDE_CODE_MODEL_CAPABILITIES"
+_MAX_EFFORT = "maxEffortLevel"
+_MODEL_SETTINGS = "modelSettings"
 
 
 def _append_strings(array: js.Node, names: list[str]) -> tuple[Edit, ...]:
@@ -665,6 +669,84 @@ def _effort_limits(source: Source, options: Options, outcome: Outcome) -> Source
     )
 
 
+def _effort_cap(model: CustomModel) -> str | None:
+    declared = [level for level in EFFORT_LADDER if level in model.efforts]
+    if not declared or declared[-1] == EFFORT_LADDER[-1]:
+        return None
+    return declared[-1]
+
+
+def _caps_per_model(source: Source) -> bool:
+    return any(
+        js.climb(
+            cap,
+            lambda n: (
+                (key := js.key_of(n)) is not None and js.text(key) == _MODEL_SETTINGS
+            ),
+        )
+        is not None
+        for node in source.find(_MAX_EFFORT)
+        if (cap := js.named(node)) is not None
+    )
+
+
+def _binds_list(name: str) -> Callable[[js.Node], bool]:
+    return lambda n: (
+        n.type == "variable_declarator"
+        and js.text(n.child_by_field_name("name")) == name
+        and (value := n.child_by_field_name("value")) is not None
+        and value.type == "array"
+    )
+
+
+def _cap_layers(source: Source) -> js.Node | None:
+    found: dict[int, js.Node] = {}
+    for node in source.find(_MAX_EFFORT):
+        if not js.reads(node.parent, _MAX_EFFORT):
+            continue
+        body = js.body(js.up(node, *js.FUNCTIONS))
+        if js.first(body, lambda n: js.reads(n, _MODEL_SETTINGS), scoped=True) is None:
+            continue
+        for loop in js.every(body, js.of_type("for_in_statement"), scoped=True):
+            walked = loop.child_by_field_name("right")
+            if walked is None or walked.type != "identifier":
+                continue
+            for declarator in js.every(body, _binds_list(js.text(walked)), scoped=True):
+                value = declarator.child_by_field_name("value")
+                if value is not None and js.visible(declarator, loop):
+                    found[declarator.id] = value
+    return js.only(list(found.values()), "effort cap settings lists")
+
+
+def _effort_caps(source: Source, options: Options, outcome: Outcome) -> Source:
+    caps = {
+        name: cap
+        for model in options.custom_models
+        if (cap := _effort_cap(model)) is not None
+        for name in model_names([model])
+    }
+    if not caps:
+        return source
+    outcome.declare(
+        required=("effort-cap",) if _caps_per_model(source) else (),
+        optional=("effort-cap",),
+    )
+    step = outcome.step("effort-cap")
+    entries = js.elements(_cap_layers(source))
+    if not entries:
+        if not step.expect:
+            outcome.note(
+                "this build has no per-model effort cap; the effort pickers are not cut"
+            )
+        return source
+    step.candidates += 1
+    step.applied += 1
+    layer = {_MODEL_SETTINGS: {name: {_MAX_EFFORT: cap} for name, cap in caps.items()}}
+    return source.apply(
+        [Edit.after(entries[-1], "," + json.dumps(layer, separators=(",", ":")))]
+    )
+
+
 # ------------------------------------------------------------------- display
 
 
@@ -1004,6 +1086,7 @@ def _custom_models(source: Source, options: Options, outcome: Outcome) -> Source
     source = _stateless(source, options, outcome)
     source = _classic(source, options, outcome)
     source = _effort_limits(source, options, outcome)
+    source = _effort_caps(source, options, outcome)
     source = _register_picker(source, options.custom_models, outcome.step("picker"))
     source = _register_context(source, options.custom_models, outcome)
     return _register_registry(source, options.custom_models, outcome.step("registry"))
@@ -1060,6 +1143,7 @@ PATCHES = [
             '"mid_conv_system"',
             '"context_management"',
             _CAPABILITIES,
+            _MAX_EFFORT,
         ),
         setting=_CUSTOM_SETTING,
     ),

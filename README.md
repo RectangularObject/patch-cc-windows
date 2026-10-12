@@ -132,9 +132,11 @@ each top the binary can express, or **off**. A model that reports no levels
 starts off — nothing is offered that was not declared, since Claude Code
 would otherwise offer every level to a model it does not know. Levels a model
 excludes are switched off from Claude 2.1.267 on, through
-`CLAUDE_CODE_MODEL_CAPABILITIES`, and your own entries in that variable win.
-Managed `availableModels` allowlists still apply. Bedrock, Vertex and Foundry
-modes are out of scope.
+`CLAUDE_CODE_MODEL_CAPABILITIES`, and your own entries in that variable win;
+on the same builds the `/effort` and `/model` pickers stop at the declared
+top, through Claude's own per-model `maxEffortLevel` setting, and a lower cap
+in your settings still wins. Managed `availableModels` allowlists still
+apply. Bedrock, Vertex and Foundry modes are out of scope.
 
 ## After a Claude update
 

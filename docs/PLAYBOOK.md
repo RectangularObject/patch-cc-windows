@@ -1037,6 +1037,7 @@ discovery live in `src/patch_cc/custom_models.py`; the patch consumes a
 | `classic:mid_conv_system`* | disables stateful mid-conversation features for selected models | native model predicate querying this capability on its normalized argument |
 | `classic:context_management`* | disables server context edits for selected models | same identity for `context_management` |
 | `effort-limits`* | optional configured restrictions on effort capabilities | member read of `CLAUDE_CODE_MODEL_CAPABILITIES` |
+| `effort-cap`* | the effort pickers stop at the declared top | the per-model `maxEffortLevel` reader, and the settings list it walks |
 | `picker` | native model picker rows | upstream's row assembler |
 | `context`* | explicit per-model window | resolver that reads and returns `CLAUDE_CODE_MAX_CONTEXT_TOKENS` |
 | `registry` | display names and effort capabilities | table carrying `models`/`aliases`, verified by entry fields |
@@ -1044,8 +1045,9 @@ discovery live in `src/patch_cc/custom_models.py`; the patch consumes a
 * Required when owed: general resolution when an alias is configured;
 stateless when the independent `thread_unsupported_request` witness exists;
 effort restrictions when the chosen metadata excludes a native capability and
-the build names `CLAUDE_CODE_MODEL_CAPABILITIES`; context when an explicit
-window is configured.
+the build names `CLAUDE_CODE_MODEL_CAPABILITIES`; the effort cap when a model
+declares a top below `max` and the settings schema caps effort per model;
+context when an explicit window is configured.
 The two classic predicates and credential isolation are always required. A
 missing locator cannot remove its own requirement. A build without Message
 Threads reports stateless absent, and a build without the capability override
@@ -1117,6 +1119,28 @@ owns translation and enforcement of individual provider levels. Registry
 `capabilities` must always be an array: its reader is unguarded and the schema's
 default is not applied to the raw catalogue. Do not register `advisor_rank`:
 `/advisor` is a server-side feature and an external id is not an Anthropic advisor.
+
+**The `/effort` surfaces read the cap, not the capabilities.** The `/effort`
+slider, its usage line and the non-interactive usage stop at a model's *cap*
+— the `maxEffortLevel` setting, per model from 2.1.267, the same release as
+the capability override — and never ask the capabilities, so a custom model
+that lacked `xhigh_effort` was still offered every level and clamped at
+request time. Only the `/model` picker's ladder asks both, which is why
+`effort-limits` already trimmed `xhigh` and `max` there; the cap is what
+takes that ladder below `high`, a top the capabilities cannot express. The
+cap reader folds every settings layer it can see into the lowest per-model
+cap, so the declared top is baked as one more layer in that list rather than
+as a twin of the cut: the user's own lower cap still wins, `max` exempts, a
+model declaring no level keeps the control off rather than a cap, and the
+message a clamped pick gets — "set by your settings" — is then true.
+Identity: a member read of `maxEffortLevel` inside a function that also reads
+`modelSettings` in its own scope, and the list that function walks — a
+`for ... of` over a list literal bound in that scope. The settings
+normaliser reads the same pair of names but walks `Object.entries` of one
+settings object, no list of its own, so it claims nothing. Witness: the
+settings schema's own `modelSettings` entry carrying `maxEffortLevel`;
+2.1.257's carries only `effortLevel`, so the step reports absent there, with
+a note.
 
 **Registration still precedes subagent overrides.** The enum populated here is
 the one `subagent-models` reads, so a dropped registration takes its pins down
