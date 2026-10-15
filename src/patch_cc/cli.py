@@ -124,7 +124,7 @@ def _valid_models(
 def _print_findings(outcome: Outcome) -> None:
     """The detail under a patch line -- worded in :func:`ui.findings`."""
     for style, text in findings(outcome):
-        console.print(f"      [{style}]· {text}[/{style}]")
+        console.print(f"      [{style}]· {escape(text)}[/{style}]")
 
 
 def _print_report(report: patcher.PatchReport, options: Options) -> None:
@@ -271,7 +271,7 @@ def cmd_doctor(args) -> int:
         console.print(f"  [dim]- {patch.id:20s} not on this build[/dim]")
 
     agents = ", ".join(f"{a.name}={a.default}" for a in result.agents) or "none found"
-    console.print(f"\n  [dim]agents:  {agents}[/dim]")
+    console.print(f"\n  [dim]agents:  {escape(agents)}[/dim]")
     console.print(f"  [dim]models:  {', '.join(result.models)}[/dim]")
 
     # One verdict, one exit code (`ui.verdicts` / `DryRun.clean` plus the smoke
@@ -286,7 +286,7 @@ def cmd_doctor(args) -> int:
         elif style == "yellow":
             warn(text)
         else:
-            console.print(f"    [{style}]{text}[/{style}]")
+            console.print(f"    [{style}]{escape(text)}[/{style}]")
     return 0 if result.clean and (run is None or run.ok) else 1
 
 
