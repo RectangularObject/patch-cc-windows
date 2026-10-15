@@ -270,10 +270,7 @@ def cmd_doctor(args) -> int:
         # run. The sentence itself prints with the closing verdicts (`verdicts`).
         console.print(f"  [dim]- {patch.id:20s} not on this build[/dim]")
 
-    agents = (
-        ", ".join(f"{a.name}={a.effective_model}" for a in result.agents)
-        or "none found"
-    )
+    agents = ", ".join(f"{a.name}={a.default}" for a in result.agents) or "none found"
     console.print(f"\n  [dim]agents:  {agents}[/dim]")
     console.print(f"  [dim]models:  {', '.join(result.models)}[/dim]")
 

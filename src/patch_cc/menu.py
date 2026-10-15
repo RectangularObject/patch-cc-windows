@@ -852,7 +852,7 @@ class MenuApp:
             row = rows[name]
             text = Text(f"{name:<{pad}}", style="bold" if selected else "")
             if row.choice == _KEEP:
-                text.append(f"keep ({row.agent.effective_model})", style="dim")
+                text.append(f"keep ({row.agent.default})", style="dim")
             else:
                 text.append(row.choice, style=_VALUE)
             return text
@@ -886,7 +886,7 @@ class MenuApp:
             """
             head, note = value, ""
             if value == _KEEP:
-                head, note = "keep default", agent_row.agent.effective_model
+                head, note = "keep default", agent_row.agent.default
             elif value == INHERIT:
                 note = "main model"
             elif value in custom_set:

@@ -977,19 +977,30 @@ for you. Each entry: what it changes, the stable anchor, and where it lives.
   callback's own. Both rules find the same four gates on every build in the
   corpus.
 - **`subagent-models`** — write the chosen model into each overridden built-in
-  definition (discovered as above): rewrite the `model` literal when the
-  definition has one, insert `model:"…",` before a property it must carry when
-  it doesn't — a new property before an existing one is valid in any object
+  definition (discovered as above): replace the `model` *entry* whole when the
+  definition has one, insert `model:"…",` before its `whenToUse` entry when it
+  doesn't — a new property before an existing one is valid in any object
   literal, so nothing here looks for where the definition ends. Discovery runs
   once and every edit is committed together, so no offset can shift under
   another.
+
+  The entry is the node because its spelling is upstream's. 2.1.300 computes
+  web-fetch's model in a getter (`"haiku"` or `"inherit"` at runtime), where a
+  rewrite of the *value* leaves a bare string with no key — rubble the gate
+  refuses, taking every pin with the patch — and spells its `whenToUse` as a
+  getter too, where a climb to the nearest `pair` leaves the definition for
+  whatever object holds it. `js.entry` stops at the entry in every spelling.
+  Nor is upstream's value read to decide whether to write: a pin is written
+  even where the definition already names it (the same bytes, for a literal),
+  because a getter answering the pin on one branch and `inherit` on another
+  reads as satisfied to any such check. What the agent runs untouched is for
+  display only — `keep (computed)` where no literal says.
+
   Every requested override is a **required step**: each one reaching this patch
   has already been validated against the bundle by whichever surface asked for
   it, so a pin that cannot be written is not a shape this build lacks — it is
   the asked-for change failing, and the patch is dropped rather than shipping a
-  manifest that claims it. An override whose target the definition already
-  carries counts as landed: the step is judged on what it achieved, not on
-  whether bytes moved.
+  manifest that claims it.
 
   **The bypass:** one helper ignores the definition's model for a single pinned
   agent (Explore today) —

@@ -169,11 +169,10 @@ class BuiltinAgent:
     """One built-in agent definition as found in a bundle."""
 
     name: str
-    #: Current ``model`` literal, or ``None`` when the definition has none
-    #: (which the runtime treats as inherit).
-    model: str | None
-    #: The ``model`` value node, when the definition carries one.
-    model_node: js.Node | None
+    #: What the definition runs untouched, for display only.
+    default: str
+    #: The ``model`` entry however it is spelled, when the definition carries one.
+    entry: js.Node | None
     #: The ``whenToUse`` property, before which a ``model`` property is
     #: inserted for a definition that has none. Any property boundary would do
     #: -- an object literal takes a new property before any existing one -- and
@@ -182,10 +181,6 @@ class BuiltinAgent:
     #: The variable this definition is assigned to, when it is assigned to one.
     #: The model-bypass helper names its pinned agent that way.
     holder: str | None
-
-    @property
-    def effective_model(self) -> str:
-        return self.model or INHERIT
 
 
 def _holder(definition: js.Node) -> str | None:
@@ -213,7 +208,7 @@ def _resolved_name(source: Source, value: js.Node) -> str | None:
     other way -- a definition to the variable holding it -- and it is what makes
     the skip an honest one: a name read through its value is a name we can still
     *write*, and ``name`` is only used to offer the agent (the edit hangs off
-    ``anchor``/``model_node``), so nothing about the rewrite changes.
+    ``anchor``/``entry``), so nothing about the rewrite changes.
 
     The declarator is looked for in the constant's *own module*
     (:meth:`js.Source.find_local`): a minified local is only unique there, and
@@ -248,6 +243,15 @@ def _resolved_name(source: Source, value: js.Node) -> str | None:
     if binding is None:
         return None
     return js.text(binding.child_by_field_name("value"))[1:-1]
+
+
+def _default(model: js.Node | None) -> str:
+    """What a ``model`` value runs; an absent one is ``undefined``, run as inherit."""
+    shown = (
+        js.text(value)[1:-1] if value.type == "string" else "computed"
+        for value in js.values(model)
+    )
+    return "/".join(dict.fromkeys(shown)) or INHERIT
 
 
 def discover_agents(source: Source) -> list[BuiltinAgent]:
@@ -294,9 +298,9 @@ def discover_agents(source: Source) -> list[BuiltinAgent]:
         agents.append(
             BuiltinAgent(
                 name=name,
-                model=js.text(model)[1:-1] if model is not None else None,
-                model_node=model,
-                anchor=js.up(when, "pair") or when,
+                default=_default(model),
+                entry=None if model is None else js.entry(model),
+                anchor=js.entry(when),
                 holder=_holder(definition),
             )
         )
@@ -470,9 +474,10 @@ def bypassed_agents(source: Source, agents: list[BuiltinAgent]) -> list[Bypass]:
 def _subagent_models(source: Source, options: Options, outcome: Outcome) -> Source:
     """Write the chosen model into each overridden built-in definition.
 
-    Definitions with a ``model`` literal get it rewritten; definitions without
-    one get it inserted before a property they are required to carry, so
-    nothing here has to find where the object *ends*.
+    A ``model`` entry is replaced whole, however upstream spells it -- 2.1.300
+    computes web-fetch's in a getter; definitions without one get it inserted
+    before a property they are required to carry, so nothing here has to find
+    where the object *ends*.
     """
     if not options.subagent_models:
         outcome.note("no subagent model overrides configured")
@@ -507,14 +512,10 @@ def _subagent_models(source: Source, options: Options, outcome: Outcome) -> Sour
 
         step.candidates += 1
         step.applied += 1
-        if agent.effective_model == target:
-            # Already the desired model. Credited as landed because the step is
-            # judged on what it achieved, not on whether bytes moved.
-            continue
-        if agent.model_node is None:
+        if agent.entry is None:
             edits.append(Edit.before(agent.anchor, f'{_MODEL}:"{target}",'))
         else:
-            edits.append(Edit.replace(agent.model_node, f'"{target}"'))
+            edits.append(Edit.replace(agent.entry, f'{_MODEL}:"{target}"'))
 
     bypasses = bypassed_agents(source, agents)
     if not bypasses:

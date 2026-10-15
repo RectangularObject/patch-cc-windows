@@ -152,7 +152,7 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
     overrides = {
         agent.name: target
         for agent in agents
-        if (target := next((m for m in models if m != agent.effective_model), None))
+        if (target := next((m for m in models if m != agent.default), None))
     }
     return Options(
         brand="patch-cc doctor",
