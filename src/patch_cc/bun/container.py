@@ -93,7 +93,10 @@ def read(path: str) -> Bundle:
         section = pe.read_section(raw) if kind == "pe" else elf.read_section(raw)
 
     parsed = blobmod.parse(blobmod.unwrap_section(section))
-    modules = [(m.index, parsed.payload(m.contents)) for m in parsed.js_modules()]
+    modules = [
+        (m.index, parsed.payload(m.name), parsed.payload(m.contents))
+        for m in parsed.js_modules()
+    ]
     return Bundle(
         path=path,
         kind=kind,
