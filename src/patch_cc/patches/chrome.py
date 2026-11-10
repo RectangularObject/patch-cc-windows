@@ -205,15 +205,9 @@ def _is_name(literal: js.Node) -> bool:
     The bundle renders plenty of bold prose that happens to contain the words
     -- "Claude Code successfully installed!", "No Claude Code sessions found" --
     and this patch renames the name badge, not everything that mentions the
-    product. The badge is the whole literal (upstream pads one of them with
-    spaces for its own layout); anything longer is a sentence.
+    product. The badge is the whole literal; anything longer is a sentence.
     """
-    return literal.type == "string" and js.text(literal)[1:-1].strip() == _BRAND
-
-
-def _blank(node: js.Node) -> bool:
-    """A string child that draws nothing -- upstream's own layout padding."""
-    return node.type == "string" and not js.text(node)[1:-1].strip()
+    return literal.type == "string" and js.text(literal)[1:-1] == _BRAND
 
 
 def _is_badge(call: js.Node, literal: js.Node) -> bool:
@@ -227,22 +221,14 @@ def _is_badge(call: js.Node, literal: js.Node) -> bool:
     would rename half a sentence -- and that sentence ends up in a system
     prompt, which is the one edit this patch must never make.
 
-    So the whole render has to be the name: this literal among what it draws,
-    and otherwise only upstream's own padding.
+    So the whole render has to be the name: this literal, and nothing beside it.
     """
     drawn = _rendered(call)
-    rest = [child for child in drawn if child.start_byte != literal.start_byte]
-    return _is_branded(call) and len(rest) < len(drawn) and all(map(_blank, rest))
-
-
-def _styled_brand(call: js.Node) -> bool:
-    """A call to the ``claude``-themed text helper: ``theme("claude",x)("...")``."""
-    callee = call.child_by_field_name("function")
-    if callee is None or callee.type != "call_expression":
-        return False
-    inner = callee.child_by_field_name("arguments")
-    first = inner.named_children[0] if inner and inner.named_children else None
-    return first is not None and first.type == "string" and js.text(first) == '"claude"'
+    return (
+        _is_branded(call)
+        and len(drawn) == 1
+        and drawn[0].start_byte == literal.start_byte
+    )
 
 
 def _branding(source: Source, options: Options, outcome: Outcome) -> Source:
@@ -270,11 +256,10 @@ def _branding(source: Source, options: Options, outcome: Outcome) -> Source:
     # rename nobody asked for -- with the manifest asserting the new name from the
     # manifest. Required, so a badge that stops being a bold render is loud
     # rather than a green tick over a binary that still says Claude Code. The
-    # other two are sentences upstream may reword or drop, and their absence is
+    # welcome line is a sentence upstream may reword or drop, and its absence is
     # a build lacking a shape, not a dead feature.
-    outcome.declare(required=("badge",), optional=("styled", "welcome"))
+    outcome.declare(required=("badge",), optional=("welcome",))
     badge = outcome.step("badge")
-    styled = outcome.step("styled")
     welcome = outcome.step("welcome")
 
     # A name that is *inside* prose, so each literal is asked what it says
@@ -283,164 +268,14 @@ def _branding(source: Source, options: Options, outcome: Outcome) -> Source:
     for literal in source.literals(_BRAND):
         # The startup/help name badge: the product name, drawn in bold.
         call = js.up(literal, "call_expression")
-        if call is not None and _is_name(literal):
-            if _is_badge(call, literal):
-                swap(badge, literal)
-            # The themed one-liner, whose helper is selected by the theme name.
-            elif _styled_brand(call):
-                swap(styled, literal)
+        if call is not None and _is_name(literal) and _is_badge(call, literal):
+            swap(badge, literal)
 
         # The welcome line, which is a bare sentence with no chrome to identify.
         if literal.type == "string" and js.text(literal)[1:-1].startswith(
             f"Welcome to {_BRAND}"
         ):
             swap(welcome, literal)
-
-    return source.apply(edits)
-
-
-# ---------------------------------------------------------- startup org label
-
-#: The welcome screen's info line: `model · plan` -- and, when the account has
-#: an organizationName (for personal claude.ai accounts, that is the account
-#: email), ` · <organizationName>` after it.
-_ORG = "organizationName"
-
-_IS_DEMO = "IS_DEMO"
-
-
-def _interpolates_org(node: js.Node) -> bool:
-    """Is this org-name read interpolated into a template literal?
-
-    The composition -- the org name written *into a line* -- is the durable
-    fingerprint, so candidates count off it rather than off the conditional. A
-    reshaped conditional then reads as "found it, rewrote nothing" (a matcher to
-    repair) rather than the zero that would equally mean upstream retired the
-    segment, and the `/status` row ``{label:"Organization",value:r.organizationName}``
-    is the same read outside any template and is not mistaken for one.
-
-    Being *in* a substitution is the whole claim. Ending one is not: text that
-    describes how the substitution closes reads ``${x.organizationName??""}``
-    -- the same composition, one defensive operator later -- as the anchor
-    being gone while the rewrite still lands, and the patch reports the state
-    no row of the table has a meaning for (candidates 0, applied 1).
-    """
-    return js.up(node, "template_substitution") is not None
-
-
-def _org_segments(source: Source) -> list[js.Node]:
-    """Every composition of the org name into a line -- this patch's surface.
-
-    One home for a question asked twice: the patch counts its candidates off
-    this, and :func:`_org_absence` asks it to learn whether the build has a
-    surface at all, so the two can never disagree about what counts.
-    """
-    return [node for node in source.find(_ORG) if _interpolates_org(node)]
-
-
-def _org_absence(source: Source) -> str | None:
-    """Why org-label has no work on this build, or ``None`` while it does.
-
-    2.1.246 deleted the welcome-banner variant that composed the segment: the
-    surviving banner draws `model · billing` with no org anywhere, which is the
-    hidden state an empty org label asks for. That is upstream retiring
-    the surface, not a matcher to repair, so it is said apart from broken --
-    and asked of the bundle in hand, never of a version, so a build that draws
-    the segment again offers the row with no code change. What this cannot
-    tell apart is a composition respelled out of the locator's sight; the cost
-    of that miss is a row missing from the menu on a build whose screen still
-    shows the segment, and the corpus sweep is what keeps the locator honest.
-    """
-    if _org_segments(source):
-        return None
-    return (
-        "the welcome screen composes no org segment -- upstream retired it, "
-        "and hiding it is now upstream's own default"
-    )
-
-
-def _appended(line: js.Node, label: str) -> str | None:
-    """What ``label`` adds to upstream's no-org line -- nothing, when hiding.
-
-    A segment is introduced by the separator this very line already uses: the
-    bytes between its last two interpolations, copied rather than spelled. What
-    you copy cannot drift from what you copied it from, and spelling it put ours
-    beside theirs the moment the two differed -- a build writing `/` where
-    2.1.232 writes `\\xB7` baked ``${model} / ${plan} \\xB7 Ada``, half its
-    punctuation and half ours.
-
-    Read from the line's own bytes, not a bundle-wide buffer: the line is one
-    template node in one module. A line with nothing to copy from (one
-    interpolation, so no separator ever written) is a line this patch cannot
-    extend, and says so by finding nothing rather than by inventing the
-    character it would have needed.
-    """
-    if not label:
-        return ""
-    marks = [c for c in js.children(line) if c.type == "template_substitution"]
-    if len(marks) < 2:
-        return None
-    line_bytes = line.text or b""
-    separator = line_bytes[
-        marks[-2].end_byte - line.start_byte : marks[-1].start_byte - line.start_byte
-    ]
-    return f"{separator.decode('utf8')}{_js_template_escape(label)}"
-
-
-def _org_label(source: Source, options: Options, outcome: Outcome) -> Source:
-    """Replace -- or, with an empty label, drop -- the welcome line's org segment.
-
-    Upstream ships the no-org line as its own false branch, so hiding the
-    segment is *selecting a string the bundle already carries*, separator and
-    all, rather than composing one. A label is that same string with one more
-    segment appended, introduced by the separator taken from the line itself
-    (:func:`_appended`). Nothing here spells the separator, the model or the
-    plan: the branch is reused verbatim and only extended, so a build that
-    renames either interpolation, or writes `\\xB7` as a raw `·`, changes
-    nothing.
-
-    The demo test is recast rather than left in front. `&&` binds tighter than
-    `?:`, so upstream's expression is ``(!demo && hasOrg) ? withOrg : noOrg``
-    and its demo value is the *no-org string*, not `false`; replacing only the
-    ternary would leave ``!demo&&`template` `` and make demo mode evaluate to
-    `false`. A baked label is therefore ``!demo?line:noOrg``, and hiding emits
-    the no-org branch alone -- both sides of the test want it.
-    """
-    label = options.org_label
-    edits: list[Edit] = []
-    seen: set[int] = set()
-
-    outcome.candidates += len(_org_segments(source))
-    for node in source.find(_ORG):
-        line = js.up(node, "ternary_expression")
-        if line is None or line.id in seen:
-            continue
-        with_org = line.child_by_field_name("consequence")
-        no_org = line.child_by_field_name("alternative")
-        condition = line.child_by_field_name("condition")
-        if with_org is None or no_org is None or condition is None:
-            continue
-        if with_org.type != "template_string" or no_org.type != "template_string":
-            continue
-        if _ORG not in js.text(with_org) or _ORG in js.text(no_org):
-            continue
-        # The read, as the read it is. Asked as text ending in `.IS_DEMO` it was
-        # a claim about the spelling of everything in front of the name -- the
-        # very half upstream keeps changing here (`process.env` through 2.1.227,
-        # a local from 2.1.228) and the one `js.reads` exists to stop describing.
-        demo = js.first(condition, lambda n: js.reads(n, _IS_DEMO))
-        tail = _appended(no_org, label)
-        if demo is None or tail is None:
-            continue
-        seen.add(line.id)
-        plain = js.text(no_org)
-        edits.append(
-            Edit.replace(
-                line,
-                f"!{js.text(demo)}?{plain[:-1]}{tail}`:{plain}" if tail else plain,
-            )
-        )
-        outcome.applied += 1
 
     return source.apply(edits)
 
@@ -469,15 +304,5 @@ PATCHES = [
         fn=_branding,
         anchors=(f'"Welcome to {_BRAND}"', f'"{_BRAND}"'),
         setting=string_setting("brand", "brand", DEFAULT_BRAND),
-    ),
-    Patch(
-        id="org-label",
-        title="Startup org/email label",
-        group=GROUP_CHROME,
-        fn=_org_label,
-        default=False,
-        anchors=(_ORG, _IS_DEMO),
-        setting=string_setting("org_label", "org_label", "", always=True),
-        absence=_org_absence,
     ),
 ]

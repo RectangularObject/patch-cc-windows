@@ -1,7 +1,7 @@
 # The corpus
 
 The measured claims in [PLAYBOOK.md](PLAYBOOK.md) — "every build in the corpus",
-"the same single site on every build", "thirty-four builds carry the surface" —
+"the same single site on every build" —
 are statements about a set of real Claude binaries. This file is that set, so a
 claim is one command from re-verification instead of a number you have to trust.
 
@@ -32,11 +32,11 @@ once `doctor` passes on it, and never restated — so a hash that stops matching
 means the file changed under you, not that a number moved. A gap in the
 numbering is upstream's rather than a miss: not every version reached the
 release channel, and `corpus.py status` names which, so no list of
-them is kept here to go stale. The set straddles the **2.1.242 code split**
-(INTERNALS.md): `2.1.242`/`2.1.243` are the first many-module builds, and they
-jump ~35 MB over `2.1.241` for it. Sizes repeat across builds, which is why the
-identity column is the hash (of the whole file, `sha256sum <version>.orig`) and
-never the size:
+them is kept here to go stale. Retiring a build deletes its `.orig`, never its
+row, so the rows under the oldest build held are retired builds, their hashes
+the offline record of binaries no longer on disk. Sizes repeat across builds,
+which is why the identity column is the hash (of the whole file,
+`sha256sum <version>.orig`) and never the size:
 
 | version | size | sha256 |
 |---|---|---|
@@ -134,14 +134,20 @@ never the size:
 | `2.1.314` | 298 MB | `4487042b4c4f5d88d4568f68ae98aae0b1ffae58864cf57fb868641bc5f84594` |
 | `2.1.315` | 328 MB | `a3b9d66caf61b40d6aad99ed4de80f48f17e0e024ddf1b6e4289efade06105df` |
 | `2.1.316` | 328 MB | `fd13c70000fec3f2116dfbcbb6121210b4a29328bf0e46210a59dd594a67d824` |
+| `2.1.317` | 331 MB | `eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0` |
+| `2.1.318` | 338 MB | `708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd` |
+| `2.1.319` | 340 MB | `dabafec82ca1319fa43d8be36a10fc61b1d11821cb98ad5df04ad95e199b8eed` |
+| `2.1.321` | 342 MB | `426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f` |
+| `2.1.322` | 342 MB | `bfb3703ad5380242328459bc62ada4bde8ae7ba57c6e1eeadb9c00e08874c478` |
 
-This set covers the span the playbook's tree-move measurements were taken over
-(`2.1.210` → `2.1.233`), the 2.1.242 split, the 2.1.246 stream-store
-migration, the 2.1.247 selector reads it was read back through, the
-2.1.257 compiled transcript renderer that retired live thinking's render half,
-the 2.1.269 Bun 1.4.3 records that retired the container's record walker, and
-the 2.1.248, 2.1.304 and 2.1.314 values moved into other chunks that names now
-resolve across, so each is re-checkable here rather than historical.
+This set starts at the 2.1.246 stream-store migration and covers the 2.1.247
+selector reads it was read back through, the 2.1.257 compiled transcript
+renderer that retired live thinking's render half, the 2.1.269 Bun 1.4.3
+records that retired the container's record walker, and the 2.1.248, 2.1.304
+and 2.1.314 values moved into other chunks that names now resolve across, so
+each is re-checkable here rather than historical. The span the playbook's
+tree-move measurements were taken over (`2.1.210` → `2.1.233`) and the 2.1.242
+split are retired; `sync --since 2.1.210` brings them back.
 
 ## Keep it complete
 
@@ -166,10 +172,18 @@ nothing has made no statement about how far back it cares, so the walk starts at
 the head — `--since` is how a fresh checkout asks for history. A build this machine
 never patched can still join the old way — save its pristine native binary as
 `~/.local/share/patch-cc/backups/<version>.orig` — and the next run verifies it
-like any other. To read the JS a given binary carries without patching anything:
+like any other.
+
+Retiring moves the floor up: delete `.orig`s from the bottom, and the walk and
+the sweep follow. Move it only where code goes with it — a shape upstream
+dropped, kept matchable only for the builds being retired — and delete that
+branch in the same change. Never past the `stable` channel's version, which
+users still run, nor a build `restore` still needs (an installed version).
+
+To read the JS a given binary carries without patching anything:
 
 ```bash
-patch-cc extract ~/.local/share/patch-cc/backups/2.1.233.orig > 2.1.233.js
+patch-cc extract ~/.local/share/patch-cc/backups/2.1.319.orig > 2.1.319.js
 ```
 
 ## The sweep

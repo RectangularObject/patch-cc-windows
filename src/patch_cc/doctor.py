@@ -17,9 +17,11 @@ overrides are exercised for real instead of being exempted.
 from __future__ import annotations
 
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import js
@@ -75,13 +77,6 @@ class DryRun:
     models: list[str] = field(default_factory=list)
     #: What discovery found and could not read (:func:`undiscovered`).
     undiscovered: list[str] = field(default_factory=list)
-    #: Patches with no surface on this build -- upstream retired the target --
-    #: each with the sentence saying so (:meth:`patch_cc.patches.Patch.absent`).
-    #: Kept apart from ``results`` because absence is a fact about the build,
-    #: reported apart from broken (docs/CONDUCT.md): an absent patch is not run
-    #: at all, exactly as the menu does not offer it, so it can neither pass nor
-    #: fail and never decides :attr:`clean`.
-    absent: list[tuple[Patch, str]] = field(default_factory=list)
     #: Where this build's *pristine* bundle stopped parsing, when it did --
     #: which `apply` refuses to patch at all. A rewrite that produces rubble is
     #: already reported as the patch that produced it, so this is the one
@@ -167,9 +162,6 @@ def _synthetic_options(agents: list[BuiltinAgent], models: list[str]) -> Options
         subagent_models=overrides,
         custom_models=custom,
         endpoint="http://127.0.0.1:8317",
-        # The replace branch; the hidden form differs only in the emitted tail,
-        # so one configuration holds the whole matcher in the net.
-        org_label="patch-cc doctor",
     )
 
 
@@ -202,9 +194,6 @@ def dryrun(bundle: Bundle) -> DryRun:
 
     current = source
     for patch in ALL_PATCHES:
-        if (why := patch.absent(source)) is not None:
-            result.absent.append((patch, why))
-            continue
         current, outcome = patch.run(current, options)
         result.results.append((patch, outcome))
         if patch.anchors:
@@ -221,6 +210,7 @@ class Smoke:
 
     ok: bool
     detail: str
+    pristine_failure: str | None = None
 
 
 def smoke(bundle: Bundle, dry: DryRun, timeout: float = 60.0) -> Smoke:
@@ -246,13 +236,36 @@ def smoke(bundle: Bundle, dry: DryRun, timeout: float = 60.0) -> Smoke:
     landed = landed_ids(dry.results)
     patched = dry.patched.append_manifest(build_manifest(landed, dry.options))
 
+    try:
+        failure, stdout = _launch(
+            "baked binary", lambda tmp: container.write(bundle, patched, tmp), timeout
+        )
+    except BunError as exc:
+        return Smoke(False, f"bake refused: {exc}")
+    if failure is not None:
+        pristine, _ = _launch(
+            "pristine binary", lambda tmp: shutil.copy(bundle.path, tmp), timeout
+        )
+        return Smoke(False, failure, pristine)
+    output = " · ".join(l for l in stdout.strip().splitlines() if l)
+    marker = dry.options.version_suffix
+    if "version-marker" in landed and marker not in stdout:
+        return Smoke(
+            False,
+            f"baked binary ran but never printed {marker!r} -- version-marker "
+            f"landed yet its edit did not execute: {output!r}",
+        )
+    return Smoke(True, f"baked binary runs: {output}")
+
+
+def _launch(
+    subject: str, place: Callable[[str], object], timeout: float
+) -> tuple[str | None, str]:
+    """How ``subject`` failed ``--version`` (``None`` if it ran) and what it printed."""
     fd, tmp = tempfile.mkstemp(prefix="patch-cc-smoke-")
     os.close(fd)
     try:
-        try:
-            container.write(bundle, patched, tmp)
-        except BunError as exc:
-            return Smoke(False, f"bake refused: {exc}")
+        place(tmp)
         try:
             proc = subprocess.run(
                 [tmp, "--version"],
@@ -262,14 +275,12 @@ def smoke(bundle: Bundle, dry: DryRun, timeout: float = 60.0) -> Smoke:
                 check=False,
             )
         except subprocess.TimeoutExpired:
-            return Smoke(
-                False, f"baked binary hung: --version did not return in {timeout:.0f}s"
-            )
+            return f"{subject} hung: --version did not return in {timeout:.0f}s", ""
         except OSError as exc:
             # A temp dir mounted noexec, ENOMEM -- the run could not even start.
-            # Still a smoke verdict, not a traceback: the question was "does the
-            # baked binary run", and the honest answer is how far it got.
-            return Smoke(False, f"baked binary could not be executed: {exc}")
+            # Still a smoke verdict, not a traceback: the question was "does it
+            # run", and the honest answer is how far it got.
+            return f"{subject} could not be executed: {exc}", ""
         if proc.returncode != 0:
             reason = f"exit {proc.returncode}"
             if proc.returncode < 0:
@@ -279,20 +290,9 @@ def smoke(bundle: Bundle, dry: DryRun, timeout: float = 60.0) -> Smoke:
                     reason = f"signal {-proc.returncode}"
             noise = (proc.stderr or proc.stdout).strip().splitlines()
             cause = next((l for l in noise if "panic" in l), noise[-1] if noise else "")
-            return Smoke(
-                False,
-                f"baked binary died on --version ({reason})"
-                + (f": {cause.strip()}" if cause else ""),
-            )
-        output = " · ".join(l for l in proc.stdout.strip().splitlines() if l)
-        marker = dry.options.version_suffix
-        if "version-marker" in landed and marker not in proc.stdout:
-            return Smoke(
-                False,
-                f"baked binary ran but never printed {marker!r} -- version-marker "
-                f"landed yet its edit did not execute: {output!r}",
-            )
-        return Smoke(True, f"baked binary runs: {output}")
+            died = f"{subject} died on --version ({reason})"
+            return died + (f": {cause.strip()}" if cause else ""), ""
+        return None, proc.stdout
     finally:
         try:
             os.unlink(tmp)
